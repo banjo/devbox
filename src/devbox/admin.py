@@ -3,6 +3,7 @@
 These take the CLI `Context` and return plain data; formatting lives in cli.py.
 """
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -110,7 +111,8 @@ def doctor(ctx, resolve_ssh_allow) -> list[dict]:
     checks += registry_checks(ctx)
 
     try:
-        plan = cleanup_plan(ctx)
+        notes: list[str] = []
+        plan = cleanup_plan(ctx, notes)
     except DevboxError as e:
         add(check("leftovers", WARN, f"could not check: {e}"))
     else:
@@ -120,6 +122,8 @@ def doctor(ctx, resolve_ssh_allow) -> list[dict]:
                       "see `devbox cleanup`"))
         else:
             add(check("leftovers", OK, "no unused devbox resources"))
+        for note in notes:
+            add(check("leftovers", WARN, note))
 
     checks.append(schedule_check(ctx))
     budget = cfg.monthly_budget
@@ -142,16 +146,45 @@ def registry_checks(ctx) -> list[dict]:
     return result
 
 
+CRON_ENTRY_RE = re.compile(
+    r"^(@\w+|(\S+\s+){4}\S+)\s+.*\bdevbox\s+idle-check\b"
+)
+
+
+def cron_has_idle_check(crontab: str) -> bool:
+    """An active (uncommented) cron entry whose command runs `devbox idle-check`."""
+    for line in crontab.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if CRON_ENTRY_RE.match(line):
+            return True
+    return False
+
+
+def _run(cmd: list[str]) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
 def schedule_check(ctx) -> dict:
     if config.parse_duration(ctx.cfg.idle_timeout) is None:
         return check("idle shutdown", OK, "idle_timeout is off")
-    for cmd in (["crontab", "-l"], ["systemctl", "--user", "is-enabled", "devbox-idle-check.timer"]):
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-        if proc.returncode == 0 and ("idle-check" in proc.stdout or proc.stdout.strip() == "enabled"):
-            return check("idle shutdown", OK, f"scheduled ({cmd[0]}), timeout {ctx.cfg.idle_timeout}")
+    cron = _run(["crontab", "-l"])
+    if cron and cron.returncode == 0 and cron_has_idle_check(cron.stdout):
+        return check("idle shutdown", OK, f"scheduled (cron), timeout {ctx.cfg.idle_timeout}")
+    timer = "devbox-idle-check.timer"
+    enabled = _run(["systemctl", "--user", "is-enabled", timer])
+    active = _run(["systemctl", "--user", "is-active", timer])
+    is_enabled = bool(enabled and enabled.returncode == 0 and enabled.stdout.strip() == "enabled")
+    is_active = bool(active and active.returncode == 0 and active.stdout.strip() == "active")
+    if is_enabled and is_active:
+        return check("idle shutdown", OK, f"scheduled (systemd timer), timeout {ctx.cfg.idle_timeout}")
+    if is_enabled:
+        return check("idle shutdown", WARN, f"{timer} is enabled but not active, so idle servers keep running",
+                     f"systemctl --user start {timer}")
     return check("idle shutdown", WARN, "`devbox idle-check` does not seem to be scheduled, so idle servers keep running",
                  "add the cron line or systemd timer from the README")
 
@@ -159,8 +192,12 @@ def schedule_check(ctx) -> dict:
 # Cleanup
 
 
-def cleanup_plan(ctx) -> list[dict]:
-    """Everything devbox created that is no longer used. Nothing is deleted here."""
+def cleanup_plan(ctx, notes: list[str] | None = None) -> list[dict]:
+    """Everything devbox created that is no longer used. Nothing is deleted here.
+
+    Parts that can't be decided safely are skipped and explained in `notes`.
+    """
+    notes = notes if notes is not None else []
     plan: list[dict] = []
     orphans = ctx.reconcile()
     for s in orphans:
@@ -180,17 +217,23 @@ def cleanup_plan(ctx) -> list[dict]:
                      "reason": "devbox firewall not attached to any server" + (" (older version)" if hc.is_legacy(fw) else "")})
 
     pub = ctx.cfg.ssh_key.with_name(ctx.cfg.ssh_key.name + ".pub")
-    if pub.exists():
+    if not pub.exists():
+        notes.append("SSH keys not checked: the local devbox key doesn't exist, so the key in use is unknown")
+    else:
+        local_key = pub.read_text().strip()
         try:
-            in_use = hc.find_ssh_key(pub.read_text().strip())["key"]
-        except DevboxError:
-            in_use = None
-        in_use_id = in_use["id"] if in_use else None
-        for key in hc.list_ssh_keys():
-            if key["id"] == in_use_id or not (hc.owns(key) or hc.is_legacy(key)):
-                continue
-            plan.append({"kind": "ssh-key", "id": key["id"], "name": key["name"],
-                         "reason": "devbox SSH key that is not the local key"})
+            hc.find_ssh_key(local_key)
+        except DevboxError as e:
+            # Which key is in use is ambiguous; listing any key could remove the one in use.
+            notes.append(f"SSH keys not checked: {e}")
+        else:
+            for key in hc.list_ssh_keys():
+                if not (hc.owns(key) or hc.is_legacy(key)):
+                    continue
+                if same_public_key(key.get("public_key", ""), local_key):
+                    continue  # never the key devbox itself uses
+                plan.append({"kind": "ssh-key", "id": key["id"], "name": key["name"],
+                             "reason": "devbox SSH key that is not the local key"})
 
     active = {(s["project"], str(s["hetzner_id"])) for s in db.active_servers(ctx.conn)}
     known_hosts = ctx.cfg.state_dir / "known_hosts"
@@ -273,3 +316,7 @@ def history(ctx, project: str | None, limit: int | None) -> dict:
     if limit:
         snaps = snaps[:limit]
     return {"servers": entries, "snapshots": snaps, "total": costs.summarize(ctx.cost_items(project))}
+
+
+def same_public_key(a: str, b: str) -> bool:
+    return a.split()[:2] == b.split()[:2]

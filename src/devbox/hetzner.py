@@ -210,8 +210,10 @@ class Hcloud:
 
     def delete_image(self, image_id: int) -> None:
         data = self.run("image", "describe", str(image_id), "-o", "json")
-        if not data or not self.owns(data):
-            raise DevboxError(f"image {image_id} is not owned by this devbox install; refusing to delete it")
+        if not data:
+            raise DevboxError(f"image {image_id} not found")
+        # Like firewalls and SSH keys: this install's, or from a version before controller ids.
+        self._deletable(data, "image")
         self.run("image", "delete", str(image_id), parse=False)
 
     def snapshot_price_per_gb_month(self) -> float | None:

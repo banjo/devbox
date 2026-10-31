@@ -1175,24 +1175,27 @@ def cmd_doctor(ctx: Context) -> int:
 
 
 def cmd_cleanup(ctx: Context) -> int:
+    notes: list[str] = []
     with ctx.lock():
-        plan = admin.cleanup_plan(ctx)
+        plan = admin.cleanup_plan(ctx, notes)
+        note_lines = [f"note: {n}" for n in notes]
         if not plan:
-            emit(ctx.args, {"items": [], "deleted": False}, "nothing to clean up")
+            emit(ctx.args, {"items": [], "deleted": False, "notes": notes}, "\n".join(["nothing to clean up", *note_lines]))
             return 0
         if not ctx.args.yes:
             lines = ["would delete:"]
             lines += [f"  {i['kind']} {i['name']} ({i['id']}): {i['reason']}" for i in plan]
+            lines += note_lines
             lines.append("run `devbox cleanup --yes` to delete these")
-            emit(ctx.args, {"items": plan, "deleted": False}, "\n".join(lines))
+            emit(ctx.args, {"items": plan, "deleted": False, "notes": notes}, "\n".join(lines))
             return 0
         results = admin.run_cleanup(ctx, plan)
-    lines = []
+    lines = list(note_lines)
     for r in results:
         state = "deleted" if r["deleted"] else f"FAILED: {r['error']}"
         lines.append(f"{r['kind']} {r['name']} ({r['id']}): {state}")
     failed = any(not r["deleted"] for r in results)
-    emit(ctx.args, {"items": results, "deleted": True}, "\n".join(lines))
+    emit(ctx.args, {"items": results, "deleted": True, "notes": notes}, "\n".join(lines))
     return 1 if failed else 0
 
 
