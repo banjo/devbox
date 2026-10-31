@@ -419,8 +419,12 @@ class Remote:
         """Run a command in the project folder and save its stdout to `dest`. Returns bytes written."""
         remote = f"cd {APP_DIR} && bash -o pipefail -lc {shlex.quote(script)}"
         tmp = dest.with_name(dest.name + ".partial")
+        tmp.unlink(missing_ok=True)
         try:
-            with open(tmp, "wb") as out:
+            # Dumps often hold credentials and personal data: owner-only, whatever the umask.
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as out:
                 proc = subprocess.run(self.ssh_cmd(remote), stdout=out, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
             if proc.returncode != 0:
                 detail = proc.stderr.decode(errors="replace").strip()

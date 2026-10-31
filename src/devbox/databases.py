@@ -110,34 +110,72 @@ class Postgres(Engine):
 
 # SQLite: Ubuntu ships python3, so use its sqlite3 module (no sqlite3 CLI needed).
 # The backup API gives a consistent copy even while the app is writing.
+# Both scripts report problems with sys.exit("...") (exit 1, message on
+# stderr) instead of a traceback.
 _SQLITE_DUMP = r"""
-import sqlite3, sys, tempfile, os
-src = sqlite3.connect(sys.argv[1])
-fd, tmp = tempfile.mkstemp(suffix=".sqlite")
-os.close(fd)
-dst = sqlite3.connect(tmp)
-src.backup(dst)
-dst.close(); src.close()
-with open(tmp, "rb") as f:
-    while chunk := f.read(1 << 20):
-        sys.stdout.buffer.write(chunk)
-os.unlink(tmp)
+import os, sqlite3, sys, tempfile
+path = sys.argv[1]
+if not os.path.isfile(path):
+    sys.exit(f"no database at {path} on the server (nothing was dumped)")
+tmp = None
+try:
+    # Read-only URI: never creates the file, never changes it.
+    src = sqlite3.connect(f"file:{os.path.abspath(path)}?mode=ro", uri=True)
+    src.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    fd, tmp = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
+    dst = sqlite3.connect(tmp)
+    src.backup(dst)
+    dst.close(); src.close()
+    with open(tmp, "rb") as f:
+        while chunk := f.read(1 << 20):
+            sys.stdout.buffer.write(chunk)
+except sqlite3.Error as e:
+    sys.exit(f"cannot dump {path}: {e}")
+finally:
+    if tmp:
+        os.unlink(tmp)
 """
 
 _SQLITE_RESTORE = r"""
-import sqlite3, sys, tempfile, os
+import os, sqlite3, sys, tempfile
 path = sys.argv[1]
-fd, tmp = tempfile.mkstemp(suffix=".sqlite", dir=os.path.dirname(os.path.abspath(path)))
-with os.fdopen(fd, "wb") as f:
-    while chunk := sys.stdin.buffer.read(1 << 20):
-        f.write(chunk)
-src = sqlite3.connect(tmp)
-if src.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
-    sys.exit("the dump is not a valid SQLite database")
-dst = sqlite3.connect(path)
-src.backup(dst)
-dst.close(); src.close()
-os.unlink(tmp)
+folder = os.path.dirname(os.path.abspath(path))
+tmp = None
+try:
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(suffix=".sqlite", dir=folder)
+    size = 0
+    with os.fdopen(fd, "wb") as f:
+        while chunk := sys.stdin.buffer.read(1 << 20):
+            f.write(chunk)
+            size += len(chunk)
+    if size == 0:
+        sys.exit("the dump is empty; nothing was restored")
+    with open(tmp, "rb") as f:
+        header = f.read(100)
+    if len(header) < 100 or not header.startswith(b"SQLite format 3\x00"):
+        sys.exit("the dump is not a SQLite database; nothing was restored")
+    page_size = int.from_bytes(header[16:18], "big")
+    page_size = 65536 if page_size == 1 else page_size
+    pages = int.from_bytes(header[28:32], "big")
+    # The page count in the header is only valid when these two counters match.
+    if pages and header[24:28] == header[92:96] and size < page_size * pages:
+        sys.exit(f"the dump is truncated ({size} of {page_size * pages} bytes); nothing was restored")
+    src = sqlite3.connect(f"file:{tmp}?mode=ro", uri=True)
+    result = [row[0] for row in src.execute("PRAGMA integrity_check").fetchall()]
+    if result != ["ok"]:
+        sys.exit("the dump failed SQLite's integrity check; nothing was restored")
+    dst = sqlite3.connect(path)
+    src.backup(dst)
+    dst.close(); src.close()
+except sqlite3.Error as e:
+    sys.exit(f"restore failed, the database was not changed: {e}")
+except OSError as e:
+    sys.exit(f"restore failed: {e}")
+finally:
+    if tmp and os.path.exists(tmp):
+        os.unlink(tmp)
 """
 
 

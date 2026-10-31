@@ -30,24 +30,27 @@ def validate_file(path: str) -> str:
     return str(p)
 
 
-def parse_assignment(text: str) -> tuple[str, str]:
+def parse_assignment(text: str, where: str = "input") -> tuple[str, str]:
+    """KEY=VALUE -> (key, value). Errors never repeat the input, which may be a secret."""
     key, sep, value = text.partition("=")
     key = key.strip()
-    if not sep or not KEY_RE.match(key):
-        raise DevboxError(f"invalid secret '{key or text}': use KEY=VALUE with KEY like DATABASE_URL")
+    if not sep:
+        raise DevboxError(f"{where}: expected KEY=VALUE (no '=' found)")
+    if not KEY_RE.match(key):
+        raise DevboxError(f"{where}: invalid key; use letters, digits and _ (like DATABASE_URL), not starting with a digit")
     return key, value
 
 
 def parse_env(text: str) -> dict[str, str]:
     """Read KEY=VALUE lines from a .env file (comments, `export` and quotes allowed)."""
     values = {}
-    for line in text.splitlines():
+    for number, line in enumerate(text.splitlines(), start=1):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         if line.startswith("export "):
             line = line[len("export "):].lstrip()
-        key, value = parse_assignment(line)
+        key, value = parse_assignment(line, f"line {number}")
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             quote, value = value[0], value[1:-1]
@@ -65,17 +68,26 @@ def format_value(value: str) -> str:
 
 
 def merge_env(existing: str, values: dict[str, str]) -> str:
-    """Set `values` in an env file's text, keeping every other line as it is."""
+    """Set `values` in an env file's text, keeping every other line as it is.
+
+    A managed key ends up on exactly one line: the first occurrence is
+    replaced and later duplicates are dropped, so last-wins dotenv loaders
+    can't keep using an old value.
+    """
     lines = existing.splitlines()
     remaining = dict(values)
+    written = set()
     out = []
     for line in lines:
         stripped = line.strip()
         body = stripped[len("export "):].lstrip() if stripped.startswith("export ") else stripped
         key = body.split("=", 1)[0].strip() if "=" in body and not body.startswith("#") else None
+        if key in written:
+            continue
         if key in remaining:
             prefix = "export " if stripped.startswith("export ") else ""
             out.append(f"{prefix}{key}={format_value(remaining.pop(key))}")
+            written.add(key)
         else:
             out.append(line)
     out += [f"{k}={format_value(v)}" for k, v in remaining.items()]
@@ -103,10 +115,17 @@ class SecretStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         os.chmod(self.path.parent, 0o700)
         tmp = self.path.with_suffix(".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            json.dump({"files": files}, f, indent=2, sort_keys=True)
-        os.replace(tmp, self.path)
+        # A leftover temp file could have a looser mode; never reuse it.
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump({"files": files}, f, indent=2, sort_keys=True)
+            os.replace(tmp, self.path)
+        finally:
+            tmp.unlink(missing_ok=True)
+        os.chmod(self.path, 0o600)
 
     def set(self, file: str, values: dict[str, str]) -> None:
         files = self.load()

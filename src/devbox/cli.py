@@ -1102,8 +1102,10 @@ def cmd_costs(ctx: Context) -> int:
         )
     )
     lines = [f"{'KEY':<24} {'SERVERS':>7} {'SNAPS':>5} {'TIME':>8} {'HOURS':>6} {'COST':>9}"]
-    for g in summary["groups"]:
-        cost = costs.money(g["cost"]) + ("*" if g["unknown_price"] else "")
+    # Rows are shown in cents, apportioned so they add up to the total shown below.
+    _, cents = costs.apportion([g["cost"] for g in summary["groups"]], summary["total"], 2)
+    for g, row_cents in zip(summary["groups"], cents):
+        cost = costs.money(row_cents) + ("*" if g["unknown_price"] else "")
         lines.append(
             f"{g['key']:<24} {g['servers']:>7} {g['snapshots']:>5} {costs.duration(g['seconds']):>8} "
             f"{costs.hours(g['billed_hours']):>6} {cost:>9}"
@@ -1383,7 +1385,9 @@ def push_secrets(ctx: Context, server, name: str) -> dict[str, int]:
 def cmd_secrets_set(ctx: Context) -> int:
     name = ctx.args.name
     db.require_project(ctx.conn, name)
-    values = dict(envsecrets.parse_assignment(a) for a in ctx.args.assignments)
+    values = dict(
+        envsecrets.parse_assignment(a, f"argument {i}") for i, a in enumerate(ctx.args.assignments, start=1)
+    )
     if ctx.args.from_file:
         text = sys.stdin.read() if ctx.args.from_file == "-" else Path(ctx.args.from_file).read_text()
         values = {**envsecrets.parse_env(text), **values}
@@ -1474,7 +1478,12 @@ def dump_database(ctx: Context, server, project: str, database: dict, output: Pa
     engine = databases.get_engine(database["engine"])
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     dest = output or dumps_dir(ctx, project) / f"{database['name']}-{stamp}.{engine.extension}"
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    if output is None:
+        dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        for folder in (dest.parent.parent, dest.parent):
+            os.chmod(folder, 0o700)
+    else:
+        dest.parent.mkdir(parents=True, exist_ok=True)
     size = ctx.remote(server).stream_out(engine.dump_command(database["settings"]), dest)
     ctx.event(server, "db_dump")
     return {"database": database["name"], "engine": engine.name, "path": str(dest), "bytes": size}

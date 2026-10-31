@@ -236,28 +236,58 @@ def summarize(items, since=None, until=None, by: str = "project", now: datetime 
         else:
             add(f"{item['project']}#{'snapshot-' if kind == 'snapshot' else ''}{item['hetzner_id']}", kind, usage)
 
+    ordered = sorted(groups.values(), key=lambda g: g["key"])
+    # Round so that the rows add up exactly to the rounded totals.
+    total_r, costs_r = apportion([g["cost"] for g in ordered], total, COST_DIGITS)
+    snap_r, snaps_r = apportion([g["snapshot_cost"] for g in ordered], snapshot_total, COST_DIGITS)
+    hours_r, rows_hours_r = apportion([g["billed_hours"] for g in ordered], total_hours, HOUR_DIGITS)
     return {
         "currency": CURRENCY,
         "since": since.isoformat() if since else None,
         "until": until.isoformat() if until else None,
         "by": by,
-        "total": round(total, 6),
-        "snapshot_total": round(snapshot_total, 6),
+        "total": total_r,
+        "snapshot_total": snap_r,
         "seconds": total_seconds,
-        "billed_hours": round(total_hours, 2),
+        "billed_hours": hours_r,
         "servers": len(counted["server"]),
         "snapshots": len(counted["snapshot"]),
         "unknown_price": unknown,
         "groups": [
-            {
-                **g,
-                "cost": round(g["cost"], 6),
-                "snapshot_cost": round(g["snapshot_cost"], 6),
-                "billed_hours": round(g["billed_hours"], 2),
-            }
-            for g in sorted(groups.values(), key=lambda g: g["key"])
+            {**g, "cost": c, "snapshot_cost": sc, "billed_hours": h}
+            for g, c, sc, h in zip(ordered, costs_r, snaps_r, rows_hours_r)
         ],
     }
+
+
+COST_DIGITS = 6
+HOUR_DIGITS = 2
+
+
+def apportion(values: list[float], total: float, digits: int) -> tuple[float, list[float]]:
+    """Round `total` and each value to `digits` so the rounded values sum exactly to the rounded total.
+
+    Largest-remainder method: round everything down, then give the leftover
+    units to the values that lost the most. Works in integer units, so the
+    result is exact in decimal (e.g. when summed from JSON).
+    """
+    scale = 10 ** digits
+    target = round(total * scale)
+    raw = [v * scale for v in values]
+    units = [math.floor(r + 1e-9) for r in raw]
+    leftover = target - sum(units)
+    order = sorted(range(len(values)), key=lambda i: raw[i] - units[i], reverse=True)
+    if leftover > 0:
+        for i in order[:leftover]:
+            units[i] += 1
+    elif leftover < 0:
+        for i in reversed(order):
+            if leftover == 0:
+                break
+            if units[i] > 0:
+                units[i] -= 1
+                leftover += 1
+    return target / scale, [u / scale for u in units]
 
 
 # Parsing report periods. All errors are DevboxError so `--json` stays valid.
@@ -304,14 +334,15 @@ def resolve_period(
     month: str | None, days: str | None, since: str | None, until: str | None, now: datetime
 ) -> tuple[datetime | None, datetime | None]:
     """[since, until) for a report; None means unbounded on that side."""
+    # `is not None`: an explicitly empty value is invalid, not "no filter".
     start = end = None
-    if month:
+    if month is not None:
         start, end = parse_month(month)
     if days is not None:
         start = now - timedelta(days=parse_days(days))
-    if since:
+    if since is not None:
         start = parse_day(since)
-    if until:
+    if until is not None:
         end = parse_day(until)
     if start and end and end <= start:
         raise DevboxError(
