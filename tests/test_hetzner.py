@@ -46,7 +46,7 @@ if resp.exists():
     def respond(key, data):
         (responses / key).write_text(json.dumps(data))
 
-    return Hcloud("token", binary=str(script)), calls, respond
+    return Hcloud("token", "abc123", binary=str(script)), calls, respond
 
 
 def test_server_info_reads_location_and_old_datacenter_shape():
@@ -57,46 +57,84 @@ def test_server_info_reads_location_and_old_datacenter_shape():
     assert server_info(SERVER)["ip"] == "1.2.3.4"
 
 
-def test_list_servers_filters_by_label(fake_hcloud):
+OWNED = {"managed-by": "devbox", "devbox-controller": "abc123"}
+
+
+def test_list_servers_filters_by_label_and_controller(fake_hcloud):
     hc, calls, respond = fake_hcloud
-    respond("server_list", [SERVER])
-    assert [s["id"] for s in hc.list_servers()] == [42]
+    other = dict(SERVER, id=43, labels={"managed-by": "devbox", "devbox-controller": "other", "project": "x"})
+    legacy = dict(SERVER, id=44, labels={"managed-by": "devbox", "project": "old"})
+    mine = dict(SERVER, labels={**OWNED, "project": "crm"})
+    respond("server_list", [mine, other, legacy])
+    assert [s["id"] for s in hc.list_servers()] == [42, 44]
     assert calls()[0]["args"] == ["server", "list", "-l", "managed-by=devbox", "-o", "json"]
 
 
 def test_create_server_labels_and_parses(fake_hcloud, tmp_path):
     hc, calls, respond = fake_hcloud
     respond("server_create", {"server": SERVER, "root_password": None})
-    info = hc.create_server("devbox-crm", "crm", "cx23", "ubuntu-24.04", "fsn1", tmp_path / "ud.yaml")
+    info = hc.create_server(
+        "devbox-crm", "crm", "cx23", "ubuntu-24.04", "fsn1", tmp_path / "ud.yaml",
+        ssh_key_id=7, firewall_id=9,
+    )
     assert info["id"] == 42
     args = calls()[0]["args"]
-    assert "managed-by=devbox" in args and "project=crm" in args
-    assert args[args.index("--firewall") + 1] == "devbox"
+    assert "managed-by=devbox" in args and "project=crm" in args and "devbox-controller=abc123" in args
+    assert args[args.index("--firewall") + 1] == "9"
+    assert args[args.index("--ssh-key") + 1] == "7"
 
 
-def test_firewall_created_then_replaced(fake_hcloud):
+def test_firewall_created_then_replaced_by_id(fake_hcloud):
     hc, calls, respond = fake_hcloud
     respond("firewall_list", [])
-    hc.ensure_firewall(["1.2.3.4/32"])
-    assert calls()[-1]["args"][:2] == ["firewall", "create"]
-    assert json.loads(calls()[-1]["stdin"]) == firewall_rules(["1.2.3.4/32"])
+    respond("firewall_create", {"firewall": {"id": 5, "name": "devbox-abc123"}})
+    assert hc.ensure_firewall(["192.0.2.1/32"]) == 5
+    create = calls()[-1]
+    assert create["args"][:2] == ["firewall", "create"]
+    assert "devbox-abc123" in create["args"] and "devbox-controller=abc123" in create["args"]
+    assert json.loads(create["stdin"]) == firewall_rules(["192.0.2.1/32"])
 
-    respond("firewall_list", [{"name": "devbox"}])
-    hc.ensure_firewall(["5.6.7.8/32"])
-    assert calls()[-1]["args"][:3] == ["firewall", "replace-rules", "devbox"]
+    respond("firewall_list", [{"id": 5, "name": "devbox-abc123", "labels": OWNED}])
+    assert hc.ensure_firewall(["198.51.100.1/32"]) == 5
+    assert calls()[-1]["args"][:3] == ["firewall", "replace-rules", "5"]
 
 
-def test_ssh_key_mismatch_is_an_error(fake_hcloud):
+@pytest.mark.parametrize("labels", [
+    {},
+    {"owner": "somebody-else"},
+    {"managed-by": "devbox"},
+    {"managed-by": "devbox", "devbox-controller": "other"},
+])
+def test_firewall_not_owned_is_never_modified(fake_hcloud, labels):
+    hc, calls, respond = fake_hcloud
+    respond("firewall_list", [{"id": 999, "name": "devbox-abc123", "labels": labels}])
+    with pytest.raises(DevboxError, match="refusing to modify"):
+        hc.ensure_firewall(["192.0.2.1/32"])
+    assert [c["args"][:2] for c in calls()] == [["firewall", "list"]]
+
+
+def test_unrelated_firewall_named_devbox_is_ignored(fake_hcloud):
+    hc, calls, respond = fake_hcloud
+    respond("firewall_list", [{"id": 999, "name": "devbox", "labels": {"owner": "somebody-else"}}])
+    respond("firewall_create", {"firewall": {"id": 6}})
+    assert hc.ensure_firewall(["192.0.2.1/32"]) == 6
+    assert not any("999" in c["args"] or c["args"][:2] == ["firewall", "replace-rules"] for c in calls())
+
+
+def test_ssh_key_ownership_and_mismatch(fake_hcloud):
     hc, _, respond = fake_hcloud
-    respond("ssh-key_list", [{"name": "devbox", "public_key": "ssh-ed25519 AAAA other"}])
-    hc.ensure_ssh_key("ssh-ed25519 AAAA devbox")
-    with pytest.raises(DevboxError):
+    respond("ssh-key_list", [{"id": 3, "name": "devbox-abc123", "public_key": "ssh-ed25519 AAAA x", "labels": OWNED}])
+    assert hc.ensure_ssh_key("ssh-ed25519 AAAA devbox") == 3
+    with pytest.raises(DevboxError, match="does not match"):
         hc.ensure_ssh_key("ssh-ed25519 BBBB devbox")
+    respond("ssh-key_list", [{"id": 3, "name": "devbox-abc123", "public_key": "ssh-ed25519 AAAA x", "labels": {}}])
+    with pytest.raises(DevboxError, match="refusing to modify"):
+        hc.ensure_ssh_key("ssh-ed25519 AAAA devbox")
 
 
 def test_missing_hcloud_binary():
     with pytest.raises(DevboxError, match="hcloud CLI not found"):
-        Hcloud(None, binary="/nonexistent/hcloud").list_servers()
+        Hcloud(None, "abc123", binary="/nonexistent/hcloud").list_servers()
 
 
 def server_type(name, cores, memory, arch, locations, deprecation=None):

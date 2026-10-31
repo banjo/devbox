@@ -13,3 +13,7 @@ ssh_key = "~/.ssh/devbox"
 
 # CIDRs allowed to SSH into devboxes. "auto" = this machine's public IPv4.
 ssh_allow = ["auto"]
+
+# Identifies this install in Hetzner labels and resource names. Generated and
+# stored in ~/.local/state/devbox/controller-id when not set.
+# controller_id = "my-laptop"

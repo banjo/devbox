@@ -57,13 +57,15 @@ CREATE TABLE servers (
 
 A project has at most one server with status other than `deleted`. Deleted rows are kept as history.
 
-**Hetzner is the source of truth for whether a server exists.** Every server is created with labels `managed-by=devbox` and `project=<name>`. Before `up`, `status` and `down`, the CLI compares the registry with `hcloud server list -l managed-by=devbox -o json`:
+**Hetzner is the source of truth for whether a server exists.** Every server is created with labels `managed-by=devbox`, `devbox-controller=<id>` (a random id per install) and `project=<name>`. The SSH key and firewall are named `devbox-<id>` and carry the same labels; a resource with that name but without the labels is never modified. Before `up`, `status` and `down`, the CLI compares the registry with `hcloud server list -l managed-by=devbox -o json`:
 - The registry says running but the server is gone in Hetzner: mark the row `deleted`.
 - A labeled server exists with no registry row (for example after a crash during `up`): add it to the registry.
 
 Background processes are not stored in the registry. They are systemd units on the server, and `ps` asks the server directly.
 
-Snapshots later: a `snapshots` table (project, hetzner_image_id, created_at, status) in migration 2. `up` then restores from the latest snapshot when one exists, and `down --snapshot` creates one first.
+Migration 2 adds cost tracking: `servers.price_hourly` and `servers.price_monthly` (stored by `up` from the offer it created), `projects.removed_at` (so `project remove` keeps cost history), and an `events` table (project, server, kind, time) counting `up`, `sync`, `exec`, `exec_detach`, `expose` and `down` for the per-server stats.
+
+Snapshots later: a `snapshots` table (project, hetzner_image_id, created_at, status) in migration 3. `up` then restores from the latest snapshot when one exists, and `down --snapshot` creates one first.
 
 ### Project notes
 
@@ -97,8 +99,9 @@ Next time the agent reads the notes first and does not have to work it out again
 | `devbox logs NAME PROC [-f] [-n LINES]` | Shows output from a background process. |
 | `devbox expose NAME PORT` | Starts or moves the preview tunnel to a port on the server and prints the URL. |
 | `devbox ssh NAME` | Opens a shell on the server. |
-| `devbox status [NAME]` | Shows each project's server (or `none`), IP, type, uptime, background processes and preview URL. |
-| `devbox down NAME` | Deletes the server and marks it `deleted`. Anything that exists only on the server (database contents, files not synced back) is lost. |
+| `devbox status [NAME]` | Shows each project's server (or `none`), IP, type, uptime, cost so far, background processes and preview URL, plus this month's total. |
+| `devbox down NAME` | Deletes the server and marks it `deleted`, then prints its uptime, billed hours, estimated cost, activity counts and the project's total. Anything that exists only on the server (database contents, files not synced back) is lost. |
+| `devbox costs [--month M \| --days N \| --since D] [--until D] [--project P] [--by project\|month\|day\|type\|server]` | Estimated cost for any period, grouped. Per started hour, capped at the monthly price per calendar month, server price only. |
 
 All commands accept `--json` for output the agent can parse.
 
@@ -129,7 +132,10 @@ skills/hetzner-devbox/SKILL.md
 tests/test_db.py         # migrations, one-server-per-project rule, notes
 tests/test_reconcile.py  # registry vs Hetzner state
 tests/test_hetzner.py    # hcloud wrapper against a fake hcloud executable
-tests/test_cli.py        # project commands, exec argument handling, no local fallback
+tests/test_cli.py        # project commands, exec argument handling, no local fallback, down/status/costs
+tests/test_remote.py     # Git-based sync file list and deletions, exec timeout enforcement
+tests/test_costs.py      # billing math, period summaries, cost history
+src/devbox/costs.py      # cost estimates
 ```
 
 ## 7. The skill
@@ -167,7 +173,7 @@ The skill tells the agent:
 
 ## 9. Later, if the POC works
 
-- Snapshots (migration 2): `down --snapshot`, restore on `up`
+- Snapshots (migration 3): `down --snapshot`, restore on `up`
 - Database backups to S3
 - Fixed preview hostname with a named Cloudflare tunnel (and optionally Access)
 - Automatic shutdown of idle servers and cost estimates

@@ -7,13 +7,16 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from importlib import resources
 from pathlib import Path
 
-from devbox import DevboxError, config, db
+from devbox import DevboxError, config, costs, db
 from devbox.hetzner import Hcloud, filter_offers
 from devbox.remote import TUNNEL, Remote, to_script, validate_proc
+
+
+EXIT_TIMEOUT = 124
 
 
 class Context:
@@ -38,13 +41,16 @@ class Context:
     @property
     def hcloud(self) -> Hcloud:
         if self._hcloud is None:
-            self._hcloud = Hcloud(self.cfg.hcloud_token())
+            self._hcloud = Hcloud(self.cfg.hcloud_token(), self.cfg.get_controller_id())
         return self._hcloud
 
     def known_hosts(self, server) -> Path:
         path = self.cfg.state_dir / "known_hosts" / f"{server['project']}-{server['hetzner_id']}"
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
+
+    def manifest(self, server) -> Path:
+        return self.cfg.state_dir / "manifests" / f"{server['project']}-{server['hetzner_id']}.json"
 
     def remote(self, server) -> Remote:
         return Remote(server["ip"], self.cfg.ssh_key, self.known_hosts(server))
@@ -59,7 +65,29 @@ class Context:
         return server
 
     def reconcile(self) -> list[dict]:
-        return db.reconcile(self.conn, self.hcloud.list_servers())
+        orphans = db.reconcile(self.conn, self.hcloud.list_servers())
+        self.fill_missing_prices()
+        return orphans
+
+    def fill_missing_prices(self) -> None:
+        """Servers adopted by reconcile (or created before prices were stored) get today's price."""
+        missing = [s for s in db.servers_missing_price(self.conn) if s["status"] != "deleted"]
+        if not missing:
+            return
+        try:
+            offers = self.hcloud.offers()
+        except DevboxError:
+            return
+        prices = {(o["type"], o["location"]): o for o in offers}
+        for s in missing:
+            o = prices.get((s["server_type"], s["location"]))
+            if o:
+                db.update_server(
+                    self.conn, s["id"], price_hourly=o["price_hourly"], price_monthly=o["price_monthly"]
+                )
+
+    def event(self, server, kind: str) -> None:
+        db.add_event(self.conn, server["project"], server["id"], kind)
 
     @contextlib.contextmanager
     def lock(self):
@@ -87,16 +115,13 @@ def row(r) -> dict | None:
 def uptime(created_at: str | None) -> str | None:
     if not created_at:
         return None
-    started = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-    secs = int((datetime.now(timezone.utc) - started).total_seconds())
-    days, rem = divmod(secs, 86400)
-    hours, rem = divmod(rem, 3600)
-    mins = rem // 60
-    if days:
-        return f"{days}d {hours}h"
-    if hours:
-        return f"{hours}h {mins}m"
-    return f"{mins}m"
+    started = costs.parse_ts(created_at)
+    return costs.duration((datetime.now(timezone.utc) - started).total_seconds())
+
+
+def cost_line(usage: dict, server) -> str:
+    rate = f"€{server['price_hourly']:.4f}/h" if server["price_hourly"] is not None else "price unknown"
+    return f"{costs.money(usage['cost'])} so far ({usage['billed_hours']} billed h at {rate})"
 
 
 # Projects
@@ -276,8 +301,8 @@ def cmd_up(ctx: Context) -> int:
                 )
             offer = choose_offer(ctx)
             public_key = ensure_local_ssh_key(cfg.ssh_key)
-            ctx.hcloud.ensure_ssh_key(public_key)
-            ctx.hcloud.ensure_firewall(resolve_ssh_allow(cfg.ssh_allow))
+            ssh_key_id = ctx.hcloud.ensure_ssh_key(public_key)
+            firewall_id = ctx.hcloud.ensure_firewall(resolve_ssh_allow(cfg.ssh_allow))
 
             print(f"creating {describe_offer(offer)} for {name}...", file=sys.stderr)
             user_data = resources.files("devbox").joinpath("cloud-init.yaml").read_text()
@@ -285,14 +310,18 @@ def cmd_up(ctx: Context) -> int:
                 f.write(user_data)
                 f.flush()
                 info = ctx.hcloud.create_server(
-                    f"devbox-{name}", name, offer["type"], cfg.image, offer["location"], Path(f.name)
+                    f"devbox-{name}", name, offer["type"], cfg.image, offer["location"], Path(f.name),
+                    ssh_key_id=ssh_key_id, firewall_id=firewall_id,
                 )
             db.insert_server(
                 ctx.conn, name, info["id"], "creating",
-                ip=info["ip"], server_type=info["server_type"], location=info["location"],
+                ip=info["ip"], server_type=info["server_type"] or offer["type"],
+                location=info["location"] or offer["location"], created_at=info.get("created"),
+                price_hourly=offer["price_hourly"], price_monthly=offer["price_monthly"],
             )
             server = db.active_server(ctx.conn, name)
             created = True
+            ctx.event(server, "create")
 
         remote = ctx.remote(server)
         if server["status"] != "running":
@@ -301,7 +330,11 @@ def cmd_up(ctx: Context) -> int:
         db.update_server(ctx.conn, server["id"], status="running")
 
         print("syncing code...", file=sys.stderr)
-        remote.sync(project["path"])
+        sync = remote.sync(project["path"], ctx.manifest(server))
+        if sync["warning"]:
+            warnings.append(sync["warning"])
+        ctx.event(server, "up")
+        ctx.event(server, "sync")
         server = db.active_server(ctx.conn, name)
 
     data = {
@@ -323,6 +356,47 @@ def cmd_up(ctx: Context) -> int:
     return 0
 
 
+def server_summary(ctx: Context, server) -> dict:
+    """Usage, cost and activity for one server over its whole lifetime."""
+    usage = costs.server_usage(server)
+    project_total = costs.summarize(db.all_servers(ctx.conn, server["project"]))
+    return {
+        "server": row(server),
+        "uptime_seconds": usage["seconds"],
+        "billed_hours": usage["billed_hours"],
+        "cost": usage["cost"],
+        "currency": costs.CURRENCY,
+        "activity": db.event_counts(ctx.conn, server["id"]),
+        "project_total": project_total["total"],
+        "project_servers": project_total["servers"],
+    }
+
+
+ACTIVITY_LABELS = [
+    ("sync", "sync"), ("exec", "exec"), ("exec_detach", "background start"),
+    ("expose", "expose"), ("up", "up"),
+]
+
+
+def summary_lines(summary: dict) -> list[str]:
+    s = summary["server"]
+    rate = f"€{s['price_hourly']:.4f}/h" if s["price_hourly"] is not None else "unknown price"
+    lines = [
+        f"  {s['server_type']} in {s['location']}, up {costs.duration(summary['uptime_seconds'])} "
+        f"({summary['billed_hours']} billed hours at {rate})",
+        f"  cost: {costs.money(summary['cost'])} (estimate, server only, incl. VAT)",
+    ]
+    counts = summary["activity"]
+    parts = [f"{counts[k]} {label}{'s' if counts[k] != 1 else ''}" for k, label in ACTIVITY_LABELS if counts.get(k)]
+    if parts:
+        lines.append(f"  activity: {', '.join(parts)}")
+    lines.append(
+        f"  project total: {costs.money(summary['project_total'])} over {summary['project_servers']} "
+        f"server{'s' if summary['project_servers'] != 1 else ''}"
+    )
+    return lines
+
+
 def cmd_down(ctx: Context) -> int:
     name = ctx.args.name
     with ctx.lock():
@@ -333,12 +407,15 @@ def cmd_down(ctx: Context) -> int:
             emit(ctx.args, {"project": name, "deleted": None}, f"{name} has no server")
             return 0
         ctx.hcloud.delete_server(server["hetzner_id"])
+        ctx.event(server, "down")
         db.mark_deleted(ctx.conn, server["id"])
         ctx.known_hosts(server).unlink(missing_ok=True)
+        ctx.manifest(server).unlink(missing_ok=True)
+        summary = server_summary(ctx, db.get_server(ctx.conn, server["id"]))
     emit(
         ctx.args,
-        {"project": name, "deleted": server["hetzner_id"]},
-        f"deleted server {server['hetzner_id']} for {name}",
+        {"project": name, "deleted": server["hetzner_id"], **summary},
+        "\n".join([f"deleted server {server['hetzner_id']} for {name}", *summary_lines(summary)]),
     )
     return 0
 
@@ -356,12 +433,19 @@ def cmd_status(ctx: Context) -> int:
         entry = {"project": p["name"], "server": row(server), "processes": None}
         if server:
             entry["uptime"] = uptime(server["created_at"])
+            entry["usage"] = costs.server_usage(server)
             if server["status"] == "running":
                 try:
                     entry["processes"] = ctx.remote(server).list_units()
                 except DevboxError as e:
                     entry["processes_error"] = str(e)
         result.append(entry)
+
+    now = datetime.now(timezone.utc)
+    month_start = costs.month_start(now)
+    month = costs.summarize(
+        db.all_servers(ctx.conn, ctx.args.name), since=month_start, now=now
+    )
 
     lines = []
     for e in result:
@@ -374,6 +458,7 @@ def cmd_status(ctx: Context) -> int:
             f"{e['project']}: {s['status']} {s['server_type']} {s['location']} {s['ip']} "
             f"(id {s['hetzner_id']}, up {e['uptime']})"
         )
+        lines.append(f"  cost: {cost_line(e['usage'], s)}")
         if s["preview_url"]:
             lines.append(f"  preview: {s['preview_url']} -> port {s['preview_port']}")
         for proc in e["processes"] or []:
@@ -384,15 +469,67 @@ def cmd_status(ctx: Context) -> int:
         lines.append(f"unregistered devbox server {o['name']} (id {o['id']}, {o['ip']})")
     if not lines:
         lines.append("no devbox servers")
-    emit(ctx.args, {"projects": result, "unregistered": orphans}, "\n".join(lines))
+    scope = f" for {ctx.args.name}" if ctx.args.name else ""
+    lines.append(f"this month{scope}: {costs.money(month['total'])} (see `devbox costs`)")
+    emit(
+        ctx.args,
+        {"projects": result, "unregistered": orphans, "month": month},
+        "\n".join(lines),
+    )
+    return 0
+
+
+def cmd_costs(ctx: Context) -> int:
+    a = ctx.args
+    now = datetime.now(timezone.utc)
+    since = until = None
+    if a.month:
+        since, until = costs.parse_month(a.month)
+    if a.days:
+        since = now - timedelta(days=a.days)
+    if a.since:
+        since = costs.parse_day(a.since)
+    if a.until:
+        until = costs.parse_day(a.until)
+    if a.project and not db.get_project(ctx.conn, a.project) and not db.all_servers(ctx.conn, a.project):
+        raise DevboxError(f"unknown project '{a.project}'")
+
+    summary = costs.summarize(db.all_servers(ctx.conn, a.project), since, until, a.by, now)
+    period = " to ".join(
+        x for x in (
+            since.date().isoformat() if since else "start",
+            (until - timedelta(seconds=1)).date().isoformat() if until else "now",
+        )
+    )
+    lines = [f"{'KEY':<24} {'SERVERS':>7} {'TIME':>8} {'HOURS':>6} {'COST':>9}"]
+    for g in summary["groups"]:
+        cost = costs.money(g["cost"]) + ("*" if g["unknown_price"] else "")
+        lines.append(
+            f"{g['key']:<24} {g['servers']:>7} {costs.duration(g['seconds']):>8} "
+            f"{g['billed_hours']:>6} {cost:>9}"
+        )
+    lines.append(
+        f"total {period}: {costs.money(summary['total'])} over {summary['servers']} "
+        f"server{'s' if summary['servers'] != 1 else ''}, {costs.duration(summary['seconds'])} running"
+    )
+    if summary["unknown_price"]:
+        lines.append(f"* {summary['unknown_price']} server(s) without a known price are not counted")
+    lines.append("Estimates: server price only (incl. VAT), per started hour, capped monthly.")
+    emit(ctx.args, summary, "\n".join(lines))
     return 0
 
 
 def cmd_sync(ctx: Context) -> int:
     server = ctx.running_server(ctx.args.name)
     project = db.require_project(ctx.conn, ctx.args.name)
-    ctx.remote(server).sync(project["path"])
-    emit(ctx.args, {"project": ctx.args.name, "synced": True}, "synced")
+    result = ctx.remote(server).sync(project["path"], ctx.manifest(server))
+    ctx.event(server, "sync")
+    text = (
+        f"synced {result['files']} files, deleted {result['deleted']}"
+        if result["mode"] == "git"
+        else f"synced (warning: {result['warning']})"
+    )
+    emit(ctx.args, {"project": ctx.args.name, **result}, text)
     return 0
 
 
@@ -404,10 +541,13 @@ def cmd_exec(ctx: Context) -> int:
     if ctx.args.detach:
         if not ctx.args.proc:
             raise DevboxError("--detach needs --name PROC")
+        if ctx.args.timeout is not None:
+            raise DevboxError("--timeout only applies to foreground commands")
         validate_proc(ctx.args.proc)
         if ctx.args.proc == TUNNEL:
             raise DevboxError(f"'{TUNNEL}' is reserved for the preview tunnel; use `devbox expose`")
         remote.start_unit(ctx.args.proc, script)
+        ctx.event(server, "exec_detach")
         emit(
             ctx.args,
             {"project": ctx.args.name, "process": ctx.args.proc, "started": True},
@@ -415,12 +555,22 @@ def cmd_exec(ctx: Context) -> int:
         )
         return 0
 
+    ctx.event(server, "exec")
+    result = remote.exec(script, timeout=ctx.args.timeout, capture=ctx.args.json)
+    code = EXIT_TIMEOUT if result.timed_out else result.returncode
     if ctx.args.json:
-        proc = remote.run(script, capture=True, check=False, timeout=ctx.args.timeout)
-        emit(ctx.args, {"exit_code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr})
-        return proc.returncode
-    proc = remote.run(script, capture=False, check=False, timeout=ctx.args.timeout)
-    return proc.returncode
+        emit(ctx.args, {
+            "exit_code": code,
+            "timed_out": result.timed_out,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        })
+    elif result.timed_out:
+        print(
+            f"error: timed out after {ctx.args.timeout:g}s; the command was stopped on the server",
+            file=sys.stderr,
+        )
+    return code
 
 
 def cmd_ps(ctx: Context) -> int:
@@ -457,6 +607,7 @@ def cmd_expose(ctx: Context) -> int:
     if not 1 <= port <= 65535:
         raise DevboxError(f"invalid port {port}")
     url = ctx.remote(server).start_tunnel(port)
+    ctx.event(server, "expose")
     db.update_server(ctx.conn, server["id"], preview_port=port, preview_url=url)
     emit(ctx.args, {"project": ctx.args.name, "port": port, "url": url}, url)
     return 0
@@ -523,7 +674,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("down", cmd_down, "delete the server")
     p.add_argument("name")
 
-    p = add("status", cmd_status, "show servers, processes and preview URLs")
+    p = add("costs", cmd_costs, "estimated server costs for a period, grouped")
+    p.add_argument("--project", help="only this project")
+    period = p.add_mutually_exclusive_group()
+    period.add_argument("--month", metavar="YYYY-MM", help="one calendar month (UTC)")
+    period.add_argument("--days", type=int, metavar="N", help="the last N days")
+    period.add_argument("--since", metavar="YYYY-MM-DD", help="from this day (UTC)")
+    p.add_argument("--until", metavar="YYYY-MM-DD", help="up to, not including, this day")
+    p.add_argument("--by", choices=costs.GROUPINGS, default="project", help="grouping (default: project)")
+
+    p = add("status", cmd_status, "show servers, processes, preview URLs and cost so far")
     p.add_argument("name", nargs="?")
 
     p = add("sync", cmd_sync, "copy local code to the server")
@@ -537,7 +697,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name")
     p.add_argument("--detach", action="store_true", help="run in the background as a named process")
     p.add_argument("--name", dest="proc", metavar="PROC", help="process name for --detach")
-    p.add_argument("--timeout", type=float, help="seconds before giving up (foreground only)")
+    p.add_argument(
+        "--timeout", type=float, metavar="SECONDS",
+        help="stop the command on the server after this many seconds (foreground only; exit code 124)",
+    )
     p.epilog = "usage: devbox exec NAME [--detach --name PROC] -- CMD..."
 
     p = add("ps", cmd_ps, "list background processes")

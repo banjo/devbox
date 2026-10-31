@@ -1,4 +1,6 @@
 import os
+import re
+import secrets
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,11 +28,28 @@ class Config:
     ssh_key: Path = field(default_factory=lambda: Path.home() / ".ssh" / "devbox")
     # CIDRs allowed to reach SSH on devboxes. "auto" means this host's public IPv4.
     ssh_allow: list[str] = field(default_factory=lambda: ["auto"])
+    # Identifies this devbox install in Hetzner labels. Generated on first use.
+    controller_id: str | None = None
     state_dir: Path = field(default_factory=state_dir)
 
     @property
     def db_path(self) -> Path:
         return self.state_dir / "devbox.db"
+
+    def get_controller_id(self) -> str:
+        if self.controller_id:
+            return self.controller_id
+        path = self.state_dir / "controller-id"
+        if path.exists():
+            value = path.read_text().strip()
+        else:
+            value = secrets.token_hex(4)
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(value + "\n")
+        if not CONTROLLER_RE.match(value):
+            raise DevboxError(f"invalid controller id '{value}' in {path}")
+        self.controller_id = value
+        return value
 
     def hcloud_token(self) -> str | None:
         if self.hcloud_token_file is None:
@@ -42,7 +61,8 @@ class Config:
 
 
 _PATH_KEYS = {"hcloud_token_file", "ssh_key"}
-_STR_KEYS = {"server_type", "location", "image"}
+_STR_KEYS = {"server_type", "location", "image", "controller_id"}
+CONTROLLER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 
 
 def load(path: Path | None = None) -> Config:
@@ -66,4 +86,6 @@ def load(path: Path | None = None) -> Config:
             cfg.ssh_allow = value
         else:
             raise DevboxError(f"{path}: unknown key '{key}'")
+    if cfg.controller_id and not CONTROLLER_RE.match(cfg.controller_id):
+        raise DevboxError(f"{path}: controller_id must be lowercase letters, digits and dashes")
     return cfg

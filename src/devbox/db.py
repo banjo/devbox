@@ -32,6 +32,21 @@ MIGRATIONS = [
     CREATE UNIQUE INDEX servers_one_active_per_project
       ON servers(project) WHERE status != 'deleted';
     """,
+    """
+    ALTER TABLE projects ADD COLUMN removed_at TEXT;
+    ALTER TABLE servers ADD COLUMN price_hourly REAL;
+    ALTER TABLE servers ADD COLUMN price_monthly REAL;
+
+    CREATE TABLE events (
+      id          INTEGER PRIMARY KEY,
+      project     TEXT NOT NULL REFERENCES projects(name),
+      server_id   INTEGER REFERENCES servers(id),
+      kind        TEXT NOT NULL,
+      at          TEXT NOT NULL
+    );
+
+    CREATE INDEX events_server ON events(server_id);
+    """,
 ]
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
@@ -81,9 +96,17 @@ def validate_name(name: str) -> None:
 
 def add_project(conn: sqlite3.Connection, name: str, path: str) -> None:
     validate_name(name)
-    if get_project(conn, name):
+    existing = conn.execute("SELECT * FROM projects WHERE name = ?", (name,)).fetchone()
+    if existing and existing["removed_at"] is None:
         raise DevboxError(f"project '{name}' already exists")
     ts = now()
+    if existing:
+        # A removed project keeps its cost history; adding it again revives it.
+        conn.execute(
+            "UPDATE projects SET path = ?, notes = '', removed_at = NULL, updated_at = ? WHERE name = ?",
+            (path, ts, name),
+        )
+        return
     conn.execute(
         "INSERT INTO projects (name, path, created_at, updated_at) VALUES (?, ?, ?, ?)",
         (name, path, ts, ts),
@@ -91,7 +114,9 @@ def add_project(conn: sqlite3.Connection, name: str, path: str) -> None:
 
 
 def get_project(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
-    return conn.execute("SELECT * FROM projects WHERE name = ?", (name,)).fetchone()
+    return conn.execute(
+        "SELECT * FROM projects WHERE name = ? AND removed_at IS NULL", (name,)
+    ).fetchone()
 
 
 def require_project(conn: sqlite3.Connection, name: str) -> sqlite3.Row:
@@ -102,7 +127,9 @@ def require_project(conn: sqlite3.Connection, name: str) -> sqlite3.Row:
 
 
 def list_projects(conn: sqlite3.Connection) -> list[sqlite3.Row]:
-    return conn.execute("SELECT * FROM projects ORDER BY name").fetchall()
+    return conn.execute(
+        "SELECT * FROM projects WHERE removed_at IS NULL ORDER BY name"
+    ).fetchall()
 
 
 def set_notes(conn: sqlite3.Connection, name: str, notes: str) -> None:
@@ -113,13 +140,13 @@ def set_notes(conn: sqlite3.Connection, name: str, notes: str) -> None:
 
 
 def remove_project(conn: sqlite3.Connection, name: str) -> None:
+    """Hide a project. Its servers and events stay for cost history."""
     require_project(conn, name)
     if active_server(conn, name):
         raise DevboxError(f"project '{name}' has a server; run `devbox down {name}` first")
-    conn.execute("BEGIN")
-    conn.execute("DELETE FROM servers WHERE project = ?", (name,))
-    conn.execute("DELETE FROM projects WHERE name = ?", (name,))
-    conn.execute("COMMIT")
+    conn.execute(
+        "UPDATE projects SET removed_at = ?, updated_at = ? WHERE name = ?", (now(), now(), name)
+    )
 
 
 # Servers
@@ -146,17 +173,59 @@ def insert_server(
     server_type: str | None = None,
     location: str | None = None,
     created_at: str | None = None,
+    price_hourly: float | None = None,
+    price_monthly: float | None = None,
 ) -> int:
     cur = conn.execute(
         """INSERT INTO servers
-           (project, hetzner_id, ip, server_type, location, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (project, hetzner_id, ip, server_type, location, status, created_at or now()),
+           (project, hetzner_id, ip, server_type, location, status, created_at,
+            price_hourly, price_monthly)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (project, hetzner_id, ip, server_type, location, status, created_at or now(),
+         price_hourly, price_monthly),
     )
     return cur.lastrowid
 
 
-_SERVER_FIELDS = {"ip", "server_type", "location", "status", "preview_port", "preview_url"}
+def get_server(conn: sqlite3.Connection, server_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM servers WHERE id = ?", (server_id,)).fetchone()
+
+
+def all_servers(conn: sqlite3.Connection, project: str | None = None) -> list[sqlite3.Row]:
+    if project:
+        return conn.execute(
+            "SELECT * FROM servers WHERE project = ? ORDER BY created_at", (project,)
+        ).fetchall()
+    return conn.execute("SELECT * FROM servers ORDER BY created_at").fetchall()
+
+
+def servers_missing_price(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM servers WHERE price_hourly IS NULL AND server_type IS NOT NULL"
+    ).fetchall()
+
+
+# Events (activity counts for stats)
+
+
+def add_event(conn: sqlite3.Connection, project: str, server_id: int | None, kind: str) -> None:
+    conn.execute(
+        "INSERT INTO events (project, server_id, kind, at) VALUES (?, ?, ?, ?)",
+        (project, server_id, kind, now()),
+    )
+
+
+def event_counts(conn: sqlite3.Connection, server_id: int) -> dict[str, int]:
+    rows = conn.execute(
+        "SELECT kind, COUNT(*) AS n FROM events WHERE server_id = ? GROUP BY kind", (server_id,)
+    ).fetchall()
+    return {r["kind"]: r["n"] for r in rows}
+
+
+_SERVER_FIELDS = {
+    "ip", "server_type", "location", "status", "preview_port", "preview_url",
+    "price_hourly", "price_monthly",
+}
 
 
 def update_server(conn: sqlite3.Connection, server_id: int, **fields) -> None:

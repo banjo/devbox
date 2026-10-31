@@ -85,13 +85,20 @@ Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/a
 1. Edit locally.
 2. `devbox sync NAME`. Dev servers in watch mode pick up the change.
 3. If dependencies changed: `devbox exec NAME -- 'npm ci'`, then restart the process with the same `exec --detach --name web ...` command (it replaces the old one).
-4. Run tests with foreground `exec`: `devbox exec NAME -- 'npm test'`.
+4. Run tests with foreground `exec`: `devbox exec NAME -- 'npm test'`. Add `--timeout SECONDS` for anything that might hang; the server stops the command when time is up and `exec` exits with 124.
 5. Debug with `devbox logs NAME PROC` and `devbox exec`. For a broken preview, check `devbox logs NAME tunnel`.
 
 ### Finishing
 
 1. Remind the user that `down` deletes the server and its data (for example the database). Code is safe because it lives on this machine.
 2. When they confirm: `devbox down NAME`.
+3. Pass on the summary `down` prints: how long the server ran, its estimated cost, and the project's total so far.
+
+### Costs
+
+- `devbox status` shows each running server's cost so far and the total for this month.
+- `devbox costs` answers questions like "what did this cost?": `--month 2026-10`, `--days 7`, `--since 2026-10-01 --until 2026-11-01`, `--project NAME`, and `--by project|month|day|type|server`.
+- Costs are estimates of the server price only (incl. VAT, per started hour, capped monthly). Say so when reporting them.
 
 ## Examples
 
@@ -101,7 +108,8 @@ Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/a
 | "Change the dashboard layout" | Edit locally; `sync` if a server is running |
 | "Run the tests" | `devbox exec NAME -- 'npm test'` (or whatever the notes say) |
 | "Which servers are running?" | `devbox status` |
-| "We're done for today" | Remind about data loss, then `devbox down NAME` |
+| "What have I spent this month?" | `devbox costs --month YYYY-MM` |
+| "We're done for today" | Remind about data loss, `devbox down NAME`, report the cost summary |
 
 ## Pitfalls
 
@@ -111,6 +119,8 @@ Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/a
 - Processes do not restart on their own. After a crash, check `logs` and run the same `exec --detach` again.
 - A new server has nothing installed: runtimes, `node_modules`, databases and `.env` must be set up again. Notes should say which steps that means.
 - If `exec` fails with an SSH error, run `devbox status`; the server may have been deleted.
+- Without `--timeout`, a foreground command keeps running on the server if the connection drops. `--timeout` does not stop containers started with `-d`; stop those with `docker compose down`.
+- Sync follows the project's Git ignore rules. Ignored files (such as `.env`) never reach the server, and files you delete locally are deleted on the server at the next sync.
 - ARM servers (`cax*`) are often cheaper, but some Docker images and native dependencies only exist for x86.
 - If `devbox status` shows a server that has been up a long time, remind the user that it still costs money.
 

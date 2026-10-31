@@ -1,13 +1,20 @@
+import json
+import math
+import os
 import re
+import secrets
 import shlex
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from devbox import DevboxError
 
 APP_DIR = "/srv/app"
 UNIT_PREFIX = "devbox-"
+EXEC_UNIT_PREFIX = "devbox-exec-"
+EXEC_KILL_AFTER = 10
 TUNNEL = "tunnel"
 PROC_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
 TUNNEL_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
@@ -25,6 +32,41 @@ def to_script(cmd: list[str]) -> str:
     if not cmd:
         raise DevboxError("no command given")
     return cmd[0] if len(cmd) == 1 else shlex.join(cmd)
+
+
+@dataclass
+class ExecResult:
+    returncode: int
+    stdout: str | None
+    stderr: str | None
+    timed_out: bool
+
+
+def git_files(root: Path) -> list[str] | None:
+    """Files Git considers part of the working tree, or None outside a Git repo."""
+    proc = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        return None
+    files = set()
+    for name in proc.stdout.decode().split("\0"):
+        if not name:
+            continue
+        path = root / name
+        # Skip tracked files deleted locally, and submodule directories.
+        if not os.path.lexists(path) or (path.is_dir() and not path.is_symlink()):
+            continue
+        files.add(name)
+    return sorted(files)
+
+
+def read_manifest(path: Path) -> set[str]:
+    try:
+        return set(json.loads(path.read_text()))
+    except (OSError, ValueError):
+        return set()
 
 
 class Remote:
@@ -64,13 +106,32 @@ class Remote:
         timeout: float | None = 120,
         cwd: str | None = APP_DIR,
         connect_timeout: int = 10,
+        input: str | None = None,
     ) -> subprocess.CompletedProcess:
         remote = f"bash -lc {shlex.quote(script)}"
         if cwd:
             remote = f"cd {shlex.quote(cwd)} && {remote}"
+        return self._ssh(remote, capture, check, timeout, connect_timeout, input)
+
+    def _ssh(
+        self,
+        remote: str,
+        capture: bool = True,
+        check: bool = True,
+        timeout: float | None = 120,
+        connect_timeout: int = 10,
+        input: str | None = None,
+    ) -> subprocess.CompletedProcess:
         cmd = self.ssh_cmd(remote, connect_timeout=connect_timeout)
         try:
-            proc = subprocess.run(cmd, capture_output=capture, text=True, timeout=timeout)
+            proc = subprocess.run(
+                cmd,
+                capture_output=capture,
+                text=True,
+                timeout=timeout,
+                input=input,
+                stdin=None if input is not None or not capture else subprocess.DEVNULL,
+            )
         except subprocess.TimeoutExpired:
             raise DevboxError(f"remote command timed out after {timeout}s")
         if proc.returncode == 255:
@@ -80,6 +141,49 @@ class Remote:
             detail = (proc.stderr or proc.stdout or "").strip() if capture else ""
             raise DevboxError(f"remote command failed (exit {proc.returncode}){': ' + detail if detail else ''}")
         return proc
+
+    def exec(self, script: str, timeout: float | None = None, capture: bool = False) -> ExecResult:
+        """Run a foreground command in the app folder.
+
+        With a timeout, the command runs in its own systemd scope with
+        RuntimeMaxSec, so the server itself stops it (SIGTERM to every process
+        in the scope, SIGKILL after 10s) even if the SSH connection is lost.
+        """
+        if timeout is None:
+            proc = self.run(script, capture=capture, check=False, timeout=None)
+            return ExecResult(proc.returncode, proc.stdout, proc.stderr, timed_out=False)
+
+        secs = max(1, math.ceil(timeout))
+        unit = f"{EXEC_UNIT_PREFIX}{secrets.token_hex(4)}"
+        remote = (
+            f"cd {APP_DIR} && systemd-run --scope --quiet --collect --unit {unit} "
+            f"-p RuntimeMaxSec={secs}s -p TimeoutStopSec={EXEC_KILL_AFTER}s "
+            f"--setenv=HOME=/root bash -lc {shlex.quote(script)}"
+        )
+        started = time.monotonic()
+        try:
+            proc = self._ssh(remote, capture=capture, check=False, timeout=secs + EXEC_KILL_AFTER + 30)
+        except DevboxError as e:
+            if "timed out" not in str(e):
+                raise
+            stopped = self.stop_scope(unit)
+            state = "stopped" if stopped else "could NOT be confirmed stopped"
+            raise DevboxError(
+                f"no response {secs}s after the deadline; remote command {state} (scope {unit})"
+            )
+        elapsed = time.monotonic() - started
+        timed_out = elapsed >= secs and proc.returncode in (128 + 15, 128 + 9, -15, -9)
+        if timed_out and not self.scope_gone(unit):
+            self.stop_scope(unit)
+        return ExecResult(proc.returncode, proc.stdout, proc.stderr, timed_out=timed_out)
+
+    def stop_scope(self, unit: str) -> bool:
+        self._ssh(f"systemctl kill --signal=SIGKILL {unit}.scope 2>/dev/null; true", check=False, timeout=30)
+        return self.scope_gone(unit)
+
+    def scope_gone(self, unit: str) -> bool:
+        proc = self._ssh(f"systemctl is-active --quiet {unit}.scope", check=False, timeout=30)
+        return proc.returncode != 0
 
     def wait_ready(self, timeout: float = 900) -> list[str]:
         """Wait for SSH and cloud-init. Returns warnings."""
@@ -103,20 +207,52 @@ class Remote:
         long = self.run("cloud-init status --long", check=False, cwd=None)
         raise DevboxError(f"cloud-init failed:\n{long.stdout.strip()}")
 
-    def sync(self, local_path: str) -> None:
-        src = local_path.rstrip("/") + "/"
+    def sync(self, local_path: str, manifest: Path) -> dict:
+        """Copy the project to the server.
+
+        In a Git repo, exactly the files Git would consider part of the working
+        tree are sent: tracked files plus untracked files that are not ignored,
+        using Git's own ignore rules. Ignored files on the server (node_modules,
+        .env, build output) are left alone. Files that were sent before and are
+        now deleted locally are deleted on the server too.
+        """
+        root = Path(local_path)
+        files = git_files(root)
         ssh = shlex.join(["ssh", *self.ssh_opts()])
-        cmd = [
-            "rsync", "-az", "--delete",
-            "--exclude", ".git",
-            "--filter", ":- .gitignore",
-            "-e", ssh,
-            src,
-            f"root@{self.ip}:{APP_DIR}/",
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        dest = f"root@{self.ip}:{APP_DIR}/"
+
+        if files is None:
+            proc = subprocess.run(
+                ["rsync", "-az", "--exclude", ".git", "-e", ssh, f"{root}/", dest],
+                capture_output=True, text=True,
+            )
+            if proc.returncode != 0:
+                raise DevboxError(f"rsync failed: {proc.stderr.strip()}")
+            return {"mode": "copy", "files": None, "deleted": 0,
+                    "warning": "not a Git repository: copied everything except .git, deleted nothing"}
+
+        previous = read_manifest(manifest)
+        current = set(files)
+        to_delete = sorted(f for f in previous - current if not os.path.lexists(root / f))
+
+        proc = subprocess.run(
+            ["rsync", "-az", "--from0", "--files-from=-", "-e", ssh, f"{root}/", dest],
+            input="\0".join(files).encode(),
+            capture_output=True,
+        )
         if proc.returncode != 0:
-            raise DevboxError(f"rsync failed: {proc.stderr.strip()}")
+            raise DevboxError(f"rsync failed: {proc.stderr.decode(errors='replace').strip()}")
+
+        if to_delete:
+            self._ssh(
+                f"cd {APP_DIR} && xargs -0 -r rm -f --",
+                input="\0".join(to_delete),
+                timeout=120,
+            )
+
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text(json.dumps(sorted(current)))
+        return {"mode": "git", "files": len(files), "deleted": len(to_delete), "warning": None}
 
     # Background processes (systemd units on the server)
 
@@ -179,7 +315,7 @@ def parse_units(output: str) -> list[dict]:
     units = []
     for line in output.splitlines():
         parts = line.split(None, 4)
-        if len(parts) < 4 or not parts[0].startswith(UNIT_PREFIX):
+        if len(parts) < 4 or not parts[0].startswith(UNIT_PREFIX) or not parts[0].endswith(".service"):
             continue
         unit, _load, active, sub = parts[:4]
         name = unit.removeprefix(UNIT_PREFIX).removesuffix(".service")

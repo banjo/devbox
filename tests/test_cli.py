@@ -140,3 +140,79 @@ def test_choose_offer_suggests_alternatives_when_sold_out():
 def test_choose_offer_unknown_type():
     with pytest.raises(DevboxError, match="unknown server type"):
         cli.choose_offer(make_ctx([offer("cx23", "fsn1")], "nope", "fsn1"))
+
+
+class FakeCloud:
+    """Stands in for Hcloud in end-to-end CLI tests."""
+
+    servers: list = []
+    deleted: list = []
+
+    def __init__(self, token, controller_id):
+        self.controller_id = controller_id
+
+    def list_servers(self):
+        return list(FakeCloud.servers)
+
+    def delete_server(self, server_id):
+        FakeCloud.deleted.append(server_id)
+        FakeCloud.servers = [s for s in FakeCloud.servers if s["id"] != server_id]
+
+    def offers(self):
+        return [offer("cx23", "fsn1", price=4.0)]
+
+
+def test_down_prints_cost_and_activity_and_costs_reports_it(capsys, isolated, monkeypatch):
+    from devbox import config, db
+
+    monkeypatch.setattr(cli, "Hcloud", FakeCloud)
+    FakeCloud.servers = [{
+        "id": 77, "name": "devbox-crm", "status": "running", "ip": "192.0.2.7",
+        "server_type": "cx23", "location": "fsn1", "project": "crm", "created": None,
+    }]
+    FakeCloud.deleted = []
+
+    run(capsys, "project", "add", "crm", "--path", str(isolated / "crm"))
+    conn = db.connect(config.load().db_path)
+    sid = db.insert_server(
+        conn, "crm", 77, "running", ip="192.0.2.7", server_type="cx23", location="fsn1",
+        created_at="2026-10-31T08:00:00+00:00", price_hourly=0.01, price_monthly=5.0,
+    )
+    for kind in ["sync", "sync", "exec", "exec_detach", "expose"]:
+        db.add_event(conn, "crm", sid, kind)
+
+    code, out, _ = run(capsys, "down", "crm")
+    assert code == 0
+    assert FakeCloud.deleted == [77]
+    assert "deleted server 77 for crm" in out
+    assert "cx23 in fsn1" in out
+    assert "2 syncs, 1 exec, 1 background start, 1 expose" in out
+    assert "project total:" in out
+
+    code, out, _ = run(capsys, "costs", "--json")
+    data = json.loads(out)
+    assert data["servers"] == 1
+    assert data["groups"][0]["key"] == "crm"
+    assert data["total"] > 0
+
+    code, out, _ = run(capsys, "costs", "--by", "month", "--project", "crm")
+    assert code == 0 and "2026-10" in out
+
+
+def test_status_shows_cost_so_far(capsys, isolated, monkeypatch):
+    from devbox import config, db
+
+    monkeypatch.setattr(cli, "Hcloud", FakeCloud)
+    FakeCloud.servers = [{
+        "id": 78, "name": "devbox-crm", "status": "running", "ip": "192.0.2.8",
+        "server_type": "cx23", "location": "fsn1", "project": "crm", "created": "2026-10-31T08:00:00+00:00",
+    }]
+    run(capsys, "project", "add", "crm", "--path", str(isolated / "crm"))
+    # Adopted by reconcile, price filled in from offers.
+    monkeypatch.setattr(cli.Remote, "list_units", lambda self: [])
+    code, out, _ = run(capsys, "status", "--json")
+    data = json.loads(out)
+    entry = data["projects"][0]
+    assert entry["server"]["price_hourly"] == 0.01
+    assert entry["usage"]["cost"] > 0
+    assert data["month"]["servers"] == 1

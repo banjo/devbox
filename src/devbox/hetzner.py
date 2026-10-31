@@ -7,18 +7,42 @@ from typing import Any
 from devbox import DevboxError
 
 MANAGED_LABEL = "managed-by=devbox"
-FIREWALL_NAME = "devbox"
-SSH_KEY_NAME = "devbox"
+CONTROLLER_LABEL = "devbox-controller"
 
 
 class Hcloud:
-    """Thin wrapper around the official `hcloud` CLI."""
+    """Thin wrapper around the official `hcloud` CLI.
 
-    def __init__(self, token: str | None, binary: str = "hcloud"):
+    Every resource devbox creates carries `managed-by=devbox` and
+    `devbox-controller=<id>`, where the id identifies this machine's devbox
+    install. Resources without both labels are never modified.
+    """
+
+    def __init__(self, token: str | None, controller_id: str, binary: str = "hcloud"):
         self.binary = binary
+        self.controller_id = controller_id
         self.env = dict(os.environ)
         if token:
             self.env["HCLOUD_TOKEN"] = token
+
+    @property
+    def resource_name(self) -> str:
+        """Name for the shared SSH key and firewall of this controller."""
+        return f"devbox-{self.controller_id}"
+
+    @property
+    def labels(self) -> dict[str, str]:
+        return {"managed-by": "devbox", CONTROLLER_LABEL: self.controller_id}
+
+    def label_args(self, **extra: str) -> list[str]:
+        args = []
+        for k, v in {**self.labels, **extra}.items():
+            args += ["--label", f"{k}={v}"]
+        return args
+
+    def owns(self, resource: dict) -> bool:
+        labels = resource.get("labels") or {}
+        return all(labels.get(k) == v for k, v in self.labels.items())
 
     def run(self, *args: str, input: str | None = None, parse: bool = True) -> Any:
         cmd = [self.binary, *args]
@@ -47,8 +71,14 @@ class Hcloud:
     # Servers
 
     def list_servers(self) -> list[dict]:
+        """Servers of this controller, plus servers from before controller labels existed."""
         data = self.run("server", "list", "-l", MANAGED_LABEL, "-o", "json") or []
-        return [server_info(s) for s in data]
+        result = []
+        for s in data:
+            owner = (s.get("labels") or {}).get(CONTROLLER_LABEL)
+            if owner in (None, self.controller_id):
+                result.append(server_info(s))
+        return result
 
     def create_server(
         self,
@@ -58,6 +88,8 @@ class Hcloud:
         image: str,
         location: str,
         user_data: Path,
+        ssh_key_id: int,
+        firewall_id: int,
     ) -> dict:
         data = self.run(
             "server", "create",
@@ -65,10 +97,9 @@ class Hcloud:
             "--type", server_type,
             "--image", image,
             "--location", location,
-            "--ssh-key", SSH_KEY_NAME,
-            "--firewall", FIREWALL_NAME,
-            "--label", MANAGED_LABEL,
-            "--label", f"project={project}",
+            "--ssh-key", str(ssh_key_id),
+            "--firewall", str(firewall_id),
+            *self.label_args(project=project),
             "--user-data-from-file", str(user_data),
             "-o", "json",
         )
@@ -87,39 +118,65 @@ class Hcloud:
 
     # SSH key and firewall
 
-    def ensure_ssh_key(self, public_key: str) -> None:
-        keys = self.run("ssh-key", "list", "-o", "json") or []
-        for key in keys:
-            if key["name"] == SSH_KEY_NAME:
-                if _same_key(key["public_key"], public_key):
-                    return
+    def _find_owned(self, kind: str, name: str) -> dict | None:
+        """Find a resource by name, refusing to touch it if devbox does not own it."""
+        items = self.run(kind, "list", "-o", "json") or []
+        for item in items:
+            if item["name"] != name:
+                continue
+            if not self.owns(item):
                 raise DevboxError(
-                    f"Hetzner SSH key '{SSH_KEY_NAME}' exists but does not match the local devbox key"
+                    f"a Hetzner {kind} named '{name}' (id {item['id']}) exists but is not "
+                    f"labeled as owned by this devbox install; refusing to modify it"
                 )
-        self.run(
-            "ssh-key", "create",
-            "--name", SSH_KEY_NAME,
-            "--public-key", public_key,
-            "--label", MANAGED_LABEL,
-            parse=False,
-        )
+            return item
+        return None
 
-    def ensure_firewall(self, ssh_cidrs: list[str]) -> None:
+    def ensure_ssh_key(self, public_key: str) -> int:
+        name = self.resource_name
+        key = self._find_owned("ssh-key", name)
+        if key:
+            if not _same_key(key["public_key"], public_key):
+                raise DevboxError(f"Hetzner SSH key '{name}' does not match the local devbox key")
+            return key["id"]
+        data = self.run(
+            "ssh-key", "create",
+            "--name", name,
+            "--public-key", public_key,
+            *self.label_args(),
+            "-o", "json",
+        )
+        return self._created_id(data, "ssh_key", "ssh-key", name)
+
+    def ensure_firewall(self, ssh_cidrs: list[str]) -> int:
+        name = self.resource_name
         rules = json.dumps(firewall_rules(ssh_cidrs))
-        firewalls = self.run("firewall", "list", "-o", "json") or []
-        if any(fw["name"] == FIREWALL_NAME for fw in firewalls):
+        firewall = self._find_owned("firewall", name)
+        if firewall:
             self.run(
-                "firewall", "replace-rules", FIREWALL_NAME, "--rules-file", "-",
+                "firewall", "replace-rules", str(firewall["id"]), "--rules-file", "-",
                 input=rules, parse=False,
             )
-        else:
-            self.run(
-                "firewall", "create",
-                "--name", FIREWALL_NAME,
-                "--label", MANAGED_LABEL,
-                "--rules-file", "-",
-                input=rules, parse=False,
-            )
+            return firewall["id"]
+        data = self.run(
+            "firewall", "create",
+            "--name", name,
+            *self.label_args(),
+            "--rules-file", "-",
+            "-o", "json",
+            input=rules,
+        )
+        return self._created_id(data, "firewall", "firewall", name)
+
+    def _created_id(self, data: Any, key: str, kind: str, name: str) -> int:
+        if isinstance(data, dict):
+            obj = data.get(key, data)
+            if isinstance(obj, dict) and "id" in obj:
+                return obj["id"]
+        item = self._find_owned(kind, name)
+        if item is None:
+            raise DevboxError(f"created {kind} '{name}' but cannot find it")
+        return item["id"]
 
 
 def firewall_rules(ssh_cidrs: list[str]) -> list[dict]:
