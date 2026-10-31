@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import secrets
 import subprocess
 import time
@@ -46,6 +47,44 @@ class Hcloud:
     def owns(self, resource: dict) -> bool:
         labels = resource.get("labels") or {}
         return all(labels.get(k) == v for k, v in self.labels.items())
+
+    @staticmethod
+    def is_legacy(resource: dict) -> bool:
+        """Created by a devbox version before controller ids."""
+        labels = resource.get("labels") or {}
+        return labels.get("managed-by") == "devbox" and CONTROLLER_LABEL not in labels
+
+    def version(self) -> str | None:
+        try:
+            out = self.run("version", parse=False)
+        except DevboxError:
+            return None
+        match = re.search(r"v?(\d+\.\d+\.\d+)", out)
+        return match.group(1) if match else out.strip() or None
+
+    def list_ssh_keys(self) -> list[dict]:
+        return self.run("ssh-key", "list", "-o", "json") or []
+
+    def list_firewalls(self) -> list[dict]:
+        return self.run("firewall", "list", "-o", "json") or []
+
+    def _deletable(self, resource: dict, kind: str) -> None:
+        if not (self.owns(resource) or self.is_legacy(resource)):
+            raise DevboxError(
+                f"{kind} {resource['id']} is not owned by this devbox install; refusing to delete it"
+            )
+
+    def delete_firewall(self, firewall_id: int) -> None:
+        fw = self.run("firewall", "describe", str(firewall_id), "-o", "json")
+        self._deletable(fw or {"id": firewall_id}, "firewall")
+        if (fw or {}).get("applied_to"):
+            raise DevboxError(f"firewall {firewall_id} is still attached to resources; refusing to delete it")
+        self.run("firewall", "delete", str(firewall_id), parse=False)
+
+    def delete_ssh_key(self, key_id: int) -> None:
+        key = self.run("ssh-key", "describe", str(key_id), "-o", "json")
+        self._deletable(key or {"id": key_id}, "SSH key")
+        self.run("ssh-key", "delete", str(key_id), parse=False)
 
     def run(self, *args: str, input: str | None = None, parse: bool = True) -> Any:
         cmd = [self.binary, *args]
@@ -202,25 +241,30 @@ class Hcloud:
             return item
         return None
 
-    def ensure_ssh_key(self, public_key: str) -> int:
+    def find_ssh_key(self, public_key: str) -> dict:
+        """Where the local public key stands in Hetzner, without changing anything.
+
+        Returns {"status": "owned" | "legacy" | "missing", "key": dict | None}.
+        Raises if the key name is taken by something else, or the same public
+        key is registered under an owner devbox must not use.
+        """
         name = self.resource_name
         key = self._find_owned("ssh-key", name)
         if key:
             if not _same_key(key["public_key"], public_key):
                 raise DevboxError(f"Hetzner SSH key '{name}' does not match the local devbox key")
-            return key["id"]
+            return {"status": "owned", "key": key}
 
         # Hetzner allows each public key only once per project, so the local key
         # may already be registered under another name.
-        keys = self.run("ssh-key", "list", "-o", "json") or []
+        keys = self.list_ssh_keys()
         same = [k for k in keys if _same_key(k["public_key"], public_key)]
         for k in same:
-            labels = k.get("labels") or {}
             if self.owns(k):
-                return k["id"]
-            if labels.get("managed-by") == "devbox" and CONTROLLER_LABEL not in labels:
+                return {"status": "owned", "key": k}
+            if self.is_legacy(k):
                 # Created by a devbox version before controller ids; reuse it unchanged.
-                return k["id"]
+                return {"status": "legacy", "key": k}
         if same:
             k = same[0]
             labels = k.get("labels") or {}
@@ -236,7 +280,13 @@ class Hcloud:
                 f"hcloud ssh-key add-label --overwrite {k['id']} managed-by=devbox "
                 f"{CONTROLLER_LABEL}={self.controller_id}"
             )
+        return {"status": "missing", "key": None}
 
+    def ensure_ssh_key(self, public_key: str) -> int:
+        found = self.find_ssh_key(public_key)
+        if found["key"]:
+            return found["key"]["id"]
+        name = self.resource_name
         data = self.run(
             "ssh-key", "create",
             "--name", name,
@@ -245,6 +295,10 @@ class Hcloud:
             "-o", "json",
         )
         return self._created_id(data, "ssh_key", "ssh-key", name)
+
+    def find_firewall(self) -> dict | None:
+        """This install's firewall, or None. Raises if the name is taken by something else."""
+        return self._find_owned("firewall", self.resource_name)
 
     def ensure_firewall(self, ssh_cidrs: list[str]) -> int:
         name = self.resource_name

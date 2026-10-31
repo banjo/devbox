@@ -296,3 +296,38 @@ def test_new_key_is_created_when_not_registered(fake_hcloud):
     assert hc.ensure_ssh_key("ssh-ed25519 AAAA devbox") == 15
     create = calls()[-1]["args"]
     assert create[:4] == ["ssh-key", "create", "--name", "devbox-abc123"]
+
+
+def test_version_parsing(fake_hcloud):
+    hc, _, respond = fake_hcloud
+    hc.run = lambda *a, **kw: "hcloud v1.70.2\n"
+    assert hc.version() == "1.70.2"
+
+
+@pytest.mark.parametrize("fw, error", [
+    ({"id": 2, "name": "devbox", "labels": {"managed-by": "devbox"}, "applied_to": []}, None),
+    ({"id": 2, "name": "devbox-abc123", "labels": OWNED, "applied_to": []}, None),
+    ({"id": 2, "name": "devbox", "labels": {"managed-by": "devbox"}, "applied_to": [{"type": "server"}]}, "still attached"),
+    ({"id": 2, "name": "prod", "labels": {}, "applied_to": []}, "not owned"),
+    ({"id": 2, "name": "x", "labels": {"managed-by": "devbox", "devbox-controller": "other"}, "applied_to": []}, "not owned"),
+])
+def test_delete_firewall_only_unused_devbox_firewalls(fake_hcloud, fw, error):
+    hc, calls, respond = fake_hcloud
+    respond("firewall_describe", fw)
+    if error:
+        with pytest.raises(DevboxError, match=error):
+            hc.delete_firewall(2)
+        assert not any(c["args"][:2] == ["firewall", "delete"] for c in calls())
+    else:
+        hc.delete_firewall(2)
+        assert calls()[-1]["args"] == ["firewall", "delete", "2"]
+
+
+def test_delete_ssh_key_requires_devbox_labels(fake_hcloud):
+    hc, calls, respond = fake_hcloud
+    respond("ssh-key_describe", {"id": 7, "name": "laptop", "labels": {}})
+    with pytest.raises(DevboxError, match="not owned"):
+        hc.delete_ssh_key(7)
+    respond("ssh-key_describe", {"id": 7, "name": "devbox", "labels": {"managed-by": "devbox"}})
+    hc.delete_ssh_key(7)
+    assert calls()[-1]["args"] == ["ssh-key", "delete", "7"]

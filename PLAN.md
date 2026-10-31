@@ -116,6 +116,9 @@ Next time the agent reads the notes first and does not have to work it out again
 | `devbox snapshot list [NAME]` / `devbox snapshot delete IMAGE_ID` | Manage snapshots. |
 | `devbox idle-check [--dry-run]` / `devbox touch NAME` | Idle shutdown and keep-alive. |
 | `devbox project set NAME --idle-timeout D` | Per-project idle timeout. |
+| `devbox doctor` | Read-only checks with fixes (issue #8). |
+| `devbox cleanup [--yes]` | Unused devbox resources and stale local files; deletes only with `--yes` (issue #8). |
+| `devbox history [NAME] [--limit N]` | Past servers and snapshots with cost and activity (issue #8). |
 
 All commands accept `--json` for output the agent can parse.
 
@@ -150,6 +153,7 @@ tests/test_cli.py        # project commands, exec argument handling, no local fa
 tests/test_remote.py     # Git-based sync file list and deletions, exec timeout enforcement
 tests/test_costs.py      # billing math, period summaries, cost history
 src/devbox/costs.py      # cost estimates
+src/devbox/admin.py      # doctor, cleanup, history
 ```
 
 ## 7. The skill

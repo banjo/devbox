@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from importlib import resources
 from pathlib import Path
 
-from devbox import DevboxError, config, costs, db
+from devbox import DevboxError, admin, config, costs, db
 from devbox.hetzner import Hcloud, filter_offers
 from devbox.remote import TUNNEL, Remote, to_script, validate_proc
 
@@ -842,6 +842,90 @@ def cmd_snapshot_delete(ctx: Context) -> int:
     return 0
 
 
+STATUS_MARK = {admin.OK: "ok  ", admin.WARN: "warn", admin.FAIL: "FAIL"}
+
+
+def cmd_doctor(ctx: Context) -> int:
+    checks = admin.doctor(ctx, resolve_ssh_allow)
+    lines = []
+    for c in checks:
+        lines.append(f"[{STATUS_MARK[c['status']]}] {c['check']}: {c['detail']}")
+        if c["fix"] and c["status"] != admin.OK:
+            lines.append(f"       fix: {c['fix']}")
+    failed = any(c["status"] == admin.FAIL for c in checks)
+    emit(ctx.args, {"ok": not failed, "checks": checks}, "\n".join(lines))
+    return 1 if failed else 0
+
+
+def cmd_cleanup(ctx: Context) -> int:
+    with ctx.lock():
+        plan = admin.cleanup_plan(ctx)
+        if not plan:
+            emit(ctx.args, {"items": [], "deleted": False}, "nothing to clean up")
+            return 0
+        if not ctx.args.yes:
+            lines = ["would delete:"]
+            lines += [f"  {i['kind']} {i['name']} ({i['id']}): {i['reason']}" for i in plan]
+            lines.append("run `devbox cleanup --yes` to delete these")
+            emit(ctx.args, {"items": plan, "deleted": False}, "\n".join(lines))
+            return 0
+        results = admin.run_cleanup(ctx, plan)
+    lines = []
+    for r in results:
+        state = "deleted" if r["deleted"] else f"FAILED: {r['error']}"
+        lines.append(f"{r['kind']} {r['name']} ({r['id']}): {state}")
+    failed = any(not r["deleted"] for r in results)
+    emit(ctx.args, {"items": results, "deleted": True}, "\n".join(lines))
+    return 1 if failed else 0
+
+
+def cmd_history(ctx: Context) -> int:
+    if ctx.args.name and not db.get_project(ctx.conn, ctx.args.name) and not db.all_servers(ctx.conn, ctx.args.name):
+        raise DevboxError(f"unknown project '{ctx.args.name}'")
+    if ctx.args.limit is not None and ctx.args.limit < 1:
+        raise DevboxError("--limit must be 1 or more")
+    data = admin.history(ctx, ctx.args.name, ctx.args.limit)
+    lines = []
+    if data["servers"]:
+        lines.append(f"{'STARTED':<16} {'PROJECT':<14} {'SERVER':<16} {'RAN':>7} {'COST':>7}  ACTIVITY")
+    for e in data["servers"]:
+        where = f"{e['server_type']} {e['location']}"
+        counts = e["activity"]
+        activity = ", ".join(
+            f"{counts[k]} {label}{'s' if counts[k] != 1 else ''}" for k, label in ACTIVITY_LABELS if counts.get(k)
+        )
+        notes = []
+        if e["restored_from_snapshot"]:
+            notes.append(f"from snapshot {e['restored_from_snapshot']}")
+        if e["status"] != "deleted":
+            notes.append("running")
+        elif counts.get("pause") or counts.get("idle_pause"):
+            notes.append("paused" + (" (idle)" if counts.get("idle_pause") else ""))
+        tail = activity + (f" [{'; '.join(notes)}]" if notes else "")
+        lines.append(
+            f"{e['created_at'][:16].replace('T', ' '):<16} {e['project']:<14} {where:<16} "
+            f"{costs.duration(e['seconds']):>7} {costs.money(e['cost']):>7}  {tail}"
+        )
+    if data["snapshots"]:
+        lines.append("")
+        lines.append(f"{'SNAPSHOT':<10} {'PROJECT':<14} {'CREATED':<16} {'SIZE':>6} {'STATUS':<9} {'COST':>7}")
+        for sn in data["snapshots"]:
+            size = f"{sn['size_gb']:.1f}G" if sn["size_gb"] is not None else "?"
+            lines.append(
+                f"{sn['hetzner_image_id']:<10} {sn['project']:<14} {sn['created_at'][:16].replace('T', ' '):<16} "
+                f"{size:>6} {sn['status']:<9} {costs.money(sn['cost']):>7}"
+            )
+    t = data["total"]
+    if lines:
+        lines.append("")
+    lines.append(
+        f"total: {costs.money(t['total'])} over {t['servers']} server{'s' if t['servers'] != 1 else ''} "
+        f"and {t['snapshots']} snapshot{'s' if t['snapshots'] != 1 else ''}, {costs.duration(t['seconds'])} running"
+    )
+    emit(ctx.args, data, "\n".join(lines))
+    return 0
+
+
 def cmd_sync(ctx: Context) -> int:
     server = ctx.running_server(ctx.args.name)
     project = db.require_project(ctx.conn, ctx.args.name)
@@ -1029,6 +1113,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = snap_sub.add_parser("delete", help="delete a snapshot", parents=[common])
     p.add_argument("image_id", type=int)
     p.set_defaults(func=cmd_snapshot_delete)
+
+    p = add("doctor", cmd_doctor, "check config, tools, Hetzner access, SSH key, firewall and leftovers")
+
+    p = add("cleanup", cmd_cleanup, "list unused devbox resources; delete them with --yes")
+    p.add_argument("--yes", action="store_true", help="really delete the listed resources")
+
+    p = add("history", cmd_history, "past servers and snapshots with dates, cost and activity")
+    p.add_argument("name", nargs="?")
+    p.add_argument("--limit", type=int, metavar="N", help="only the N most recent servers and snapshots")
 
     p = add("costs", cmd_costs, "estimated server and snapshot costs for a period, grouped")
     p.add_argument("--project", help="only this project")

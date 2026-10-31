@@ -119,6 +119,8 @@ Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/a
 | "Run the tests" | `devbox exec NAME -- 'npm test'` (or whatever the notes say) |
 | "Which servers are running?" | `devbox status` |
 | "What have I spent this month?" | `devbox costs --month YYYY-MM` |
+| "What did we run on this project?" | `devbox history NAME` |
+| "Something's broken with devbox" | `devbox doctor` |
 | "We're done for today" | `devbox pause NAME`, report the cost summary |
 | "Delete everything for this project" | Confirm, `devbox down NAME`, `devbox snapshot delete` for its snapshots |
 | "Continue where we left off" | `devbox up NAME` (restores the snapshot), then the notes' every-start steps |
@@ -131,6 +133,8 @@ Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/a
 - Processes do not restart on their own. After a crash, check `logs` and run the same `exec --detach` again.
 - A clean server has nothing installed: runtimes, `node_modules`, databases and `.env` must be set up again. Notes should separate "new server" steps from "every start" steps, because a server restored from a snapshot only needs the latter.
 - If `exec` fails with an SSH error, run `devbox status`; the server may have been deleted.
+- When `up` or another command fails in a way you don't understand (token, SSH key, firewall), run `devbox doctor` and follow its fixes.
+- `devbox cleanup` only lists unused resources. Show the list to the user and only run `devbox cleanup --yes` after they agree.
 - Without `--timeout`, a foreground command keeps running on the server if the connection drops. `--timeout` does not stop containers started with `-d`; stop those with `docker compose down`.
 - Sync follows the project's Git ignore rules. Ignored files (such as `.env`) never reach the server, and files you delete locally are deleted on the server at the next sync.
 - ARM servers (`cax*`) are often cheaper, but some Docker images and native dependencies only exist for x86.

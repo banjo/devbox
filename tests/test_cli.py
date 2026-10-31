@@ -217,6 +217,45 @@ class FakeCloud:
     def snapshot_price_per_gb_month(self):
         return 0.012
 
+    # Firewalls, SSH keys and ownership, as in Hcloud.
+    resource_name = "devbox-test"
+    firewalls: list
+    keys: list
+
+    def owns(self, r):
+        return (r.get("labels") or {}) == {"managed-by": "devbox", "devbox-controller": "test"}
+
+    @staticmethod
+    def is_legacy(r):
+        labels = r.get("labels") or {}
+        return labels.get("managed-by") == "devbox" and "devbox-controller" not in labels
+
+    def version(self):
+        return "1.70.2"
+
+    def list_firewalls(self):
+        return list(getattr(self, "firewalls", []))
+
+    def list_ssh_keys(self):
+        return list(getattr(self, "keys", []))
+
+    def find_firewall(self):
+        return next((f for f in self.list_firewalls() if f["name"] == self.resource_name), None)
+
+    def find_ssh_key(self, public_key):
+        for k in self.list_ssh_keys():
+            if k["public_key"] == public_key:
+                return {"status": "owned" if self.owns(k) else "legacy", "key": k}
+        return {"status": "missing", "key": None}
+
+    def delete_firewall(self, firewall_id):
+        self.calls.append(("delete_firewall", firewall_id))
+        self.firewalls = [f for f in self.firewalls if f["id"] != firewall_id]
+
+    def delete_ssh_key(self, key_id):
+        self.calls.append(("delete_ssh_key", key_id))
+        self.keys = [k for k in self.keys if k["id"] != key_id]
+
 
 @pytest.fixture
 def cloud(monkeypatch):
@@ -451,3 +490,118 @@ def test_costs_invalid_periods_give_json_errors(capsys, args):
     assert code == 1
     assert "Traceback" not in err
     assert "error" in json.loads(out)
+
+
+OWNED_LABELS = {"managed-by": "devbox", "devbox-controller": "test"}
+
+
+def test_cleanup_lists_then_deletes_only_unused_devbox_resources(capsys, isolated, cloud):
+    run(capsys, "project", "add", "crm", "--path", str(isolated / "crm"))
+    run(capsys, "up", "crm", "--type", "cx23", "--location", "fsn1")
+    cloud.servers[500] = {"id": 500, "name": "devbox-ghost", "status": "running", "ip": "192.0.2.50",
+                          "server_type": "cx23", "location": "fsn1", "project": "ghost", "created": None}
+    cloud.images[600] = {"id": 600, "description": "old", "status": "available", "size_gb": 1.0,
+                         "disk_gb": 40, "architecture": "x86", "project": "ghost", "created": None}
+    cloud.firewalls = [
+        {"id": 1, "name": "devbox-test", "labels": OWNED_LABELS, "applied_to": [{"type": "server"}]},
+        {"id": 2, "name": "devbox", "labels": {"managed-by": "devbox"}, "applied_to": []},
+        {"id": 3, "name": "devbox", "labels": {"managed-by": "devbox"}, "applied_to": [{"type": "server"}]},
+        {"id": 4, "name": "prod", "labels": {}, "applied_to": []},
+        {"id": 5, "name": "other", "labels": {"managed-by": "devbox", "devbox-controller": "other"}, "applied_to": []},
+    ]
+    ssh_dir = isolated / "home-ssh"
+    ssh_dir.mkdir()
+    (ssh_dir / "devbox.pub").write_text("ssh-ed25519 AAAA local")
+    cfg_dir = isolated / "config" / "devbox"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.toml").write_text(f'ssh_key = "{ssh_dir / "devbox"}"\n')
+    cloud.keys = [
+        {"id": 10, "name": "devbox", "public_key": "ssh-ed25519 AAAA local", "labels": {"managed-by": "devbox"}},
+        {"id": 11, "name": "devbox-old", "public_key": "ssh-ed25519 BBBB", "labels": OWNED_LABELS},
+        {"id": 12, "name": "laptop", "public_key": "ssh-ed25519 CCCC", "labels": {}},
+    ]
+    stale = isolated / "state" / "devbox" / "known_hosts" / "crm-1"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("x")
+
+    code, out, _ = run(capsys, "cleanup", "--json")
+    plan = json.loads(out)["items"]
+    found = {(i["kind"], str(i["id"])) for i in plan}
+    assert found == {
+        ("server", "500"), ("snapshot", "600"), ("firewall", "2"), ("ssh-key", "11"), ("local file", str(stale)),
+    }
+    assert 500 in cloud.servers and stale.exists()  # nothing deleted without --yes
+
+    code, out, _ = run(capsys, "cleanup", "--yes")
+    assert code == 0
+    assert 500 not in cloud.servers and 600 not in cloud.images
+    assert [f["id"] for f in cloud.firewalls] == [1, 3, 4, 5]
+    assert [k["id"] for k in cloud.keys] == [10, 12]
+    assert not stale.exists()
+    assert len(cloud.servers) == 1  # the project's own server stays
+
+    code, out, _ = run(capsys, "cleanup")
+    assert "nothing to clean up" in out
+
+
+def test_history_shows_servers_snapshots_and_totals(capsys, isolated, cloud):
+    run(capsys, "project", "add", "crm", "--path", str(isolated / "crm"))
+    run(capsys, "up", "crm", "--type", "cx23", "--location", "fsn1")
+    run(capsys, "pause", "crm")
+    run(capsys, "up", "crm")
+    code, out, _ = run(capsys, "history", "crm", "--json")
+    data = json.loads(out)
+    assert len(data["servers"]) == 2
+    latest, first = data["servers"]
+    assert latest["status"] == "running" and latest["restored_from_snapshot"] == data["snapshots"][0]["hetzner_image_id"]
+    assert first["activity"]["pause"] == 1
+    assert data["total"]["servers"] == 2 and data["total"]["snapshots"] == 1
+
+    code, out, _ = run(capsys, "history", "crm")
+    assert "from snapshot" in out and "paused" in out and "total:" in out
+    code, out, _ = run(capsys, "history", "crm", "--limit", "1", "--json")
+    assert len(json.loads(out)["servers"]) == 1
+    code, _, err = run(capsys, "history", "nope")
+    assert code == 1 and "unknown project" in err
+
+
+def test_doctor_reports_checks_and_fails_on_conflicts(capsys, isolated, cloud, monkeypatch):
+    from devbox import admin
+
+    monkeypatch.setattr(admin.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    monkeypatch.setattr(admin, "schedule_check", lambda ctx: admin.check("idle shutdown", admin.WARN, "not scheduled"))
+    cloud.firewalls = [{"id": 1, "name": "devbox-test", "labels": OWNED_LABELS, "applied_to": [],
+                        "rules": [{"source_ips": ["198.51.100.1/32"]}]}]
+    code, out, _ = run(capsys, "doctor", "--json")
+    data = json.loads(out)
+    by_name = {c["check"]: c for c in data["checks"]}
+    assert by_name["hcloud"]["detail"] == "version 1.70.2"
+    assert by_name["hetzner api"]["status"] == "ok"
+    assert by_name["firewall"]["status"] == "warn"  # allows another IP than this machine's
+    assert by_name["idle shutdown"]["status"] == "warn"
+    assert code == 0 and data["ok"]
+
+    def conflict(public_key):
+        raise DevboxError("the local devbox SSH key is already registered")
+
+    ssh_dir = isolated / "ssh"
+    ssh_dir.mkdir()
+    (ssh_dir / "devbox").write_text("private")
+    (ssh_dir / "devbox.pub").write_text("ssh-ed25519 AAAA")
+    cfg_dir = isolated / "config" / "devbox"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.toml").write_text(f'ssh_key = "{ssh_dir / "devbox"}"\n')
+    monkeypatch.setattr(cloud, "find_ssh_key", conflict)
+    code, out, _ = run(capsys, "doctor")
+    assert code == 1
+    assert "[FAIL] hetzner ssh key" in out
+
+
+def test_doctor_without_hcloud(capsys, isolated, monkeypatch):
+    from devbox import admin
+
+    monkeypatch.setattr(admin.shutil, "which", lambda tool: None if tool == "hcloud" else f"/usr/bin/{tool}")
+    code, out, _ = run(capsys, "doctor")
+    assert code == 1
+    assert "[FAIL] hcloud: hcloud CLI not found" in out
+    assert "registry" in out

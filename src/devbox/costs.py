@@ -110,8 +110,15 @@ def lifetime(item, now: datetime) -> tuple[datetime, datetime]:
 
 
 def server_window(item, since: datetime | None, until: datetime | None, now: datetime) -> tuple[datetime, datetime] | None:
-    """The part of an item's lifetime inside [since, until), or None."""
+    """The part of an item's lifetime inside [since, until), or None.
+
+    An item that existed for no measurable time still counts if it started
+    inside the period.
+    """
     start, end = lifetime(item, now)
+    if start == end:
+        inside = (since is None or start >= since) and (until is None or start < until)
+        return (start, end) if inside else None
     if since and since > start:
         start = since
     if until and until < end:

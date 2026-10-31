@@ -42,7 +42,7 @@ On the machine where the agent runs:
    ln -s "$PWD/skills/hetzner-devbox" ~/.agents/skills/hetzner-devbox
    ```
 
-6. Check it works: `devbox status` should print `no devbox servers`.
+6. Check it works: `devbox doctor` checks the config, local tools, `hcloud`, the token, the SSH key and firewall, leftover resources and whether `idle-check` is scheduled, and says how to fix what's wrong.
 
 The first `devbox up` creates an SSH key at `~/.ssh/devbox` (if missing), uploads it to Hetzner, and creates a firewall that allows SSH only from this machine's public IP. Both are named `devbox-<controller id>`, where the controller id is a random id stored in `~/.local/state/devbox/controller-id` (or set with `controller_id` in the config).
 
@@ -77,6 +77,9 @@ devbox touch NAME                         record activity so idle shutdown waits
 devbox idle-check [--dry-run]             pause/delete servers idle past their timeout (for cron)
 devbox snapshot list [NAME]               snapshots with size and cost
 devbox snapshot delete IMAGE_ID           delete a snapshot
+devbox doctor                             check config, tools, token, SSH key, firewall, leftovers, scheduling
+devbox cleanup [--yes]                    list (or delete) unused devbox resources and stale local files
+devbox history [NAME] [--limit N]         past servers and snapshots with dates, cost and activity
 devbox costs [--month M | --days N | --since D] [--until D] [--project P] [--by project|month|day|type|server]
                                           estimated server + snapshot cost for a period
 ```
@@ -119,6 +122,12 @@ All commands accept `--json`. `exec` runs a single argument as a shell script (`
   cp contrib/systemd/devbox-idle-check.* ~/.config/systemd/user/
   systemctl --user enable --now devbox-idle-check.timer
   ```
+
+### Housekeeping
+
+- `devbox doctor` runs read-only checks and exits 1 if something blocks devbox from working (for example an SSH key conflict or no `hcloud`).
+- `devbox cleanup` lists what devbox created that is no longer used: labeled servers and snapshots that aren't in the registry, devbox firewalls not attached to any server (including the old `devbox` firewall), devbox SSH keys other than the one in use, and stale local host-key and sync files. Only resources labeled `managed-by=devbox` without another install's controller label are considered. Nothing is deleted without `--yes`.
+- `devbox history` lists every server (newest first) with type, location, run time, cost, activity and whether it was restored from or paused into a snapshot, plus all snapshots and the overall total. It works offline from the registry.
 
 ### Costs and budget
 - `up` stores the server's hourly and monthly price from Hetzner when it creates it, and every server's and snapshot's start and end time stays in the registry. Servers are estimated the way Hetzner bills them: per started hour, capped at the monthly price per calendar month. Snapshots are estimated per GB per month, prorated by the hour. Prices include VAT; primary IPv4 and traffic are not included.

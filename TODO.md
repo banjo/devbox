@@ -20,6 +20,8 @@ Nothing below has run against Hetzner yet. Check each step and fix what breaks.
 - [ ] Snapshot prices: Hetzner pricing API is reachable with the token; snapshot cost in `costs` matches the console
 - [ ] Snapshot rotation: second `pause` deletes the older snapshot only after the new one exists
 - [ ] `idle-check` from cron/systemd timer pauses a server after the timeout, `touch` postpones it
+- [ ] `doctor` on a real setup: hcloud version, token, SSH key (owned/legacy/conflict), firewall IP drift, idle-check scheduling detection (cron and systemd)
+- [ ] `cleanup`: finds the old `devbox` firewall and orphaned servers/snapshots; `--yes` deletes only those; attached firewalls and foreign resources untouched
 - [ ] Full agent run with the skill: a project with no notes goes from `up` to a working preview, the agent saves notes, then `down` and `up` again work from the notes alone
 
 ## Next
