@@ -30,7 +30,7 @@ def persist(path: Path, fstab: Path) -> None:
     for line in content.splitlines():
         fields = line.split()
         if fields and fields[0] == str(path):
-            if len(fields) < 3 or fields[2] != "swap":
+            if len(fields) < 4 or fields[2] != "swap" or "noauto" in fields[3].split(","):
                 raise RuntimeError(f"conflicting fstab entry for {path}")
             return
     with fstab.open("a") as stream:
@@ -73,10 +73,11 @@ def configure_swap(size_mib: int, path: Path = SWAP_FILE, fstab: Path = FSTAB) -
                 os.posix_fallocate(stream.fileno(), 0, size)
                 stream.flush()
                 os.fsync(stream.fileno())
+            command("mkswap", str(path))
         except BaseException:
+            # Only this invocation's newly-created file may be removed, never an existing one.
             path.unlink()
             raise
-        command("mkswap", str(path))
 
     # Fail visibly during bootstrap if activation is unsupported; don't claim success.
     command("swapon", str(path))

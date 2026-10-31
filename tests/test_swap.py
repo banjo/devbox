@@ -29,11 +29,11 @@ def test_reject_invalid_swap_config(tmp_path, value):
 def test_rendered_cloud_init_contains_complete_helper(size):
     text = render_cloud_init(size)
     assert "__DEVBOX_SWAP_" not in text
-    assert f'[python3, /usr/local/sbin/devbox-setup-swap.py, "{size}"]' in text
+    assert f'python3 /usr/local/sbin/devbox-setup-swap.py {size} || exit $?' in text
     assert 'permissions: "0700"' in text
     source = Path(swap.__file__).read_text().rstrip()
     assert "\n".join("      " + line if line else "" for line in source.splitlines()) in text
-    assert text.index("- [python3,") < text.index("- mkdir -p /srv/app")
+    assert text.index("- python3 /usr/local/sbin/devbox-setup-swap.py") < text.index("- mkdir -p /srv/app")
 
 
 @pytest.fixture
@@ -190,3 +190,37 @@ def test_activation_is_read_back(machine, monkeypatch):
     monkeypatch.setattr(swap, "command", missing)
     with pytest.raises(RuntimeError, match="could not be verified"):
         swap.configure_swap(1, path, fstab)
+
+
+def test_mkswap_failure_can_be_retried(machine):
+    path, fstab, state = machine
+    state["fail"] = "mkswap"
+    with pytest.raises(subprocess.CalledProcessError):
+        swap.configure_swap(1, path, fstab)
+    assert not path.exists()
+    state["fail"] = None
+    assert "active and persistent" in swap.configure_swap(1, path, fstab)
+
+
+@pytest.mark.parametrize("options", ["noauto", "sw,noauto", "defaults,noauto,nofail"])
+def test_noauto_fstab_entry_is_not_claimed_persistent(tmp_path, options):
+    path, fstab = tmp_path / "swapfile", tmp_path / "fstab"
+    content = f"{path} none swap {options} 0 0\n"
+    fstab.write_text(content)
+    with pytest.raises(RuntimeError, match="conflicting"):
+        swap.persist(path, fstab)
+    assert fstab.read_text() == content
+
+
+def test_failing_swap_helper_stops_bootstrap(tmp_path):
+    text = render_cloud_init(2048)
+    line = next(line[4:] for line in text.splitlines()
+                if line.startswith("  - python3 /usr/local/sbin/devbox-setup-swap.py"))
+    helper = tmp_path / "failed-helper.py"
+    helper.write_text("raise SystemExit(37)\n")
+    marker = tmp_path / "later-command"
+    line = line.replace("/usr/local/sbin/devbox-setup-swap.py", str(helper))
+    # Model cloud-init's non-errexit /bin/sh: a later success must not mask the failure.
+    result = subprocess.run(["sh", "-c", f"{line}\nprintf continued > {marker}"], check=False)
+    assert result.returncode == 37
+    assert not marker.exists()

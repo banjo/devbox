@@ -292,7 +292,7 @@ def test_up_passes_configured_swap_to_cloud_init(capsys, isolated, cloud, size):
     run(capsys, "project", "add", "crm", "--path", str(isolated / "crm"))
     code, _, err = run(capsys, "up", "crm", "--type", "cx23", "--location", "fsn1")
     assert code == 0, err
-    assert f'[python3, /usr/local/sbin/devbox-setup-swap.py, "{size}"]' in cloud.last_user_data
+    assert f'python3 /usr/local/sbin/devbox-setup-swap.py {size} || exit $?' in cloud.last_user_data
     assert "__DEVBOX_SWAP_" not in cloud.last_user_data
 
 

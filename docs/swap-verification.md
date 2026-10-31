@@ -5,17 +5,21 @@ created and no builds/tests were run on the controller host.
 
 ## Automated checks
 
-- `uv run --frozen pytest -q`: **284 passed**.
+- `uv run --frozen pytest -q`: **289 passed**.
 - Config coverage: default 2048 MiB, zero/custom size, invalid negative/bool/float/string/list.
 - CLI tests inspect the actual user-data passed to server creation for zero/default/custom size.
 - Helper tests cover creation, permissions, allocation failure, low disk, command failure,
   activation readback, repeat calls, foreign active swap, inactive file reuse, fstab repair,
-  duplicate/conflicting entries and unsafe file types/ownership/link counts.
+  duplicate/conflicting entries and unsafe file types/ownership/link counts. Review regressions
+  cover failed-`mkswap` cleanup followed by a successful retry, `noauto` rejection and bootstrap
+  stopping immediately when the swap helper fails.
 - Sensitivity check: restoring the old cloud-init template makes all three rendering regression
   cases fail; restoring the changed template returns the complete suite to green.
 - `uv build --wheel`: passed; archive inspection confirms `cloud-init.yaml`, `bootstrap.py`
   and `setup_swap.py` are packaged.
 - `cloud-init schema --config-file <rendered.yaml>`: **Valid schema**.
+- The installed cloud-init's real `shellify()` generated a bootstrap script in which a forced
+  helper failure exited with code 37 and prevented the subsequent sentinel command.
 
 ## Live helper checks
 
