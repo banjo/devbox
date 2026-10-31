@@ -119,6 +119,7 @@ Next time the agent reads the notes first and does not have to work it out again
 | `devbox doctor` | Read-only checks with fixes (issue #8). |
 | `devbox cleanup [--yes]` | Unused devbox resources and stale local files; deletes only with `--yes` (issue #8). |
 | `devbox history [NAME] [--limit N]` | Past servers and snapshots with cost and activity (issue #8). |
+| `devbox up NAME [--startup-timeout D] [--cleanup-on-failure]` | One deadline over the whole startup, progress on stderr, structured failures, diagnostics, retry on the same server (issue #18). |
 | `devbox sync NAME --watch` | Poll for local changes and sync after each burst (issue #7). |
 | `devbox pull NAME [PATHS] [--all]` | Stage server-side changes locally for review (issue #7). |
 | `devbox forward NAME PORT...` | SSH port forwarding on 127.0.0.1 (issue #7). |
@@ -162,6 +163,7 @@ src/devbox/admin.py      # doctor, cleanup, history
 src/devbox/databases.py  # database engines
 src/devbox/envsecrets.py # per-project secrets
 src/devbox/watch.py      # polling watcher for sync --watch
+src/devbox/startup.py    # startup deadline, progress, redaction
 ```
 
 ## 7. The skill

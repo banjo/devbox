@@ -55,6 +55,8 @@ class Config:
     # `devbox idle-check` pauses (or deletes) servers without activity for this long.
     idle_timeout: str = "8h"
     idle_action: str = "pause"
+    # Deadline for `up`: creating the server, first-boot setup and the first sync.
+    startup_timeout: str = "5m"
     # Monthly spending limit in EUR, and what `up` does when it is reached.
     monthly_budget: float | None = None
     budget_action: str = "warn"
@@ -89,7 +91,10 @@ class Config:
 
 
 _PATH_KEYS = {"hcloud_token_file", "ssh_key"}
-_STR_KEYS = {"server_type", "location", "image", "controller_id", "idle_timeout", "idle_action", "budget_action"}
+_STR_KEYS = {
+    "server_type", "location", "image", "controller_id", "idle_timeout", "idle_action", "budget_action",
+    "startup_timeout",
+}
 _FLOAT_KEYS = {"snapshot_price_per_gb_month", "monthly_budget"}
 CONTROLLER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 
@@ -130,6 +135,11 @@ def load(path: Path | None = None) -> Config:
         parse_duration(cfg.idle_timeout)
     except DevboxError as e:
         raise DevboxError(f"{path}: idle_timeout: {e}")
+    try:
+        if parse_duration(cfg.startup_timeout) is None:
+            raise DevboxError("startup_timeout can't be off")
+    except DevboxError as e:
+        raise DevboxError(f"{path}: startup_timeout: {e}")
     if cfg.idle_action not in ("pause", "down"):
         raise DevboxError(f"{path}: idle_action must be 'pause' or 'down'")
     if cfg.budget_action not in ("warn", "block"):

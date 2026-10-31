@@ -29,6 +29,7 @@ Nothing below has run against Hetzner yet. Check each step and fix what breaks.
 - [ ] `db dump/restore` with Postgres in Compose and with SQLite; `down --dump`; restore into a fresh server
 - [ ] Idle shutdown with a long foreground `exec` and a `--detach --keep-alive` job: server left alone until both finish (#14)
 - [ ] Pause where deleting the server fails (e.g. delete protection): status shows powered off, a second `pause` reuses the snapshot, `up` powers it on (#16)
+- [ ] Startup (#18): progress lines on a fresh and a restored server; real cold-start time vs the 5m default; stalled mirror / blocked SSH give a bounded failure with diagnostics; retry continues on the same server; `--cleanup-on-failure` deletes only a fresh server; Ctrl-C reports accurately
 - [ ] Full agent run with the skill: a project with no notes goes from `up` to a working preview, the agent saves notes, then `down` and `up` again work from the notes alone
 
 ## Next
@@ -51,6 +52,7 @@ Nothing below has run against Hetzner yet. Check each step and fix what breaks.
 - A restored server keeps the snapshot's disk size, so it can't move to a smaller server type.
 - Availability from Hetzner is an indicator, not a guarantee; `up` can still fail if a type sells out between listing and creating.
 - One server at a time unless `up --force`.
+- The 5m startup default is a guess until measured on real cold starts (see #18); app health checks are separate from `up` being ready.
 - Costs are estimates of server and snapshot prices; IPv4 and traffic are not included. Servers deleted outside devbox are recorded as deleted when devbox next notices, which can overstate their cost.
 - Submodule contents are not synced.
 - `exec --timeout` does not stop containers started in the background (`-d`).

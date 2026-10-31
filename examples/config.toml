@@ -28,6 +28,9 @@ keep_snapshots = 1
 idle_timeout = "8h"
 idle_action = "pause"
 
+# Deadline for `up`: create/power on, SSH, cloud-init, tool check and first sync.
+startup_timeout = "5m"
+
 # Monthly spending limit in EUR. "warn" or "block" when `up` would exceed it.
 # monthly_budget = 20
 # budget_action = "warn"

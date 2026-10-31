@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from devbox import DevboxError
+from devbox.startup import StageTimeout
 
 MANAGED_LABEL = "managed-by=devbox"
 CONTROLLER_LABEL = "devbox-controller"
@@ -25,6 +26,9 @@ class Hcloud:
     def __init__(self, token: str | None, controller_id: str, binary: str = "hcloud"):
         self.binary = binary
         self.controller_id = controller_id
+        # Set by `up`: every hcloud call then ends by the startup deadline.
+        self.deadline = None
+        self.stage = "prepare"
         self.env = dict(os.environ)
         if token:
             self.env["HCLOUD_TOKEN"] = token
@@ -88,6 +92,7 @@ class Hcloud:
 
     def run(self, *args: str, input: str | None = None, parse: bool = True) -> Any:
         cmd = [self.binary, *args]
+        timeout = 600 if self.deadline is None else self.deadline.bound(self.stage, 600)
         try:
             proc = subprocess.run(
                 cmd,
@@ -96,11 +101,17 @@ class Hcloud:
                 stdin=None if input is not None else subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
-                timeout=600,
+                timeout=timeout,
             )
         except FileNotFoundError:
             raise DevboxError("hcloud CLI not found; install it from https://github.com/hetznercloud/cli")
         except subprocess.TimeoutExpired:
+            if self.deadline is not None:
+                raise StageTimeout(
+                    self.stage,
+                    f"hcloud {' '.join(args[:2])} did not finish before the startup deadline; "
+                    f"the action may still complete at Hetzner",
+                )
             raise DevboxError(f"timed out: hcloud {' '.join(args)}")
         if proc.returncode != 0:
             msg = proc.stderr.strip() or proc.stdout.strip()

@@ -10,6 +10,13 @@ packages:
   - unzip
 
 write_files:
+  # Fail fast instead of retrying a stalled package mirror for a long time.
+  - path: /etc/apt/apt.conf.d/99devbox-timeouts
+    permissions: "0644"
+    content: |
+      Acquire::http::Timeout "20";
+      Acquire::https::Timeout "20";
+      Acquire::Retries "2";
   - path: /etc/profile.d/devbox.sh
     permissions: "0644"
     content: |
@@ -20,11 +27,11 @@ write_files:
 runcmd:
   # Idempotent, because these run again when a server is restored from a snapshot.
   - mkdir -p /srv/app
-  - command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh
-  - command -v mise >/dev/null || curl -fsSL https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh
+  - command -v docker >/dev/null || curl -fsSL --connect-timeout 20 --max-time 120 --retry 2 https://get.docker.com | sh
+  - command -v mise >/dev/null || curl -fsSL --connect-timeout 20 --max-time 120 --retry 2 https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh
   - |
     if ! command -v cloudflared >/dev/null; then
-      curl -fsSL -o /tmp/cloudflared.deb "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$(dpkg --print-architecture).deb"
+      curl -fsSL --connect-timeout 20 --max-time 120 --retry 2 -o /tmp/cloudflared.deb "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$(dpkg --print-architecture).deb"
       dpkg -i /tmp/cloudflared.deb
       rm -f /tmp/cloudflared.deb
     fi

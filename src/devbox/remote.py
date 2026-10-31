@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from devbox import DevboxError
+from devbox.startup import Deadline, Progress, StageFailed, StageTimeout, redact
 
 APP_DIR = "/srv/app"
 UNIT_PREFIX = "devbox-"
@@ -37,6 +38,53 @@ def to_script(cmd: list[str]) -> str:
     if not cmd:
         raise DevboxError("no command given")
     return cmd[0] if len(cmd) == 1 else shlex.join(cmd)
+
+
+CLOUD_INIT_POLL = (
+    "cloud-init status 2>/dev/null; echo \"rc=$?\"; "
+    "tail -n 1 /var/log/cloud-init-output.log 2>/dev/null"
+)
+TOOLS_CHECK = (
+    "for t in docker rsync git mise cloudflared python3; do command -v $t >/dev/null || echo $t; done; "
+    "docker compose version >/dev/null 2>&1 || echo 'docker compose'"
+)
+DIAGNOSTICS = (
+    "echo '== cloud-init status'; cloud-init status --long 2>&1; "
+    "echo '== last setup output'; tail -n 60 /var/log/cloud-init-output.log 2>&1; "
+    "echo '== failed units'; systemctl --failed --no-legend --plain 2>&1"
+)
+
+
+def parse_cloud_init_poll(output: str) -> tuple[str | None, int | None, str | None]:
+    """(status, exit code, last log line) from CLOUD_INIT_POLL output."""
+    status = code = last = None
+    lines = output.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("status:"):
+            value = line.split(":", 1)[1].strip()
+            # e.g. "running", "done", "degraded done", "error", "not started", "disabled"
+            for known in ("error", "done", "running", "disabled"):
+                if known in value.split():
+                    status = known
+                    break
+            else:
+                status = value or None
+        elif line.startswith("rc="):
+            try:
+                code = int(line[3:])
+            except ValueError:
+                pass
+            rest = [l for l in lines[i + 1:] if l.strip()]
+            last = rest[-1].strip() if rest else None
+            break
+    return status, code, last
+
+
+def _run_bounded(cmd: list[str], timeout: float | None, **kw) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(cmd, timeout=timeout, **kw)
+    except subprocess.TimeoutExpired:
+        raise StageTimeout("sync", "syncing code did not finish before the startup deadline")
 
 
 @dataclass
@@ -236,29 +284,69 @@ class Remote:
         proc = self._ssh(f"systemctl is-active --quiet {unit}.scope", check=False, timeout=30)
         return proc.returncode != 0
 
-    def wait_ready(self, timeout: float = 900) -> list[str]:
-        """Wait for SSH and cloud-init. Returns warnings."""
-        deadline = time.monotonic() + timeout
+    # Startup stages for `up`. All of them stop at the shared deadline.
+
+    def wait_ssh(self, deadline: Deadline, progress: Progress, sleep=time.sleep) -> None:
+        progress.step("ssh", f"Waiting for SSH on {self.ip}...")
         while True:
-            proc = subprocess.run(
-                self.ssh_cmd("true", connect_timeout=5), capture_output=True, text=True
+            limit = deadline.bound("ssh", 15)
+            try:
+                proc = subprocess.run(
+                    self.ssh_cmd("true", connect_timeout=max(1, min(10, int(limit)))),
+                    capture_output=True, text=True, timeout=limit, stdin=subprocess.DEVNULL,
+                )
+                if proc.returncode == 0:
+                    progress.say("SSH connected")
+                    return
+            except subprocess.TimeoutExpired:
+                pass
+            progress.waiting(f"Waiting for SSH on {self.ip}; not reachable yet")
+            sleep(max(0.0, min(5.0, deadline.remaining())))
+            deadline.check("ssh")
+
+    def wait_cloud_init(self, deadline: Deadline, progress: Progress, secrets=(), sleep=time.sleep) -> list[str]:
+        """Wait for first-boot setup. Fails at once if cloud-init reports an error."""
+        progress.step("cloud-init", "Waiting for cloud-init (server setup)...")
+        while True:
+            limit = deadline.bound("cloud-init", 20)
+            try:
+                proc = self._ssh(CLOUD_INIT_POLL, check=False, timeout=limit)
+            except DevboxError as e:
+                deadline.check("cloud-init")
+                progress.waiting(f"Waiting for cloud-init; could not ask the server ({e})")
+                sleep(max(0.0, min(5.0, deadline.remaining())))
+                continue
+            status, code, last = parse_cloud_init_poll(proc.stdout)
+            if code == 1 or status == "error":
+                detail = self._ssh("cloud-init status --long", check=False, timeout=deadline.bound("cloud-init", 15)).stdout
+                raise StageFailed("cloud-init", "cloud-init reported an error:\n" + redact(detail.strip(), secrets))
+            if status in ("done", "disabled"):
+                progress.say("cloud-init finished")
+                if code == 2:
+                    return ["cloud-init finished with recoverable errors; see `cloud-init status --long` on the server"]
+                return []
+            note = redact(last, secrets)[:140] if last else None
+            progress.waiting(
+                f"cloud-init {status or 'state unknown'}; last output: {note}" if note
+                else f"cloud-init {status or 'state unknown'}; no further progress reported"
             )
-            if proc.returncode == 0:
-                break
-            if time.monotonic() > deadline:
-                raise DevboxError(f"server {self.ip} did not accept SSH within {int(timeout)}s")
-            time.sleep(5)
+            sleep(max(0.0, min(5.0, deadline.remaining())))
+            deadline.check("cloud-init")
 
-        remaining = max(60, deadline - time.monotonic())
-        proc = self.run("cloud-init status --wait", check=False, timeout=remaining, cwd=None)
-        if proc.returncode == 0:
-            return []
-        if proc.returncode == 2:
-            return ["cloud-init finished with recoverable errors; see `cloud-init status --long`"]
-        long = self.run("cloud-init status --long", check=False, cwd=None)
-        raise DevboxError(f"cloud-init failed:\n{long.stdout.strip()}")
+    def verify_tools(self, deadline: Deadline, progress: Progress) -> None:
+        """Make sure first-boot setup actually installed what devbox relies on."""
+        progress.step("tools", "Checking installed tools...")
+        proc = self._ssh(TOOLS_CHECK, check=False, timeout=deadline.bound("tools", 30))
+        missing = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+        if missing:
+            raise StageFailed("tools", f"server setup finished but these tools are missing: {', '.join(missing)}")
 
-    def sync(self, local_path: str, manifest: Path) -> dict:
+    def collect_diagnostics(self, timeout: float = 20) -> str:
+        """Recent setup output from the server, for failure reports. Bounded by `timeout`."""
+        proc = self._ssh(DIAGNOSTICS, check=False, timeout=timeout)
+        return proc.stdout + (proc.stderr or "")
+
+    def sync(self, local_path: str, manifest: Path, timeout: float | None = None) -> dict:
         """Copy the project to the server.
 
         In a Git repo, exactly the files Git would consider part of the working
@@ -273,9 +361,9 @@ class Remote:
         dest = f"root@{self.ip}:{APP_DIR}/"
 
         if files is None:
-            proc = subprocess.run(
+            proc = _run_bounded(
                 ["rsync", "-az", "--exclude", ".git", "-e", ssh, f"{root}/", dest],
-                capture_output=True, text=True,
+                timeout, capture_output=True, text=True,
             )
             if proc.returncode != 0:
                 raise DevboxError(f"rsync failed: {proc.stderr.strip()}")
@@ -286,8 +374,9 @@ class Remote:
         current = set(files)
         to_delete = sorted(f for f in previous - current if not os.path.lexists(root / f))
 
-        proc = subprocess.run(
+        proc = _run_bounded(
             ["rsync", "-az", "--from0", "--files-from=-", "-e", ssh, f"{root}/", dest],
+            timeout,
             input="\0".join(files).encode(),
             capture_output=True,
         )

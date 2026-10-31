@@ -62,6 +62,7 @@ devbox server-types [filters]             server types that can be ordered now, 
 devbox up NAME [--type T --location L]    reuse the server, or create one (from the latest snapshot
                                           if there is one; --fresh for a clean image), sync code
 devbox resume NAME                        like up, but only from a snapshot
+    up/resume options: --startup-timeout 5m, --cleanup-on-failure, --fresh, --force, --over-budget
 devbox sync NAME [--watch]                copy local code to the server (keep syncing on save with --watch)
 devbox pull NAME [PATHS...] [--all]       copy files that differ on the server into a local staging folder
 devbox forward NAME PORT...               forward local ports to the server (PORT or LOCAL:REMOTE)
@@ -111,6 +112,17 @@ All commands accept `--json`. `exec` runs a single argument as a shell script (`
 - `exec --timeout S` is enforced on the server: the command runs in its own systemd scope with `RuntimeMaxSec`, so after S seconds systemd sends SIGTERM to every process in it and SIGKILL 10 seconds later, even if the SSH connection is gone. `exec` checks the scope's result on the server and then exits with 124 (`timed_out: true` with `--json`); a real SSH failure is still reported as one. Containers started in the background (`docker compose up -d`, `docker run -d`) belong to Docker, not the scope, and keep running. Without `--timeout`, a foreground command keeps running on the server if the connection drops.
 - Previews use a Cloudflare quick tunnel: a public, random `*.trycloudflare.com` URL that changes whenever the tunnel restarts. No Cloudflare account and no open ports.
 - `down` deletes the server. Anything that exists only there (database contents, unsynced files) is gone.
+
+### Startup
+
+- `up` runs every step under one deadline: creating (or powering on) the server, waiting for SSH, first-boot setup (cloud-init), checking that Docker, Compose, mise, cloudflared, rsync, git and python3 are installed, syncing code and writing secrets. The default is `startup_timeout = "5m"`; change it in the config, per project with `devbox project set NAME --startup-timeout 10m`, or per run with `up --startup-timeout`. Every network call and wait uses the time that's left; nothing extends it.
+- Progress is printed to stderr as `[mm:ss] ...` lines, including the last line of setup output while cloud-init runs (with secrets masked). With `--json`, stdout only has the final JSON.
+- If cloud-init reports an error or tools are missing, `up` fails right away instead of waiting.
+- On failure, `up` exits 1 (124 for a timeout, 130 for Ctrl-C) and prints the stage, how long it took, the server id and IP, that the server is kept and still billed, where the diagnostics file is (`~/.local/state/devbox/diagnostics/`: cloud-init status, the last 60 lines of setup output and failed units, secrets masked), and the commands to retry or delete. With `--json` the same information is in the error object (`code`, `stage`, `elapsed_seconds`, `limit_seconds`, `server_id`, `server_retained`, `billable`, `diagnostics`, `cleanup`, ...).
+- The server is recorded as "setup failed at <stage>" (`status` shows it). Running `up` again continues setup on the same server; it never creates a second one.
+- `--cleanup-on-failure` deletes the server when startup fails, but only a fresh server created by that run (never a reused one or one restored from a snapshot, and never a snapshot). devbox checks that Hetzner no longer lists it before saying it's gone.
+- If the create request itself times out, the server may still appear at Hetzner later; `devbox status` picks it up.
+- On the server, package downloads use short timeouts (20 s per connection, 2 retries) so a stalled mirror fails instead of hanging.
 
 ### Development loop
 

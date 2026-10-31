@@ -81,6 +81,12 @@ MIGRATIONS = [
     """
     ALTER TABLE servers ADD COLUMN power TEXT;
     """,
+    """
+    ALTER TABLE servers ADD COLUMN setup_stage TEXT;
+    ALTER TABLE servers ADD COLUMN setup_error TEXT;
+    ALTER TABLE servers ADD COLUMN diagnostics TEXT;
+    ALTER TABLE projects ADD COLUMN startup_timeout TEXT;
+    """,
 ]
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
@@ -170,6 +176,13 @@ def set_idle_timeout(conn: sqlite3.Connection, name: str, value: str | None) -> 
     require_project(conn, name)
     conn.execute(
         "UPDATE projects SET idle_timeout = ?, updated_at = ? WHERE name = ?", (value, now(), name)
+    )
+
+
+def set_startup_timeout(conn: sqlite3.Connection, name: str, value: str | None) -> None:
+    require_project(conn, name)
+    conn.execute(
+        "UPDATE projects SET startup_timeout = ?, updated_at = ? WHERE name = ?", (value, now(), name)
     )
 
 
@@ -383,7 +396,7 @@ def event_counts(conn: sqlite3.Connection, server_id: int) -> dict[str, int]:
 
 _SERVER_FIELDS = {
     "ip", "server_type", "location", "status", "preview_port", "preview_url",
-    "price_hourly", "price_monthly", "power",
+    "price_hourly", "price_monthly", "power", "setup_stage", "setup_error", "diagnostics",
 }
 
 

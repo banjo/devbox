@@ -138,6 +138,7 @@ Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/a
 - A single argument after `--` is run as a shell script, so quote it: `-- 'npm ci && npm test'`. Several arguments are quoted individually, so `&&` between them is passed literally.
 - Processes do not restart on their own. After a crash, check `logs` and run the same `exec --detach` again.
 - A clean server has nothing installed: runtimes, `node_modules`, databases and `.env` must be set up again. Notes should separate "new server" steps from "every start" steps, because a server restored from a snapshot only needs the latter.
+- If `up` fails, read its message: it names the stage, says whether the server was kept (it is still billed) and points to a diagnostics file. Read that file, tell the user what went wrong, and either run `devbox up NAME` again (it continues on the same server) or, if they don't want to keep it, `devbox down NAME`. A slow first boot can be given more time with `--startup-timeout 10m`. Use `--cleanup-on-failure` when nothing on a fresh server is worth keeping.
 - If `exec` fails with an SSH error, run `devbox status`; the server may have been deleted.
 - When `up` or another command fails in a way you don't understand (token, SSH key, firewall), run `devbox doctor` and follow its fixes.
 - `devbox cleanup` only lists unused resources. Show the list to the user and only run `devbox cleanup --yes` after they agree.

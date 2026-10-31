@@ -270,9 +270,13 @@ def cloud(monkeypatch):
     monkeypatch.setattr(cli, "Hcloud", fake)
     monkeypatch.setattr(cli, "ensure_local_ssh_key", lambda key: "ssh-ed25519 AAAA test")
     monkeypatch.setattr(cli, "resolve_ssh_allow", lambda entries: ["192.0.2.1/32"])
-    monkeypatch.setattr(cli.Remote, "wait_ready", lambda self: [])
+    monkeypatch.setattr(cli.Remote, "wait_ssh", lambda self, deadline, progress: None)
+    monkeypatch.setattr(cli.Remote, "wait_cloud_init", lambda self, deadline, progress, secrets=(): [])
+    monkeypatch.setattr(cli.Remote, "verify_tools", lambda self, deadline, progress: None)
+    monkeypatch.setattr(cli.Remote, "collect_diagnostics", lambda self, timeout=20: "cloud-init log\n")
     monkeypatch.setattr(
-        cli.Remote, "sync", lambda self, path, manifest: {"mode": "git", "files": 1, "deleted": 0, "warning": None}
+        cli.Remote, "sync",
+        lambda self, path, manifest, timeout=None: {"mode": "git", "files": 1, "deleted": 0, "warning": None},
     )
     monkeypatch.setattr(cli.Remote, "list_units", lambda self: [])
     monkeypatch.setattr(cli.Remote, "running_work", lambda self: list(fake.running_work))

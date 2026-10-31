@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from importlib import resources
 from pathlib import Path
 
-from devbox import DevboxError, admin, config, costs, databases, db, envsecrets, watch
+from devbox import DevboxError, admin, config, costs, databases, db, envsecrets, startup, watch
 from devbox.hetzner import Hcloud, filter_offers
 from devbox.remote import PULL_PRUNE, TUNNEL, Remote, git_files, git_ignored, to_script, validate_proc
 
@@ -67,6 +67,11 @@ class Context:
         if server is None:
             raise DevboxError(f"project '{project}' has no server; start one with `devbox up {project}`")
         if server["status"] != "running":
+            if server["setup_error"]:
+                raise DevboxError(
+                    f"setup of the server for '{project}' failed at {server['setup_stage']}; "
+                    f"`devbox up {project}` retries it, `devbox down {project}` deletes it"
+                )
             raise DevboxError(f"server for '{project}' is still being set up; run `devbox up {project}` again")
         if server["power"] in POWERED_DOWN:
             raise DevboxError(
@@ -156,6 +161,8 @@ def uptime(created_at: str | None) -> str | None:
 def server_state(server) -> str:
     if server["power"] in POWERED_DOWN:
         return "powered off"
+    if server["status"] == "creating" and server["setup_error"]:
+        return f"setup failed at {server['setup_stage']}"
     return server["status"]
 
 
@@ -219,6 +226,7 @@ def cmd_project_notes(ctx: Context) -> int:
 
 def cmd_project_set(ctx: Context) -> int:
     name = ctx.args.name
+    db.require_project(ctx.conn, name)
     value = ctx.args.idle_timeout
     if value is not None:
         if value == "default":
@@ -226,9 +234,21 @@ def cmd_project_set(ctx: Context) -> int:
         else:
             config.parse_duration(value)
         db.set_idle_timeout(ctx.conn, name, value)
+    value = ctx.args.startup_timeout
+    if value is not None:
+        if value == "default":
+            value = None
+        elif config.parse_duration(value) is None:
+            raise DevboxError("the startup timeout can't be off")
+        db.set_startup_timeout(ctx.conn, name, value)
     project = db.require_project(ctx.conn, name)
-    effective = project["idle_timeout"] or f"{ctx.cfg.idle_timeout} (default)"
-    emit(ctx.args, {"name": name, "idle_timeout": project["idle_timeout"]}, f"{name}: idle timeout {effective}")
+    idle = project["idle_timeout"] or f"{ctx.cfg.idle_timeout} (default)"
+    start = project["startup_timeout"] or f"{ctx.cfg.startup_timeout} (default)"
+    emit(
+        ctx.args,
+        {"name": name, "idle_timeout": project["idle_timeout"], "startup_timeout": project["startup_timeout"]},
+        f"{name}: idle timeout {idle}, startup timeout {start}",
+    )
     return 0
 
 
@@ -409,113 +429,293 @@ def check_budget(ctx: Context) -> list[str]:
 # Server lifecycle
 
 
+def startup_limit(ctx: Context, project) -> tuple[str, float]:
+    """The startup deadline for `up`: --startup-timeout, then the project's, then the config's."""
+    value = ctx.args.startup_timeout or project["startup_timeout"] or ctx.cfg.startup_timeout
+    limit = config.parse_duration(value)
+    if limit is None or limit.total_seconds() <= 0:
+        raise DevboxError(f"invalid startup timeout '{value}': use a duration like 5m (it can't be off)")
+    return value, limit.total_seconds()
+
+
 def cmd_up(ctx: Context) -> int:
     name = ctx.args.name
+    project = db.require_project(ctx.conn, name)
+    limit_label, limit = startup_limit(ctx, project)
+    deadline = startup.Deadline(limit)
+    progress = startup.Progress(deadline)
+    state = {"server_id": None, "created": False, "snapshot": None}
+    with ctx.lock():
+        ctx.hcloud.deadline = deadline
+        try:
+            result = bring_up(ctx, project, deadline, progress, state)
+        except (DevboxError, KeyboardInterrupt) as e:
+            ctx.hcloud.deadline = None
+            if isinstance(e, DevboxError) and not isinstance(e, (startup.StageTimeout, startup.StageFailed)) \
+                    and state["server_id"] is None and progress.stage == "prepare":
+                raise  # checks before anything was created: budget, server choice, ...
+            raise startup_failure(ctx, e, state, deadline, progress, limit_label)
+        finally:
+            ctx.hcloud.deadline = None
+    return report_up(ctx, result, deadline)
+
+
+def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "startup.Progress", state: dict) -> dict:
+    """Every step of `up` under one deadline. Caller holds the lock."""
+    name = project["name"]
     cfg = ctx.cfg
     offer = None
     snapshot = None
     warnings: list[str] = []
-    with ctx.lock():
-        project = db.require_project(ctx.conn, name)
-        orphans = ctx.reconcile()
-        server = db.active_server(ctx.conn, name)
-        created = False
+    hc = ctx.hcloud
 
-        if server is None:
-            snapshot = None if ctx.args.fresh else db.latest_snapshot(ctx.conn, name)
-            if ctx.args.require_snapshot and snapshot is None:
-                raise DevboxError(f"{name} has no snapshot to resume from; use `devbox up {name}`")
-            others = [s["project"] for s in db.active_servers(ctx.conn)]
-            others += [o["name"] for o in orphans]
-            if others and not ctx.args.force:
-                raise DevboxError(
-                    f"another devbox server is running ({', '.join(others)}); "
-                    "stop it with `devbox down` or pass --force"
-                )
-            warnings += check_budget(ctx)
-            offer = choose_offer(ctx, name, snapshot)
-            public_key = ensure_local_ssh_key(cfg.ssh_key)
-            ssh_key_id = ctx.hcloud.ensure_ssh_key(public_key)
-            firewall_id = ctx.hcloud.ensure_firewall(resolve_ssh_allow(cfg.ssh_allow))
+    hc.stage = "prepare"
+    orphans = ctx.reconcile()
+    server = db.active_server(ctx.conn, name)
+    created = False
 
-            source = f" from snapshot {snapshot['hetzner_image_id']}" if snapshot else ""
-            print(f"creating {describe_offer(offer)} for {name}{source}...", file=sys.stderr)
-            user_data = resources.files("devbox").joinpath("cloud-init.yaml").read_text()
-            with tempfile.NamedTemporaryFile("w", suffix=".yaml") as f:
-                f.write(user_data)
-                f.flush()
-                info = ctx.hcloud.create_server(
-                    f"devbox-{name}", name, offer["type"],
-                    str(snapshot["hetzner_image_id"]) if snapshot else cfg.image,
-                    offer["location"], Path(f.name),
-                    ssh_key_id=ssh_key_id, firewall_id=firewall_id,
-                )
-            if snapshot is None:
-                # A clean server has none of the previously synced files.
-                ctx.manifest(name).unlink(missing_ok=True)
-            db.insert_server(
-                ctx.conn, name, info["id"], "creating", power=info.get("status"),
-                ip=info["ip"], server_type=info["server_type"] or offer["type"],
-                location=info["location"] or offer["location"], created_at=info.get("created"),
-                price_hourly=offer["price_hourly"], price_monthly=offer["price_monthly"],
-                snapshot_id=snapshot["id"] if snapshot else None,
+    if server is None:
+        snapshot = None if ctx.args.fresh else db.latest_snapshot(ctx.conn, name)
+        if ctx.args.require_snapshot and snapshot is None:
+            raise DevboxError(f"{name} has no snapshot to resume from; use `devbox up {name}`")
+        others = [s["project"] for s in db.active_servers(ctx.conn)]
+        others += [o["name"] for o in orphans]
+        if others and not ctx.args.force:
+            raise DevboxError(
+                f"another devbox server is running ({', '.join(others)}); "
+                "stop it with `devbox down` or pass --force"
             )
-            server = db.active_server(ctx.conn, name)
-            created = True
-            ctx.event(server, "restore" if snapshot else "create")
+        warnings += check_budget(ctx)
+        offer = choose_offer(ctx, name, snapshot)
+        public_key = ensure_local_ssh_key(cfg.ssh_key)
+        ssh_key_id = hc.ensure_ssh_key(public_key)
+        firewall_id = hc.ensure_firewall(resolve_ssh_allow(cfg.ssh_allow))
 
-        if server["power"] in POWERED_DOWN:
-            print(f"powering on the server for {name}...", file=sys.stderr)
-            ctx.hcloud.poweron(server["hetzner_id"])
-            powered_on = True
-        else:
-            powered_on = False
-        remote = ctx.remote(server)
-        if server["status"] != "running":
-            print(f"waiting for {server['ip']} to finish setup...", file=sys.stderr)
-        warnings += remote.wait_ready()
-        db.update_server(ctx.conn, server["id"], status="running", power="running")
+        source = f" from snapshot {snapshot['hetzner_image_id']}" if snapshot else ""
+        hc.stage = "create"
+        progress.step("create", f"Creating server: {describe_offer(offer)}{source}")
+        user_data = resources.files("devbox").joinpath("cloud-init.yaml").read_text()
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml") as f:
+            f.write(user_data)
+            f.flush()
+            info = hc.create_server(
+                f"devbox-{name}", name, offer["type"],
+                str(snapshot["hetzner_image_id"]) if snapshot else cfg.image,
+                offer["location"], Path(f.name),
+                ssh_key_id=ssh_key_id, firewall_id=firewall_id,
+            )
+        if snapshot is None:
+            # A clean server has none of the previously synced files.
+            ctx.manifest(name).unlink(missing_ok=True)
+        server_id = db.insert_server(
+            ctx.conn, name, info["id"], "creating", power=info.get("status"),
+            ip=info["ip"], server_type=info["server_type"] or offer["type"],
+            location=info["location"] or offer["location"], created_at=info.get("created"),
+            price_hourly=offer["price_hourly"], price_monthly=offer["price_monthly"],
+            snapshot_id=snapshot["id"] if snapshot else None,
+        )
+        state.update(server_id=server_id, created=True, snapshot=snapshot)
+        server = db.get_server(ctx.conn, server_id)
+        created = True
+        progress.say(f"Server {server['hetzner_id']} created at {server['ip']}")
+        ctx.event(server, "restore" if snapshot else "create")
+    else:
+        state["server_id"] = server["id"]
+        if server["setup_error"]:
+            progress.say(f"Retrying setup of server {server['hetzner_id']} (failed before at {server['setup_stage']})")
 
-        print("syncing code...", file=sys.stderr)
-        sync = remote.sync(project["path"], ctx.manifest(name))
-        if sync["warning"]:
-            warnings.append(sync["warning"])
-        ctx.event(server, "up")
-        ctx.event(server, "sync")
-        secrets_written = push_secrets(ctx, server, name)
-        server = db.active_server(ctx.conn, name)
+    powered_on = False
+    if server["power"] in POWERED_DOWN:
+        hc.stage = "power-on"
+        progress.step("power-on", f"Powering on server {server['hetzner_id']}...")
+        hc.poweron(server["hetzner_id"])
+        powered_on = True
 
+    remote = ctx.remote(server)
+    secret_values = project_secret_values(name)
+    remote.wait_ssh(deadline, progress)
+    if server["status"] != "running" or powered_on:
+        warnings += remote.wait_cloud_init(deadline, progress, secrets=secret_values)
+        remote.verify_tools(deadline, progress)
+    db.update_server(
+        ctx.conn, server["id"], status="running", power="running",
+        setup_stage=None, setup_error=None,
+    )
+
+    progress.step("sync", "Syncing code...")
+    sync = remote.sync(project["path"], ctx.manifest(name), timeout=deadline.bound("sync", deadline.remaining()))
+    if sync["warning"]:
+        warnings.append(sync["warning"])
+    ctx.event(server, "up")
+    ctx.event(server, "sync")
+    progress.step("secrets", "Writing secrets...") if secret_store(ctx, name).load() else None
+    deadline.check("secrets")
+    secrets_written = push_secrets(ctx, server, name)
+    progress.say("Ready")
+    return {
+        "project": project,
+        "server": db.active_server(ctx.conn, name),
+        "created": created,
+        "powered_on": powered_on,
+        "snapshot": snapshot,
+        "offer": offer,
+        "warnings": warnings,
+        "secrets_written": secrets_written,
+    }
+
+
+def report_up(ctx: Context, r: dict, deadline: "startup.Deadline") -> int:
+    project, server, snapshot, offer = r["project"], r["server"], r["snapshot"], r["offer"]
+    name = project["name"]
     data = {
         "project": name,
-        "created": created,
-        "restored_from_snapshot": row(snapshot) if created and snapshot else None,
-        "secrets_written": secrets_written,
+        "created": r["created"],
+        "restored_from_snapshot": row(snapshot) if r["created"] and snapshot else None,
+        "secrets_written": r["secrets_written"],
         "server": row(server),
         "has_notes": bool(project["notes"].strip()),
         "offer": offer,
-        "warnings": warnings,
+        "warnings": r["warnings"],
+        "startup_seconds": round(deadline.elapsed(), 1),
     }
-    verb = "powered on" if powered_on else "reusing"
-    if created:
+    verb = "powered on" if r["powered_on"] else "reusing"
+    if r["created"]:
         verb = "restored" if snapshot else "created"
     text = [
         f"{name}: {verb} server {server['hetzner_id']} "
-        f"({server['server_type']} in {server['location']}) at {server['ip']}, code synced",
+        f"({server['server_type']} in {server['location']}) at {server['ip']}, code synced "
+        f"in {startup.duration_label(deadline.elapsed())}",
     ]
     if offer:
         text.append(f"  {offer['choice']}: {describe_offer(offer)}")
-    if created and snapshot:
+    if r["created"] and snapshot:
         text.append(
             f"  from snapshot taken {snapshot['created_at'][:16].replace('T', ' ')}: installed tools, "
             f"dependencies and data from then are back; background processes and the preview must be started again"
         )
-    if secrets_written:
-        text.append("  secrets written to " + ", ".join(f"{f} ({n} keys)" for f, n in secrets_written.items()))
-    text += [f"warning: {w}" for w in warnings]
+    if r["secrets_written"]:
+        text.append("  secrets written to " + ", ".join(f"{f} ({n} keys)" for f, n in r["secrets_written"].items()))
+    text += [f"warning: {w}" for w in r["warnings"]]
     if not data["has_notes"]:
         text.append(f"no notes for {name} yet; work out how to start it, then save them with `devbox project notes {name} --set ...`")
     emit(ctx.args, data, "\n".join(text))
     return 0
+
+
+def project_secret_values(name: str) -> list[str]:
+    files = envsecrets.SecretStore(config.config_dir(), name).load()
+    return [v for values in files.values() for v in values.values()]
+
+
+def startup_failure(ctx: Context, exc, state: dict, deadline, progress, limit_label: str) -> DevboxError:
+    """Record a failed or interrupted `up`, collect diagnostics, optionally clean up, and explain."""
+    interrupted = isinstance(exc, KeyboardInterrupt)
+    timed_out = isinstance(exc, startup.StageTimeout)
+    stage = getattr(exc, "stage", None) or progress.stage
+    name = ctx.args.name
+    reason = "interrupted (Ctrl-C)" if interrupted else str(exc)
+    code = "interrupted" if interrupted else ("startup_timeout" if timed_out else "startup_failed")
+    exit_code = startup.EXIT_INTERRUPTED if interrupted else (startup.EXIT_TIMEOUT if timed_out else 1)
+    secret_values = project_secret_values(name)
+    reason = startup.redact(reason, secret_values)
+
+    server = db.get_server(ctx.conn, state["server_id"]) if state["server_id"] else None
+    details = {
+        "code": code,
+        "stage": stage,
+        "elapsed_seconds": round(deadline.elapsed(), 1),
+        "limit_seconds": deadline.limit,
+        "project": name,
+        "server_id": server["hetzner_id"] if server else None,
+        "ip": server["ip"] if server else None,
+        "server_retained": bool(server),
+        "billable": bool(server),
+        "remote_may_still_run": stage in ("cloud-init", "tools") and (timed_out or interrupted),
+        "diagnostics": None,
+        "cleanup": None,
+    }
+
+    if timed_out:
+        headline = f"Startup timed out during {stage} after {startup.duration_label(deadline.elapsed())} (limit: {limit_label})"
+    elif interrupted:
+        headline = f"Startup interrupted during {stage} after {startup.duration_label(deadline.elapsed())}"
+    else:
+        headline = f"Startup failed during {stage} after {startup.duration_label(deadline.elapsed())}"
+    lines = [headline, f"  reason: {reason}", "", f"Project: {name}"]
+
+    if server is None:
+        if stage == "create":
+            lines += [
+                "Server: unknown. The create request may still complete at Hetzner; "
+                f"`devbox status` picks up a server created for {name} (it would be billed).",
+            ]
+            details["billable"] = None
+        else:
+            lines.append("Server: none was created")
+        return DevboxError("\n".join(lines), code=code, exit_code=exit_code, details=details)
+
+    remote = ctx.remote(server)
+    diag_path = None
+    try:
+        text = remote.collect_diagnostics(timeout=15)
+        diag_dir = ctx.cfg.state_dir / "diagnostics"
+        diag_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        diag_path = diag_dir / f"{name}-{server['hetzner_id']}-{stamp}.log"
+        header = f"devbox up {name}: {headline}\nreason: {reason}\nserver: {server['hetzner_id']} {server['ip']}\n\n"
+        diag_path.write_text(startup.redact(header + text, secret_values))
+        details["diagnostics"] = str(diag_path)
+    except (DevboxError, OSError) as e:
+        details["diagnostics_error"] = str(e)
+
+    cleanup = None
+    if ctx.args.cleanup_on_failure:
+        if state["created"] and state["snapshot"] is None:
+            cleanup = {"requested": True, "deleted": False}
+            try:
+                ctx.hcloud.delete_server(server["hetzner_id"])
+                still_there = any(s["id"] == server["hetzner_id"] for s in ctx.hcloud.list_servers())
+                if still_there:
+                    cleanup["error"] = "Hetzner still lists the server after deleting it"
+                else:
+                    cleanup["deleted"] = True
+                    ctx.event(server, "setup_cleanup")
+                    db.mark_deleted(ctx.conn, server["id"])
+                    ctx.known_hosts(server).unlink(missing_ok=True)
+            except DevboxError as e:
+                cleanup["error"] = str(e)
+        else:
+            cleanup = {"requested": True, "deleted": False,
+                       "skipped": "only a fresh server created by this run is deleted; this one was reused or restored"}
+    details["cleanup"] = cleanup
+
+    deleted = bool(cleanup and cleanup.get("deleted"))
+    details["server_retained"] = details["billable"] = not deleted
+    if not deleted:
+        db.update_server(ctx.conn, server["id"], setup_stage=stage, setup_error=reason[:500],
+                         diagnostics=str(diag_path) if diag_path else None)
+        ctx.event(server, "setup_failed")
+
+    rate = f" (~€{server['price_hourly']:.4f}/h)" if server["price_hourly"] is not None else ""
+    lines.append(f"Server: {server['hetzner_id']} ({server['ip']})")
+    if deleted:
+        lines.append("State: deleted (--cleanup-on-failure); Hetzner no longer lists it")
+    else:
+        lines.append(f"State: setup failed at {stage}")
+        lines.append(f"Server retained: still billable{rate}")
+        if cleanup and cleanup.get("error"):
+            lines.append(f"Cleanup failed: {cleanup['error']}")
+        elif cleanup and cleanup.get("skipped"):
+            lines.append(f"Cleanup skipped: {cleanup['skipped']}")
+        if details["remote_may_still_run"]:
+            lines.append("Remote setup may still be running.")
+    if diag_path:
+        lines.append(f"Diagnostics: {diag_path}")
+    else:
+        lines.append(f"Diagnostics: not collected ({details.get('diagnostics_error', 'unknown error')})")
+    if not deleted:
+        lines += ["", f"Retry startup: devbox up {name}", f"Delete server: devbox down {name}"]
+    return DevboxError("\n".join(lines), code=code, exit_code=exit_code, details=details)
 
 
 def server_summary(ctx: Context, server, snapshot=None, pruned=None) -> dict:
@@ -843,6 +1043,11 @@ def cmd_status(ctx: Context) -> int:
         if s["power"] in POWERED_DOWN:
             lines.append(f"  powered off but still billed: `devbox up {e['project']}` starts it, "
                          f"`devbox pause {e['project']}` removes it")
+        elif s["status"] == "creating" and s["setup_error"]:
+            lines.append(f"  {s['setup_error'].splitlines()[0]}")
+            if s["diagnostics"]:
+                lines.append(f"  diagnostics: {s['diagnostics']}")
+            lines.append(f"  still billed: `devbox up {e['project']}` retries setup, `devbox down {e['project']}` deletes it")
         lines.append(f"  cost: {cost_line(e['usage'], s)}")
         idle = e["idle"]
         if idle["remaining_seconds"] is None:
@@ -1501,6 +1706,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = proj_sub.add_parser("set", help="change project settings", parents=[common])
     p.add_argument("name")
     p.add_argument("--idle-timeout", metavar="DURATION", help="e.g. 2h, 1d, off, or 'default'")
+    p.add_argument("--startup-timeout", metavar="DURATION", help="deadline for `up`, e.g. 10m, or 'default'")
     p.set_defaults(func=cmd_project_set)
 
     p = proj_sub.add_parser("remove", help="hide a project (cost history is kept)", parents=[common])
@@ -1525,6 +1731,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--location", help="location for a new server (default: last used)")
         p.add_argument("--force", action="store_true", help="allow a second devbox server")
         p.add_argument("--over-budget", action="store_true", help="create even if the monthly budget is used up")
+        p.add_argument("--startup-timeout", metavar="DURATION", help="deadline for the whole startup, e.g. 5m (default from config/project)")
+        p.add_argument("--cleanup-on-failure", action="store_true",
+                       help="if startup fails, delete the server, but only a fresh one created by this run")
         p.set_defaults(require_snapshot=require_snapshot, fresh=False)
         if not require_snapshot:
             p.add_argument("--fresh", action="store_true", help="ignore snapshots and start from a clean image")
@@ -1694,9 +1903,9 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(ctx)
     except DevboxError as e:
         if args.json:
-            print(json.dumps({"error": str(e)}))
+            print(json.dumps({"error": str(e), **({"code": e.code} if e.code else {}), **e.details}, default=str))
         else:
             print(f"error: {e}", file=sys.stderr)
-        return 1
+        return e.exit_code
     except KeyboardInterrupt:
         return 130
