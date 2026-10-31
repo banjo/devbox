@@ -10,6 +10,10 @@ packages:
   - unzip
 
 write_files:
+  - path: /usr/local/sbin/devbox-setup-swap.py
+    permissions: "0700"
+    content: |
+      __DEVBOX_SWAP_HELPER__
   # Fail fast instead of retrying a stalled package mirror for a long time.
   - path: /etc/apt/apt.conf.d/99devbox-timeouts
     permissions: "0644"
@@ -26,6 +30,7 @@ write_files:
 
 runcmd:
   # Idempotent, because these run again when a server is restored from a snapshot.
+  - python3 /usr/local/sbin/devbox-setup-swap.py __DEVBOX_SWAP_SIZE_MIB__ || exit $?
   - mkdir -p /srv/app
   - command -v docker >/dev/null || curl -fsSL --connect-timeout 20 --max-time 120 --retry 2 https://get.docker.com | sh
   - command -v mise >/dev/null || curl -fsSL --connect-timeout 20 --max-time 120 --retry 2 https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh

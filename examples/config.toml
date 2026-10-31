@@ -9,6 +9,9 @@ hcloud_token_file = "~/.config/devbox/hcloud.token"
 # location = "fsn1"
 
 image = "ubuntu-24.04"
+# Safety margin for build/browser memory spikes, in MiB. 0 skips setup (does not remove swap).
+# Existing active swap is reused, and existing devbox swap files are never resized.
+swap_size_mib = 2048
 ssh_key = "~/.ssh/devbox"
 
 # CIDRs allowed to SSH into devboxes. "auto" = this machine's public IPv4.

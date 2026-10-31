@@ -48,6 +48,29 @@ The first `devbox up` creates an SSH key at `~/.ssh/devbox` (if missing), upload
 
 Upgrading from a version before controller ids: Hetzner allows each public key only once per project, so if your local key is already registered as the old `devbox` key (labeled `managed-by=devbox`, no controller label), devbox keeps using that key as it is. If the same public key is registered under another owner, `up` stops and tells you how to either label that key for this install or use a different `ssh_key`. The old firewall named `devbox` is no longer used and can be deleted in the Hetzner console once no server uses it. Running servers keep working.
 
+## Swap and memory pressure
+
+New servers configure **2 GiB of disk-backed swap** during cloud-init, before installing
+Docker/mise or running application work. Set `swap_size_mib = 4096` in
+`~/.config/devbox/config.toml` to request 4 GiB, or `swap_size_mib = 0` to skip swap setup.
+Only non-negative whole numbers are accepted.
+
+- Existing active swap (including swap partitions or zram) is reused; no extra file is created.
+- Otherwise devbox creates `/var/lib/devbox/swapfile` with mode `0600`, activates it, verifies
+  activation and adds one `/etc/fstab` entry so it returns after reboot.
+- An inactive devbox swap file, including one restored from a snapshot, is reactivated without
+  formatting or resizing. Unknown files, symlinks, hardlinks and non-root-owned files are refused.
+- Allocation requires enough disk for the file **plus 1 GiB left free**. Activation/allocation
+  errors are reported by cloud-init, rather than claiming swap is ready.
+- The setting applies when provisioning a server (including a snapshot restore), not to an
+  already running server. Changing the size does not resize existing swap; `0` does not
+  disable or delete existing swap. This avoids destroying snapshot/user-managed configuration.
+
+Swap is a safety margin for short-lived build/browser memory spikes, not extra RAM at RAM
+speed. Stop dev servers while running large builds on small machines. Sustained swap I/O
+means reducing parallel work or choosing more RAM, not endlessly increasing the swap file.
+Swap uses server disk; it can also increase stored snapshot size and snapshot cost.
+
 ## Commands
 
 ```text

@@ -9,10 +9,9 @@ import sys
 import tempfile
 import urllib.request
 from datetime import datetime, timedelta, timezone
-from importlib import resources
 from pathlib import Path
 
-from devbox import DevboxError, admin, config, costs, databases, db, envsecrets, startup, watch
+from devbox import DevboxError, admin, bootstrap, config, costs, databases, db, envsecrets, startup, watch
 from devbox.hetzner import Hcloud, filter_offers
 from devbox.remote import PULL_PRUNE, TUNNEL, Remote, git_files, git_ignored, to_script, validate_proc
 
@@ -494,7 +493,7 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
         source = f" from snapshot {snapshot['hetzner_image_id']}" if snapshot else ""
         hc.stage = "create"
         progress.step("create", f"Creating server: {describe_offer(offer)}{source}")
-        user_data = resources.files("devbox").joinpath("cloud-init.yaml").read_text()
+        user_data = bootstrap.render_cloud_init(cfg.swap_size_mib)
         with tempfile.NamedTemporaryFile("w", suffix=".yaml") as f:
             f.write(user_data)
             f.flush()

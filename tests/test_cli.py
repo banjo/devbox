@@ -182,6 +182,7 @@ class FakeCloud:
         return 2
 
     def create_server(self, name, project, server_type, image, location, user_data, ssh_key_id, firewall_id):
+        self.last_user_data = user_data.read_text()
         self.calls.append(("create", server_type, location, image))
         sid = self._id()
         self.servers[sid] = {
@@ -281,6 +282,18 @@ def cloud(monkeypatch):
     monkeypatch.setattr(cli.Remote, "list_units", lambda self: [])
     monkeypatch.setattr(cli.Remote, "running_work", lambda self: list(fake.running_work))
     return fake
+
+
+@pytest.mark.parametrize("size", [0, 2048, 4096])
+def test_up_passes_configured_swap_to_cloud_init(capsys, isolated, cloud, size):
+    path = isolated / "config" / "devbox" / "config.toml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"swap_size_mib = {size}\n")
+    run(capsys, "project", "add", "crm", "--path", str(isolated / "crm"))
+    code, _, err = run(capsys, "up", "crm", "--type", "cx23", "--location", "fsn1")
+    assert code == 0, err
+    assert f'python3 /usr/local/sbin/devbox-setup-swap.py {size} || exit $?' in cloud.last_user_data
+    assert "__DEVBOX_SWAP_" not in cloud.last_user_data
 
 
 def test_down_prints_cost_and_activity_and_costs_reports_it(capsys, isolated, cloud):
