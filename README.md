@@ -1,12 +1,12 @@
 # devbox
 
-Temporary Hetzner development servers, driven from the Hermes host. Code is edited locally, copied to a disposable server, and run there. The CLI manages the server; the agent (see [the skill](skills/hetzner-devbox/SKILL.md)) works out how to run each project and keeps notes on it.
+Temporary Hetzner development servers for coding agents. Code is edited locally, copied to a disposable server, and run there, so the machine the agent runs on stays light. The CLI manages the server; the agent (see [the skill](skills/hetzner-devbox/SKILL.md)) works out how to run each project and keeps notes on it.
 
 Status: proof of concept. See [PLAN.md](PLAN.md).
 
 ## Setup
 
-On the Hermes host:
+On the machine where the agent runs:
 
 1. Install the tools: Python 3.11+, [`uv`](https://docs.astral.sh/uv/), [`hcloud`](https://github.com/hetznercloud/cli), `ssh` and `rsync`.
 2. Create a dedicated Hetzner Cloud project and an API token with read/write access. Save it:
@@ -23,18 +23,28 @@ On the Hermes host:
    hcloud_token_file = "~/.config/devbox/hcloud.token"
    ```
 
-4. Install the CLI and the skill:
+4. Install the CLI:
 
    ```sh
-   cd /root/code/devbox
+   git clone https://github.com/banjo/devbox && cd devbox
    uv tool install -e .
-   mkdir -p ~/.hermes/skills/devops
-   ln -s "$PWD/skills/hetzner-devbox" ~/.hermes/skills/devops/hetzner-devbox
    ```
 
-5. Check it works: `devbox status` should print `no devbox servers`.
+5. Install the skill by linking `skills/hetzner-devbox` into your agent's skills folder, for example:
 
-The first `devbox up` creates an SSH key at `~/.ssh/devbox` (if missing), uploads it to Hetzner as `devbox`, and creates a firewall `devbox` that allows SSH only from this host's public IP.
+   ```sh
+   # Hermes
+   mkdir -p ~/.hermes/skills/devops
+   ln -s "$PWD/skills/hetzner-devbox" ~/.hermes/skills/devops/hetzner-devbox
+
+   # Agents that read ~/.agents/skills
+   mkdir -p ~/.agents/skills
+   ln -s "$PWD/skills/hetzner-devbox" ~/.agents/skills/hetzner-devbox
+   ```
+
+6. Check it works: `devbox status` should print `no devbox servers`.
+
+The first `devbox up` creates an SSH key at `~/.ssh/devbox` (if missing), uploads it to Hetzner as `devbox`, and creates a firewall `devbox` that allows SSH only from this machine's public IP.
 
 ## Commands
 
@@ -58,7 +68,7 @@ devbox status [NAME]                      servers, processes, preview URLs
 devbox down NAME                          delete the server
 ```
 
-All commands accept `--json`. `exec` runs a single argument as a shell script (`devbox exec crm -- 'npm ci && npm test'`) and quotes several arguments as one command.
+All commands accept `--json`. `exec` runs a single argument as a shell script (`devbox exec myapp -- 'npm ci && npm test'`) and quotes several arguments as one command.
 
 ## How it works
 

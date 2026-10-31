@@ -1,6 +1,6 @@
 # Devbox POC Plan
 
-**Goal:** Prove the basic loop. From the Hermes host, create a temporary Hetzner server for a project, copy the code there, let the agent install and start it however that project needs, get a preview URL, keep editing locally, and delete the server when done.
+**Goal:** Prove the basic loop. From the machine the agent runs on, create a temporary Hetzner server for a project, copy the code there, let the agent install and start it however that project needs, get a preview URL, keep editing locally, and delete the server when done.
 
 The CLI does not know how any project is built. It only manages the server and runs commands on it. The agent works out how to start each project and keeps notes on it. A SQLite registry makes it possible to add snapshots, backups and idle shutdown later without a rewrite. Everything else from the [original requirements](https://gist.github.com/banjo/961e2c548c74d249119b0732e8ce28d5) is left for later (section 9).
 
@@ -8,7 +8,7 @@ The CLI does not know how any project is built. It only manages the server and r
 
 - **`devbox` CLI**: a Python 3.11+ package in this repo, standard library only (`argparse`, `sqlite3`, `subprocess`). Installed with `uv tool install -e .`. It calls `hcloud`, `ssh` and `rsync` as subprocesses.
 - **Registry**: SQLite at `~/.local/state/devbox/devbox.db`, holding projects, their notes, and their servers.
-- **Skill**: `skills/hetzner-devbox/SKILL.md`, symlinked to `~/.hermes/skills/hetzner-devbox/`. Describes how the agent works with the CLI and how it figures out how to run a project.
+- **Skill**: `skills/hetzner-devbox/SKILL.md`, linked into the agent's skills folder (for example `~/.hermes/skills/` or `~/.agents/skills/`). Describes how the agent works with the CLI and how it figures out how to run a project.
 - Nothing is added to the project repos.
 
 ## 2. Config
@@ -31,7 +31,7 @@ The schema version is kept in `PRAGMA user_version`. Migrations are numbered SQL
 -- migration 1
 CREATE TABLE projects (
   name        TEXT PRIMARY KEY,
-  path        TEXT NOT NULL,      -- local project folder on Hermes
+  path        TEXT NOT NULL,      -- local project folder
   notes       TEXT NOT NULL DEFAULT '',  -- free text, written by the agent
   created_at  TEXT NOT NULL,
   updated_at  TEXT NOT NULL
@@ -102,12 +102,12 @@ All commands accept `--json` for output the agent can parse.
 
 - **Server:** `hcloud server create` with name `devbox-<name>`, the labels, the devbox SSH key, the firewall and `cloud-init.yaml`. Cloud-init installs only general tools: Docker with the Compose plugin, `rsync`, `git`, `build-essential`, `mise` and `cloudflared`. Anything project-specific is up to the agent. Everything runs as root in `/srv/app`, which is fine for a throwaway POC box.
 - **One server at a time:** `up` refuses to create a server if another project already has one running, unless `--force` is given.
-- **Firewall:** one Hetzner firewall, `devbox`. It allows only SSH, and only from the Hermes host's IP, and is created on first use.
+- **Firewall:** one Hetzner firewall, `devbox`. It allows only SSH, and only from the controlling machine's IP, and is created on first use.
 - **SSH:** `-i ssh_key`, `StrictHostKeyChecking=accept-new`, and a `known_hosts` file per server that `down` removes.
 - **Sync:** `rsync -az --delete --exclude .git --filter=':- .gitignore'` from the project path to `/srv/app`. Ignored folders such as `node_modules` stay on the server.
 - **Background processes:** `systemd-run --unit devbox-<proc> --working-directory /srv/app bash -lc '<cmd>'`, so they survive SSH disconnects. `ps` lists `devbox-*` units, and `logs` reads `journalctl -u devbox-<proc>`.
 - **Preview:** a Cloudflare quick tunnel (`cloudflared tunnel --url http://localhost:<port>`) as the unit `devbox-tunnel`. It needs no Cloudflare account, and the server exposes no ports. The URL is a public, random `*.trycloudflare.com` address read from the unit log, saved in the registry, and new each time the tunnel restarts.
-- **Remote only:** `exec`, `ps`, `logs`, `expose` and `ssh` fail if the project has no running server. Nothing falls back to running on the Hermes host.
+- **Remote only:** `exec`, `ps`, `logs`, `expose` and `ssh` fail if the project has no running server. Nothing falls back to running locally.
 
 ## 6. Files
 
@@ -132,25 +132,25 @@ tests/test_cli.py        # project commands, exec argument handling, no local fa
 
 The skill tells the agent:
 
-1. **Edit locally.** Reading code, editing, Git and small checks happen on the Hermes host. Do not start a server for that.
-2. **Run remotely.** Installs, builds, Compose, dev servers and tests go through `devbox exec`, never directly on the Hermes host.
+1. **Edit locally.** Reading code, editing, Git and small checks happen locally. Do not start a server for that.
+2. **Run remotely.** Installs, builds, Compose, dev servers and tests go through `devbox exec`, never locally.
 3. **Ask before `devbox up` creates a server.** It costs money. Once a server is running, the agent can use it freely.
 4. **Starting a project:**
    1. `devbox project notes NAME`. If there are notes, follow them.
    2. If there are none, read the project (README, `package.json`, `compose.yaml`, `Makefile`, `.env.example`, `.tool-versions`/`.nvmrc` and so on) and work out what it needs.
    3. Install the runtime and dependencies with `devbox exec`, start services and dev servers with `devbox exec --detach`, check `devbox logs`, then `devbox expose` the right port.
-   4. Ask Anton if it is still unclear how the project is run, or which secrets or env values it needs.
+   4. Ask the user if it is still unclear how the project is run, or which secrets or env values it needs.
    5. Once it works, save or update the notes with `devbox project notes NAME --set ...`. Keep them short: steps, commands, ports, env values, gotchas.
-5. **Development loop:** edit locally, then run `devbox sync`. For new dependencies or a restart, use `devbox exec` or restart the process with `exec --detach`. Use `devbox logs` to debug. Always give Anton the preview URL.
-6. **When done** ("vi är klara", "stäng ner"): remind Anton that the server's data is lost, then run `devbox down`. Commit and push only if he asks.
-7. **Remind about forgotten servers.** If `devbox status` shows a server that has been up for a long time, tell Anton it still costs money.
+5. **Development loop:** edit locally, then run `devbox sync`. For new dependencies or a restart, use `devbox exec` or restart the process with `exec --detach`. Use `devbox logs` to debug. Always give the user the preview URL.
+6. **When done** ("we're done", "shut it down"): remind the user that the server's data is lost, then run `devbox down`. Commit and push only if they ask.
+7. **Remind about forgotten servers.** If `devbox status` shows a server that has been up for a long time, tell the user it still costs money.
 
-| Anton says | Agent does |
+| The user says | Agent does |
 |---|---|
-| "Starta CRM så jag kan testa" | Asks first if no server is running, `devbox up crm`, follows the notes (or works it out), `expose`, gives the URL |
-| "Ändra layouten på dashboarden" | Edits locally, then `devbox sync crm` if a server is running |
-| "Kör testerna" | `devbox exec crm -- npm test` |
-| "Vi är klara för idag" | `devbox down crm` |
+| "Start the app so I can test it" | Asks first if no server is running, `devbox up myapp`, follows the notes (or works it out), `expose`, gives the URL |
+| "Change the dashboard layout" | Edits locally, then `devbox sync myapp` if a server is running |
+| "Run the tests" | `devbox exec myapp -- npm test` |
+| "We're done for today" | `devbox down myapp` |
 
 ## 8. Steps
 
@@ -159,7 +159,7 @@ The skill tells the agent:
 3. `cloud-init.yaml`, `up`, `sync`, `exec` (plain and `--detach`), `ps`, `stop`, `logs`, `ssh`, `down`.
 4. `expose` and the preview URL in `status`.
 5. `SKILL.md` and a short README covering setup and commands.
-6. Live test, approved by Anton first: let the agent take one real project with no notes from `up` to a working preview URL, check that it saved notes, edit and `sync` to see the change, `down`, then `up` again and confirm it starts the project from the notes alone. Finally check the server is gone in Hetzner and `deleted` in the registry.
+6. Live test, approved by the user first: let the agent take one real project with no notes from `up` to a working preview URL, check that it saved notes, edit and `sync` to see the change, `down`, then `up` again and confirm it starts the project from the notes alone. Finally check the server is gone in Hetzner and `deleted` in the registry.
 
 ## 9. Later, if the POC works
 
@@ -167,5 +167,5 @@ The skill tells the agent:
 - Database backups to S3
 - Fixed preview hostname with a named Cloudflare tunnel (and optionally Access)
 - Automatic shutdown of idle servers and cost estimates
-- Pulling changes made on the server back to Hermes
+- Pulling changes made on the server back to the local copy
 - Running as a non-root user and pinned host keys
