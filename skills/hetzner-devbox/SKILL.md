@@ -104,7 +104,9 @@ Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/a
 ### Idle shutdown
 
 - Servers without devbox activity for the idle timeout (default 8h) are paused automatically by `devbox idle-check`, if the user has scheduled it. `devbox status` shows how long is left.
-- Viewing the preview in a browser does not count as activity. While the user is testing by hand for a long time, run `devbox touch NAME` now and then.
+- Commands you run against the server (`exec`, `sync`, `ps`, `logs`, `ssh`, ...) count as activity; `status` does not. Viewing the preview in a browser does not count either. While the user is testing by hand for a long time, run `devbox touch NAME` now and then.
+- Running foreground `exec` commands are never interrupted. For long builds or test runs in the background, start them with `devbox exec NAME --detach --keep-alive --name build -- '...'` so idle shutdown waits for them. Don't use `--keep-alive` for dev servers; they would keep the server alive forever.
+- If `status` says the server is powered off (for example after a pause that couldn't delete it), tell the user it is still billed and either finish with `devbox pause NAME` or start it again with `devbox up NAME`.
 - For projects that need longer: `devbox project set NAME --idle-timeout 1d` (or `off`).
 
 ### Costs

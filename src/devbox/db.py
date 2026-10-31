@@ -78,6 +78,9 @@ MIGRATIONS = [
       PRIMARY KEY (project, name)
     );
     """,
+    """
+    ALTER TABLE servers ADD COLUMN power TEXT;
+    """,
 ]
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
@@ -219,14 +222,15 @@ def insert_server(
     price_hourly: float | None = None,
     price_monthly: float | None = None,
     snapshot_id: int | None = None,
+    power: str | None = None,
 ) -> int:
     cur = conn.execute(
         """INSERT INTO servers
            (project, hetzner_id, ip, server_type, location, status, created_at,
-            price_hourly, price_monthly, snapshot_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            price_hourly, price_monthly, snapshot_id, power)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (project, hetzner_id, ip, server_type, location, status, created_at or now(),
-         price_hourly, price_monthly, snapshot_id),
+         price_hourly, price_monthly, snapshot_id, power),
     )
     return cur.lastrowid
 
@@ -379,7 +383,7 @@ def event_counts(conn: sqlite3.Connection, server_id: int) -> dict[str, int]:
 
 _SERVER_FIELDS = {
     "ip", "server_type", "location", "status", "preview_port", "preview_url",
-    "price_hourly", "price_monthly",
+    "price_hourly", "price_monthly", "power",
 }
 
 
@@ -411,8 +415,13 @@ def reconcile(conn: sqlite3.Connection, hetzner_servers: list[dict]) -> list[dic
         live = by_id.get(row["hetzner_id"])
         if live is None:
             mark_deleted(conn, row["id"])
-        elif live["ip"] != row["ip"]:
-            update_server(conn, row["id"], ip=live["ip"])
+            continue
+        changes = {}
+        if live["ip"] != row["ip"]:
+            changes["ip"] = live["ip"]
+        if live.get("status") and live["status"] != row["power"]:
+            changes["power"] = live["status"]
+        update_server(conn, row["id"], **changes)
 
     known_ids = {row["hetzner_id"] for row in active_servers(conn)}
     orphans = []
@@ -430,6 +439,7 @@ def reconcile(conn: sqlite3.Connection, hetzner_servers: list[dict]) -> list[dic
                 server_type=s["server_type"],
                 location=s["location"],
                 created_at=s.get("created"),
+                power=s.get("status"),
             )
         else:
             orphans.append(s)

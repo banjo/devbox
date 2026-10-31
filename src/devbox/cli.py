@@ -18,6 +18,8 @@ from devbox.remote import PULL_PRUNE, TUNNEL, Remote, git_files, git_ignored, to
 
 
 EXIT_TIMEOUT = 124
+# Hetzner server statuses in which nothing runs on the server.
+POWERED_DOWN = ("off", "stopping")
 
 
 class Context:
@@ -66,6 +68,11 @@ class Context:
             raise DevboxError(f"project '{project}' has no server; start one with `devbox up {project}`")
         if server["status"] != "running":
             raise DevboxError(f"server for '{project}' is still being set up; run `devbox up {project}` again")
+        if server["power"] in POWERED_DOWN:
+            raise DevboxError(
+                f"the server for '{project}' is powered off (and still billed); "
+                f"`devbox up {project}` powers it on, `devbox pause {project}` or `devbox down {project}` removes it"
+            )
         return server
 
     def reconcile(self) -> list[dict]:
@@ -88,27 +95,30 @@ class Context:
         return items
 
     def fill_missing_prices(self) -> None:
-        """Servers adopted by reconcile (or created before prices were stored) get today's price."""
+        """Servers and snapshots adopted by reconcile (or saved without a price) get today's price.
+
+        Servers and snapshots are handled independently, so a snapshot is
+        priced even when no server needs a price.
+        """
         missing = [s for s in db.servers_missing_price(self.conn) if s["status"] != "deleted"]
-        if not missing:
-            return
-        try:
-            offers = self.hcloud.offers()
-        except DevboxError:
-            return
-        prices = {(o["type"], o["location"]): o for o in offers}
-        for s in missing:
-            o = prices.get((s["server_type"], s["location"]))
-            if o:
-                db.update_server(
-                    self.conn, s["id"], price_hourly=o["price_hourly"], price_monthly=o["price_monthly"]
-                )
-        for snap in db.snapshots(self.conn):
-            if snap["price_per_gb_month"] is None:
-                price = self.snapshot_price()
-                if price is None:
-                    break
-                db.update_snapshot(self.conn, snap["id"], price_per_gb_month=price)
+        if missing:
+            try:
+                offers = self.hcloud.offers()
+            except DevboxError:
+                offers = []
+            prices = {(o["type"], o["location"]): o for o in offers}
+            for s in missing:
+                o = prices.get((s["server_type"], s["location"]))
+                if o:
+                    db.update_server(
+                        self.conn, s["id"], price_hourly=o["price_hourly"], price_monthly=o["price_monthly"]
+                    )
+        unpriced = [snap for snap in db.snapshots(self.conn) if snap["price_per_gb_month"] is None]
+        if unpriced:
+            price = self.snapshot_price()
+            if price is not None:
+                for snap in unpriced:
+                    db.update_snapshot(self.conn, snap["id"], price_per_gb_month=price)
 
     def event(self, server, kind: str) -> None:
         db.add_event(self.conn, server["project"], server["id"], kind)
@@ -141,6 +151,12 @@ def uptime(created_at: str | None) -> str | None:
         return None
     started = costs.parse_ts(created_at)
     return costs.duration((datetime.now(timezone.utc) - started).total_seconds())
+
+
+def server_state(server) -> str:
+    if server["power"] in POWERED_DOWN:
+        return "powered off"
+    return server["status"]
 
 
 def cost_line(usage: dict, server) -> str:
@@ -359,8 +375,13 @@ def budget_status(ctx: Context) -> dict | None:
     budget = ctx.cfg.monthly_budget
     if budget is None:
         return None
-    spent = month_spend(ctx)["total"]
-    return {"budget": budget, "spent": spent, "left": round(budget - spent, 4), "action": ctx.cfg.budget_action}
+    month = month_spend(ctx)
+    spent = month["total"]
+    return {
+        "budget": budget, "spent": spent, "left": round(budget - spent, 4), "action": ctx.cfg.budget_action,
+        # Servers or snapshots this month whose price is unknown are not in `spent`.
+        "unpriced": month["unknown_price"],
+    }
 
 
 def check_budget(ctx: Context) -> list[str]:
@@ -369,14 +390,20 @@ def check_budget(ctx: Context) -> list[str]:
     if status is None:
         return []
     spent, budget = status["spent"], status["budget"]
+    warnings = []
+    if status["unpriced"]:
+        warnings.append(
+            f"{status['unpriced']} server(s)/snapshot(s) this month have no known price, so the budget check "
+            f"is incomplete (spent so far is at least {costs.money(spent)})"
+        )
     if spent >= budget:
         msg = f"this month's spending ({costs.money(spent)}) has reached the budget of {costs.money(budget)}"
         if status["action"] == "block" and not ctx.args.over_budget:
             raise DevboxError(f"{msg}; pass --over-budget to create a server anyway")
-        return [msg]
+        return warnings + [msg]
     if spent >= 0.8 * budget:
-        return [f"{costs.money(spent)} of the {costs.money(budget)} monthly budget is used"]
-    return []
+        warnings.append(f"{costs.money(spent)} of the {costs.money(budget)} monthly budget is used")
+    return warnings
 
 
 # Server lifecycle
@@ -427,7 +454,7 @@ def cmd_up(ctx: Context) -> int:
                 # A clean server has none of the previously synced files.
                 ctx.manifest(name).unlink(missing_ok=True)
             db.insert_server(
-                ctx.conn, name, info["id"], "creating",
+                ctx.conn, name, info["id"], "creating", power=info.get("status"),
                 ip=info["ip"], server_type=info["server_type"] or offer["type"],
                 location=info["location"] or offer["location"], created_at=info.get("created"),
                 price_hourly=offer["price_hourly"], price_monthly=offer["price_monthly"],
@@ -437,11 +464,17 @@ def cmd_up(ctx: Context) -> int:
             created = True
             ctx.event(server, "restore" if snapshot else "create")
 
+        if server["power"] in POWERED_DOWN:
+            print(f"powering on the server for {name}...", file=sys.stderr)
+            ctx.hcloud.poweron(server["hetzner_id"])
+            powered_on = True
+        else:
+            powered_on = False
         remote = ctx.remote(server)
         if server["status"] != "running":
             print(f"waiting for {server['ip']} to finish setup...", file=sys.stderr)
         warnings += remote.wait_ready()
-        db.update_server(ctx.conn, server["id"], status="running")
+        db.update_server(ctx.conn, server["id"], status="running", power="running")
 
         print("syncing code...", file=sys.stderr)
         sync = remote.sync(project["path"], ctx.manifest(name))
@@ -462,7 +495,7 @@ def cmd_up(ctx: Context) -> int:
         "offer": offer,
         "warnings": warnings,
     }
-    verb = "reusing"
+    verb = "powered on" if powered_on else "reusing"
     if created:
         verb = "restored" if snapshot else "created"
     text = [
@@ -511,6 +544,7 @@ ACTIVITY_LABELS = [
     ("sync", "sync"), ("exec", "exec"), ("exec_detach", "background start"),
     ("expose", "expose"), ("up", "up"), ("touch", "touch"), ("pull", "pull"),
     ("forward", "port forward"), ("db_dump", "database dump"), ("db_restore", "database restore"),
+    ("ps", "ps"), ("logs", "logs"), ("stop", "stop"), ("ssh", "ssh"),
 ]
 
 
@@ -556,34 +590,61 @@ def prune_snapshots(ctx: Context, project: str) -> list[int]:
     return deleted
 
 
+def snapshot_server(ctx: Context, server):
+    """Shut the server down and snapshot it. On failure, try to power it back on."""
+    name = server["project"]
+    print(f"shutting down {name} for a snapshot...", file=sys.stderr)
+    ctx.hcloud.shutdown(server["hetzner_id"])
+    db.update_server(ctx.conn, server["id"], power="off")
+    print("creating snapshot (this can take a few minutes)...", file=sys.stderr)
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    try:
+        info = ctx.hcloud.create_snapshot(server["hetzner_id"], name, f"devbox {name} {stamp}")
+    except DevboxError as e:
+        try:
+            ctx.hcloud.poweron(server["hetzner_id"])
+            db.update_server(ctx.conn, server["id"], power="running")
+            kept = "the server was kept and powered on again"
+        except DevboxError:
+            kept = (
+                f"the server was kept but is powered off (still billed); "
+                f"`devbox up {name}` powers it on"
+            )
+        raise DevboxError(f"snapshot failed, {kept}: {e}")
+    snap_id = db.insert_snapshot(
+        ctx.conn, name, info["id"], server_id=server["id"],
+        server_type=server["server_type"], location=server["location"],
+        architecture=info["architecture"], size_gb=info["size_gb"], disk_gb=info["disk_gb"],
+        price_per_gb_month=ctx.snapshot_price(), created_at=info.get("created"),
+    )
+    return db.get_snapshot(ctx.conn, snap_id)
+
+
 def take_down(ctx: Context, server, snapshot: bool, event: str) -> dict:
     """Delete a project's server, optionally snapshotting it first. Caller holds the lock."""
     name = server["project"]
     snap = None
     pruned: list[int] = []
     if snapshot:
-        print(f"shutting down {name} for a snapshot...", file=sys.stderr)
-        ctx.hcloud.shutdown(server["hetzner_id"])
-        print("creating snapshot (this can take a few minutes)...", file=sys.stderr)
-        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-        try:
-            info = ctx.hcloud.create_snapshot(server["hetzner_id"], name, f"devbox {name} {stamp}")
-        except DevboxError as e:
-            try:
-                ctx.hcloud.poweron(server["hetzner_id"])
-                kept = "the server was kept and powered on again"
-            except DevboxError:
-                kept = "the server was kept but is powered off; start it in the Hetzner console"
-            raise DevboxError(f"snapshot failed, {kept}: {e}")
-        snap_id = db.insert_snapshot(
-            ctx.conn, name, info["id"], server_id=server["id"],
-            server_type=server["server_type"], location=server["location"],
-            architecture=info["architecture"], size_gb=info["size_gb"], disk_gb=info["disk_gb"],
-            price_per_gb_month=ctx.snapshot_price(), created_at=info.get("created"),
-        )
-        snap = db.get_snapshot(ctx.conn, snap_id)
+        latest = db.latest_snapshot(ctx.conn, name)
+        if server["power"] in POWERED_DOWN and latest and latest["server_id"] == server["id"]:
+            # An earlier pause saved this snapshot but failed to delete the
+            # (already shut down) server; finish that instead of a second snapshot.
+            print(f"reusing snapshot {latest['hetzner_image_id']} from the earlier pause...", file=sys.stderr)
+            snap = latest
+        else:
+            snap = snapshot_server(ctx, server)
 
-    ctx.hcloud.delete_server(server["hetzner_id"])
+    try:
+        ctx.hcloud.delete_server(server["hetzner_id"])
+    except DevboxError as e:
+        if snap is None:
+            raise
+        raise DevboxError(
+            f"snapshot {snap['hetzner_image_id']} is saved, but deleting server {server['hetzner_id']} failed: {e}. "
+            f"The server is shut down and still billed. Run `devbox pause {name}` again to finish "
+            f"(it reuses this snapshot), or `devbox up {name}` to power the server back on."
+        )
     ctx.event(server, event)
     db.mark_deleted(ctx.conn, server["id"])
     ctx.known_hosts(server).unlink(missing_ok=True)
@@ -660,6 +721,25 @@ def cmd_idle_check(ctx: Context) -> int:
             if remaining is None or remaining > 0:
                 results.append(entry)
                 continue
+            # Never interrupt work in progress: foreground `exec` commands and
+            # keep-alive background jobs. If that can't be checked, do nothing.
+            if server["power"] != "off":
+                try:
+                    busy = ctx.remote(server).running_work()
+                except DevboxError as e:
+                    entry["skipped"] = f"could not check for running work: {e}"
+                    results.append(entry)
+                    continue
+                if busy:
+                    entry["busy"] = busy
+                    results.append(entry)
+                    continue
+            # Recheck activity right before acting; a command may have just started.
+            latest = idle_info(ctx, db.get_server(ctx.conn, server["id"]), datetime.now(timezone.utc))
+            if latest["remaining_seconds"] is not None and latest["remaining_seconds"] > 0:
+                entry.update(latest)
+                results.append(entry)
+                continue
             entry["action"] = action
             if ctx.args.dry_run:
                 entry["dry_run"] = True
@@ -674,7 +754,13 @@ def cmd_idle_check(ctx: Context) -> int:
     lines = []
     for e in results:
         idle = costs.duration(e["idle_seconds"])
-        if e["action"] is None:
+        if e.get("busy"):
+            kinds = ", ".join(sorted({b["kind"] for b in e["busy"]}))
+            lines.append(f"{e['project']}: idle {idle} (limit {e['idle_timeout']}), but {len(e['busy'])} "
+                         f"{kinds}(s) still running; left alone")
+        elif e.get("skipped"):
+            lines.append(f"{e['project']}: idle {idle} (limit {e['idle_timeout']}), {e['skipped']}; left alone")
+        elif e["action"] is None:
             if e["remaining_seconds"] is None:
                 lines.append(f"{e['project']}: idle {idle}, idle shutdown off")
             else:
@@ -726,7 +812,7 @@ def cmd_status(ctx: Context) -> int:
             entry["uptime"] = uptime(server["created_at"])
             entry["usage"] = costs.server_usage(server)
             entry["idle"] = idle_info(ctx, server, now)
-            if server["status"] == "running":
+            if server["status"] == "running" and server["power"] not in POWERED_DOWN:
                 try:
                     entry["processes"] = ctx.remote(server).list_units()
                 except DevboxError as e:
@@ -751,9 +837,12 @@ def cmd_status(ctx: Context) -> int:
                 lines.append(f"{e['project']}: no server")
             continue
         lines.append(
-            f"{e['project']}: {s['status']} {s['server_type']} {s['location']} {s['ip']} "
+            f"{e['project']}: {server_state(s)} {s['server_type']} {s['location']} {s['ip']} "
             f"(id {s['hetzner_id']}, up {e['uptime']})"
         )
+        if s["power"] in POWERED_DOWN:
+            lines.append(f"  powered off but still billed: `devbox up {e['project']}` starts it, "
+                         f"`devbox pause {e['project']}` removes it")
         lines.append(f"  cost: {cost_line(e['usage'], s)}")
         idle = e["idle"]
         if idle["remaining_seconds"] is None:
@@ -781,6 +870,8 @@ def cmd_status(ctx: Context) -> int:
     month_line = f"this month{scope}: {costs.money(month['total'])}"
     if budget and not ctx.args.name:
         month_line += f" of {costs.money(budget['budget'])} budget ({costs.money(budget['left'])} left)"
+    if month["unknown_price"]:
+        month_line += f", plus {month['unknown_price']} item(s) with unknown price"
     lines.append(month_line + " (see `devbox costs`)")
     emit(
         ctx.args,
@@ -1099,6 +1190,7 @@ def cmd_secrets_set(ctx: Context) -> int:
     server = db.active_server(ctx.conn, name)
     if server and server["status"] == "running" and not ctx.args.no_push:
         pushed = push_secrets(ctx, server, name)
+        ctx.event(server, "secrets")
     text = f"stored {len(values)} key(s) for {file}: {', '.join(sorted(values))}"
     if pushed is not None:
         text += "; written to the server"
@@ -1131,6 +1223,7 @@ def cmd_secrets_unset(ctx: Context) -> int:
 def cmd_secrets_push(ctx: Context) -> int:
     server = ctx.running_server(ctx.args.name)
     written = push_secrets(ctx, server, ctx.args.name)
+    ctx.event(server, "secrets")
     lines = [f"{path}: {n} key(s) written" for path, n in written.items()]
     emit(ctx.args, {"project": ctx.args.name, "written": written}, "\n".join(lines) or "no secrets stored")
     return 0
@@ -1282,6 +1375,8 @@ def cmd_exec(ctx: Context) -> int:
     script = to_script(ctx.args.cmd)
     remote = ctx.remote(server)
 
+    if ctx.args.keep_alive and not ctx.args.detach:
+        raise DevboxError("--keep-alive only applies to --detach (foreground commands always count as running work)")
     if ctx.args.detach:
         if not ctx.args.proc:
             raise DevboxError("--detach needs --name PROC")
@@ -1290,7 +1385,7 @@ def cmd_exec(ctx: Context) -> int:
         validate_proc(ctx.args.proc)
         if ctx.args.proc == TUNNEL:
             raise DevboxError(f"'{TUNNEL}' is reserved for the preview tunnel; use `devbox expose`")
-        remote.start_unit(ctx.args.proc, script)
+        remote.start_unit(ctx.args.proc, script, keep_alive=ctx.args.keep_alive)
         ctx.event(server, "exec_detach")
         emit(
             ctx.args,
@@ -1320,7 +1415,10 @@ def cmd_exec(ctx: Context) -> int:
 def cmd_ps(ctx: Context) -> int:
     server = ctx.running_server(ctx.args.name)
     units = ctx.remote(server).list_units()
-    lines = [f"{u['name']:<20} {u['active']:<10} {u['sub']}" for u in units]
+    ctx.event(server, "ps")
+    lines = [
+        f"{u['name']:<20} {u['active']:<10} {u['sub']}{'  (keep-alive)' if u['keep_alive'] else ''}" for u in units
+    ]
     emit(ctx.args, units, "\n".join(lines) or "no background processes")
     return 0
 
@@ -1329,6 +1427,7 @@ def cmd_stop(ctx: Context) -> int:
     server = ctx.running_server(ctx.args.name)
     validate_proc(ctx.args.proc)
     stopped = ctx.remote(server).stop_unit(ctx.args.proc)
+    ctx.event(server, "stop")
     if ctx.args.proc == TUNNEL and stopped:
         db.update_server(ctx.conn, server["id"], preview_port=None, preview_url=None)
     emit(
@@ -1342,6 +1441,7 @@ def cmd_stop(ctx: Context) -> int:
 def cmd_logs(ctx: Context) -> int:
     server = ctx.running_server(ctx.args.name)
     validate_proc(ctx.args.proc)
+    ctx.event(server, "logs")
     return ctx.remote(server).logs(ctx.args.proc, ctx.args.lines, ctx.args.follow)
 
 
@@ -1360,6 +1460,7 @@ def cmd_expose(ctx: Context) -> int:
 def cmd_ssh(ctx: Context) -> int:
     server = ctx.running_server(ctx.args.name)
     remote = ctx.remote(server)
+    ctx.event(server, "ssh")
     cmd = remote.ssh_cmd(tty=True)
     os.execvp(cmd[0], cmd)
 
@@ -1546,6 +1647,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name")
     p.add_argument("--detach", action="store_true", help="run in the background as a named process")
     p.add_argument("--name", dest="proc", metavar="PROC", help="process name for --detach")
+    p.add_argument(
+        "--keep-alive", action="store_true",
+        help="with --detach: idle shutdown waits while this process runs (for long builds, not dev servers)",
+    )
     p.add_argument(
         "--timeout", type=float, metavar="SECONDS",
         help="stop the command on the server after this many seconds (foreground only; exit code 124)",

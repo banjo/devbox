@@ -15,6 +15,7 @@ APP_DIR = "/srv/app"
 UNIT_PREFIX = "devbox-"
 EXEC_UNIT_PREFIX = "devbox-exec-"
 EXEC_KILL_AFTER = 10
+KEEP_ALIVE_DESCRIPTION = "devbox-keepalive"
 # Exit codes of a command killed by a signal: ssh reports 255, a shell 128+N.
 SIGNAL_EXITS = (255, 128 + 15, 128 + 9, -15, -9)
 TUNNEL = "tunnel"
@@ -164,27 +165,25 @@ class Remote:
     def exec(self, script: str, timeout: float | None = None, capture: bool = False) -> ExecResult:
         """Run a foreground command in the app folder.
 
-        With a timeout, the command runs in its own systemd scope with
-        RuntimeMaxSec, so the server itself stops it (SIGTERM to every process
-        in the scope, SIGKILL after 10s) even if the SSH connection is lost.
-        Whether the deadline was hit is read back from the scope's result.
+        The command always runs in its own systemd scope (`devbox-exec-*`), so
+        `idle-check` can see that work is in progress. With a timeout the scope
+        gets RuntimeMaxSec, so the server itself stops it (SIGTERM to every
+        process in the scope, SIGKILL after 10s) even if the SSH connection is
+        lost. Whether the deadline was hit is read back from the scope's result.
         """
-        if timeout is None:
-            proc = self.run(script, capture=capture, check=False, timeout=None)
-            return ExecResult(proc.returncode, proc.stdout, proc.stderr, timed_out=False)
-
-        secs = max(1, math.ceil(timeout))
+        secs = max(1, math.ceil(timeout)) if timeout is not None else None
         unit = f"{EXEC_UNIT_PREFIX}{secrets.token_hex(4)}"
         # No --collect: a scope stopped by RuntimeMaxSec stays loaded as failed
         # with Result=timeout until reset-failed, so it can be checked below.
+        limits = f"-p RuntimeMaxSec={secs}s -p TimeoutStopSec={EXEC_KILL_AFTER}s " if secs else ""
         remote = (
-            f"cd {APP_DIR} && systemd-run --scope --quiet --unit {unit} "
-            f"-p RuntimeMaxSec={secs}s -p TimeoutStopSec={EXEC_KILL_AFTER}s "
+            f"cd {APP_DIR} && systemd-run --scope --quiet --unit {unit} {limits}"
             f"--setenv=HOME=/root bash -lc {shlex.quote(script)}"
         )
         try:
             proc = self._ssh(
-                remote, capture=capture, check=False, timeout=secs + EXEC_KILL_AFTER + 30,
+                remote, capture=capture, check=False,
+                timeout=secs + EXEC_KILL_AFTER + 30 if secs else None,
                 raise_on_255=False,
             )
         except DevboxError as e:
@@ -205,9 +204,9 @@ class Remote:
             if result is None:
                 raise DevboxError(f"ssh to {self.ip} failed{': ' + detail if detail else ''}")
             if not self.scope_gone(unit):
+                after = "will be stopped at the deadline" if secs else f"keeps running until it ends (stop it with `systemctl stop {unit}.scope` on the server)"
                 raise DevboxError(
-                    f"lost the connection; the command is still running on the server "
-                    f"and will be stopped at the deadline (scope {unit})"
+                    f"lost the connection; the command is still running on the server and {after} (scope {unit})"
                 )
             self._ssh(f"systemctl reset-failed {unit}.scope 2>/dev/null; true", check=False, timeout=30)
             raise DevboxError(f"the command was killed on the server (systemd result: {result})")
@@ -390,14 +389,26 @@ class Remote:
 
     # Background processes (systemd units on the server)
 
-    def start_unit(self, name: str, script: str) -> None:
+    def start_unit(self, name: str, script: str, keep_alive: bool = False) -> None:
+        """Start a background process. Keep-alive processes block idle shutdown while running."""
         unit = UNIT_PREFIX + name
+        description = f"{KEEP_ALIVE_DESCRIPTION} {name}" if keep_alive else f"devbox {name}"
         self.run(
             f"systemctl stop {unit} 2>/dev/null; systemctl reset-failed {unit} 2>/dev/null; "
-            f"systemd-run --quiet --unit {unit} --working-directory={APP_DIR} --setenv=HOME=/root "
+            f"systemd-run --quiet --unit {unit} --description {shlex.quote(description)} "
+            f"--working-directory={APP_DIR} --setenv=HOME=/root "
             f"bash -lc {shlex.quote(script)}",
             cwd=None,
         )
+
+    def running_work(self) -> list[dict]:
+        """Foreground commands and keep-alive background jobs currently running on the server."""
+        proc = self.run(
+            f"systemctl list-units '{UNIT_PREFIX}*' --state=active --no-legend --plain --no-pager",
+            cwd=None,
+            timeout=30,
+        )
+        return busy_units(proc.stdout)
 
     def stop_unit(self, name: str) -> bool:
         unit = UNIT_PREFIX + name
@@ -446,12 +457,33 @@ class Remote:
 
 
 def parse_units(output: str) -> list[dict]:
+    """Background processes (services) from `systemctl list-units` output."""
     units = []
     for line in output.splitlines():
         parts = line.split(None, 4)
         if len(parts) < 4 or not parts[0].startswith(UNIT_PREFIX) or not parts[0].endswith(".service"):
             continue
         unit, _load, active, sub = parts[:4]
+        description = parts[4] if len(parts) > 4 else ""
         name = unit.removeprefix(UNIT_PREFIX).removesuffix(".service")
-        units.append({"name": name, "active": active, "sub": sub})
+        units.append({
+            "name": name, "active": active, "sub": sub,
+            "keep_alive": description.startswith(KEEP_ALIVE_DESCRIPTION),
+        })
     return units
+
+
+def busy_units(output: str) -> list[dict]:
+    """Active work that must not be interrupted: exec scopes and keep-alive jobs."""
+    busy = []
+    for line in output.splitlines():
+        parts = line.split(None, 4)
+        if len(parts) < 4 or parts[2] != "active":
+            continue
+        unit = parts[0]
+        description = parts[4] if len(parts) > 4 else ""
+        if unit.startswith(EXEC_UNIT_PREFIX) and unit.endswith(".scope"):
+            busy.append({"unit": unit, "kind": "command"})
+        elif unit.endswith(".service") and description.startswith(KEEP_ALIVE_DESCRIPTION):
+            busy.append({"unit": unit, "kind": "keep-alive job"})
+    return busy

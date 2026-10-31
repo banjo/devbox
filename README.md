@@ -76,7 +76,8 @@ devbox db dump NAME [DB] [-o FILE]        dump a database from the server to a l
 devbox db restore NAME [DB] [--file F] --yes
                                           replace a database on the server with a dump
 devbox exec NAME [--timeout S] -- CMD...  run a command in /srv/app and wait
-devbox exec NAME --detach --name P -- CMD start a background process P
+devbox exec NAME --detach --name P [--keep-alive] -- CMD
+                                          start a background process P (--keep-alive: idle shutdown waits for it)
 devbox ps NAME                            list background processes
 devbox logs NAME P [-f] [-n LINES]        output from process P
 devbox stop NAME P                        stop process P
@@ -128,7 +129,8 @@ All commands accept `--json`. `exec` runs a single argument as a shell script (`
 
 ### Snapshots, pause and resume
 
-- `pause` (or `down --snapshot`) shuts the server down cleanly, saves its disk as a Hetzner snapshot, then deletes the server. If the snapshot fails, the server is kept and powered on again.
+- `pause` (or `down --snapshot`) shuts the server down cleanly, saves its disk as a Hetzner snapshot, then deletes the server. If the snapshot fails, the server is kept and powered on again. If the snapshot succeeds but deleting the server fails, the server stays shut down (and billed), `status` shows it as powered off, and running `pause` again finishes the job with the same snapshot; `up` powers it back on instead.
+- devbox records each server's power state from Hetzner. Commands that need a running server refuse with a clear message when it is powered off.
 - The next `up` creates the server from the latest snapshot, so installed runtimes, `node_modules`, Docker images and database data are already there. Background processes and the preview are not running after a restore; start them again. `up --fresh` ignores snapshots; `resume` refuses to start without one.
 - The restored server must have the snapshot's architecture and at least its disk size; `up` checks this.
 - `keep_snapshots` (default 1) snapshots are kept per project. Older ones are deleted after a new snapshot is available, never before.
@@ -136,7 +138,9 @@ All commands accept `--json`. `exec` runs a single argument as a shell script (`
 
 ### Idle shutdown
 
-- `devbox idle-check` pauses (`idle_action = "pause"`, default) or deletes (`"down"`) servers whose last devbox activity is older than the idle timeout (`idle_timeout = "8h"` by default, or per project with `project set --idle-timeout`). Activity is any devbox command for that server (`up`, `sync`, `exec`, `expose`, `touch`, ...). Browsing the preview does not count; use `devbox touch NAME` while testing manually.
+- `devbox idle-check` pauses (`idle_action = "pause"`, default) or deletes (`"down"`) servers whose last activity is older than the idle timeout (`idle_timeout = "8h"` by default, or per project with `project set --idle-timeout`).
+- Activity is recorded by the commands a person or agent runs against a server: `up`, `sync` (and every `sync --watch` round), `exec`, `ps`, `logs`, `stop`, `ssh`, `expose`, `pull`, `forward`, `secrets set/push`, `db dump/restore` and `touch`. Read-only overviews (`status`, `history`, `costs`, `snapshot list`, `doctor`) do not count, so an automated loop polling `status` can't keep a server alive forever. Browsing the preview doesn't count either; use `devbox touch NAME` while testing by hand.
+- Running work is never interrupted. Before acting, `idle-check` asks the server whether a foreground `exec` is still running (every `exec` runs in its own `devbox-exec-*` scope) or a background job started with `exec --detach --keep-alive` is active, and leaves the server alone if so, or if it can't check. Ordinary background processes such as dev servers don't keep a server alive; use `--keep-alive` for long builds or test runs.
 - It only runs when scheduled. Either a cron entry:
 
   ```cron

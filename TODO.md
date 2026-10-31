@@ -27,6 +27,8 @@ Nothing below has run against Hetzner yet. Check each step and fix what breaks.
 - [ ] `forward NAME 5432` with a local `psql`
 - [ ] `secrets set` before and after `up`: values land in the right env files, other lines kept, mode 600
 - [ ] `db dump/restore` with Postgres in Compose and with SQLite; `down --dump`; restore into a fresh server
+- [ ] Idle shutdown with a long foreground `exec` and a `--detach --keep-alive` job: server left alone until both finish (#14)
+- [ ] Pause where deleting the server fails (e.g. delete protection): status shows powered off, a second `pause` reuses the snapshot, `up` powers it on (#16)
 - [ ] Full agent run with the skill: a project with no notes goes from `up` to a working preview, the agent saves notes, then `down` and `up` again work from the notes alone
 
 ## Next
@@ -45,7 +47,7 @@ Nothing below has run against Hetzner yet. Check each step and fix what breaks.
 - Previews are public: anyone with the URL can open them.
 - The preview URL changes every time the tunnel restarts.
 - `down` without `--snapshot` loses everything that exists only on the server (database contents, files not synced back). `pause` keeps it in a snapshot.
-- Idle shutdown only sees devbox commands, not people using the preview, and only runs when `idle-check` is scheduled.
+- Idle shutdown only sees devbox commands and running `exec`/keep-alive work, not people using the preview, and only runs when `idle-check` is scheduled.
 - A restored server keeps the snapshot's disk size, so it can't move to a smaller server type.
 - Availability from Hetzner is an indicator, not a guarantee; `up` can still fail if a type sells out between listing and creating.
 - One server at a time unless `up --force`.

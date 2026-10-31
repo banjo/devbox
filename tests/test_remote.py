@@ -189,3 +189,32 @@ def test_exec_normal_exit_codes_pass_through(monkeypatch):
     result = remote_with(monkeypatch, server).exec("exit 17", timeout=30)
     assert result.returncode == 17 and not result.timed_out
     assert not any("show -p Result" in c for c in server.calls)
+
+
+def test_exec_without_timeout_still_runs_in_a_scope(monkeypatch):
+    # Issue #14: idle-check must be able to see foreground commands.
+    server = ScopeServer(0)
+    seen = {}
+
+    def spy(remote_cmd, *a, **kw):
+        if "systemd-run --scope" in remote_cmd:
+            seen["timeout"] = kw.get("timeout")
+        return server(remote_cmd, *a, **kw)
+
+    r = remote_with(monkeypatch, spy)
+    result = r.exec("make build")
+    assert result.returncode == 0 and not result.timed_out
+    cmd = server.calls[0]
+    assert "systemd-run --scope" in cmd and "--unit devbox-exec-" in cmd
+    assert "RuntimeMaxSec" not in cmd
+    assert seen["timeout"] is None
+
+
+def test_detached_keep_alive_gets_marked(monkeypatch):
+    r = Remote("192.0.2.1", Path("/key"), Path("/kh"))
+    calls = []
+    monkeypatch.setattr(r, "run", lambda script, **kw: calls.append(script))
+    r.start_unit("build", "make", keep_alive=True)
+    r.start_unit("web", "npm run dev")
+    assert "--description 'devbox-keepalive build'" in calls[0]
+    assert "--description 'devbox web'" in calls[1]

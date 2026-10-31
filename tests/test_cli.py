@@ -84,8 +84,8 @@ def test_parse_units():
         "devbox-tunnel.service loaded failed failed cloudflared\n"
     )
     assert parse_units(out) == [
-        {"name": "web", "active": "active", "sub": "running"},
-        {"name": "tunnel", "active": "failed", "sub": "failed"},
+        {"name": "web", "active": "active", "sub": "running", "keep_alive": False},
+        {"name": "tunnel", "active": "failed", "sub": "failed", "keep_alive": False},
     ]
 
 
@@ -152,6 +152,8 @@ class FakeCloud:
         self.calls: list[tuple] = []
         self.next_id = 100
         self.fail_snapshot = False
+        self.fail_delete = False
+        self.running_work = []
         self.offer_list = [
             offer("cx23", "fsn1", price=4.0),
             offer("cx33", "fsn1", price=7.0, cores=4, memory=8.0),
@@ -190,13 +192,18 @@ class FakeCloud:
 
     def delete_server(self, server_id):
         self.calls.append(("delete", server_id))
+        if self.fail_delete:
+            from devbox import DevboxError
+            raise DevboxError("locked")
         del self.servers[server_id]
 
     def shutdown(self, server_id):
         self.calls.append(("shutdown", server_id))
+        self.servers[server_id]["status"] = "off"
 
     def poweron(self, server_id):
         self.calls.append(("poweron", server_id))
+        self.servers[server_id]["status"] = "running"
 
     def create_snapshot(self, server_id, project, description):
         self.calls.append(("snapshot", server_id))
@@ -268,6 +275,7 @@ def cloud(monkeypatch):
         cli.Remote, "sync", lambda self, path, manifest: {"mode": "git", "files": 1, "deleted": 0, "warning": None}
     )
     monkeypatch.setattr(cli.Remote, "list_units", lambda self: [])
+    monkeypatch.setattr(cli.Remote, "running_work", lambda self: list(fake.running_work))
     return fake
 
 
@@ -605,3 +613,188 @@ def test_doctor_without_hcloud(capsys, isolated, monkeypatch):
     assert code == 1
     assert "[FAIL] hcloud: hcloud CLI not found" in out
     assert "registry" in out
+
+
+# Issue #14: idle shutdown must not interrupt running work.
+
+
+def make_idle(isolated):
+    from devbox import config, db
+
+    conn = db.connect(config.load().db_path)
+    conn.execute("UPDATE servers SET created_at = '2026-01-01T00:00:00+00:00'")
+    conn.execute("UPDATE events SET at = '2026-01-01T00:00:00+00:00'")
+
+
+@pytest.mark.parametrize("work", [
+    [{"unit": "devbox-exec-1a2b.scope", "kind": "command"}],
+    [{"unit": "devbox-build.service", "kind": "keep-alive job"}],
+])
+def test_idle_check_leaves_servers_with_running_work_alone(capsys, isolated, cloud, work):
+    run(capsys, "project", "add", "crm", "--path", str(isolated / "crm"))
+    run(capsys, "up", "crm", "--type", "cx23", "--location", "fsn1")
+    make_idle(isolated)
+    cloud.running_work = work
+    code, out, _ = run(capsys, "idle-check")
+    assert code == 0 and "still running; left alone" in out
+    assert len(cloud.servers) == 1 and not cloud.images
+
+    cloud.running_work = []
+    code, out, _ = run(capsys, "idle-check")
+    assert "paused" in out and cloud.servers == {}
+
+
+def test_idle_check_does_nothing_when_work_cannot_be_checked(capsys, isolated, cloud, monkeypatch):
+    run(capsys, "project", "add", "crm", "--path", str(isolated / "crm"))
+    run(capsys, "up", "crm", "--type", "cx23", "--location", "fsn1")
+    make_idle(isolated)
+
+    def unreachable(self):
+        raise DevboxError("ssh to 192.0.2.1 failed")
+
+    monkeypatch.setattr(cli.Remote, "running_work", unreachable)
+    code, out, _ = run(capsys, "idle-check", "--json")
+    entry = json.loads(out)[0]
+    assert entry["action"] is None and "could not check" in entry["skipped"]
+    assert len(cloud.servers) == 1
+
+
+def test_keep_alive_only_with_detach(capsys, isolated, cloud):
+    run(capsys, "project", "add", "crm", "--path", str(isolated / "crm"))
+    run(capsys, "up", "crm", "--type", "cx23", "--location", "fsn1")
+    code, _, err = run(capsys, "exec", "crm", "--keep-alive", "--", "make")
+    assert code == 1 and "--keep-alive only applies to --detach" in err
+
+
+def test_busy_units_parsing():
+    from devbox.remote import busy_units
+
+    out = (
+        "devbox-exec-ab12.scope loaded active running bash -lc make\n"
+        "devbox-web.service loaded active running devbox web\n"
+        "devbox-build.service loaded active running devbox-keepalive build\n"
+        "devbox-tunnel.service loaded active running devbox tunnel\n"
+    )
+    assert busy_units(out) == [
+        {"unit": "devbox-exec-ab12.scope", "kind": "command"},
+        {"unit": "devbox-build.service", "kind": "keep-alive job"},
+    ]
+
+
+# Issue #15: snapshots are priced even when no server needs a price.
+
+
+def test_adopted_snapshot_is_priced_and_counts_for_budget(capsys, isolated, cloud):
+    cfg_dir = isolated / "config" / "devbox"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.toml").write_text('monthly_budget = 0.01\nbudget_action = "block"\n')
+    run(capsys, "project", "add", "crm", "--path", str(isolated / "crm"))
+    start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    cloud.images[700] = {
+        "id": 700, "description": "old", "status": "available", "size_gb": 20.0, "disk_gb": 40,
+        "architecture": "x86", "project": "crm", "created": start.isoformat(),
+    }
+    code, _, err = run(capsys, "up", "crm", "--fresh", "--type", "cx23", "--location", "fsn1")
+    assert code == 1 and "budget" in err
+    code, out, _ = run(capsys, "snapshot", "list", "--json")
+    assert json.loads(out)["snapshots"][0]["price_per_gb_month"] == 0.012
+
+
+def test_unknown_prices_make_budget_check_incomplete(capsys, isolated, cloud, monkeypatch):
+    cfg_dir = isolated / "config" / "devbox"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.toml").write_text("monthly_budget = 100\n")
+    monkeypatch.setattr(cloud, "snapshot_price_per_gb_month", lambda: None)
+    run(capsys, "project", "add", "crm", "--path", str(isolated / "crm"))
+    cloud.images[701] = {
+        "id": 701, "description": "old", "status": "available", "size_gb": 20.0, "disk_gb": 40,
+        "architecture": "x86", "project": "crm", "created": datetime.now(timezone.utc).isoformat(),
+    }
+    code, out, _ = run(capsys, "up", "crm", "--fresh", "--type", "cx23", "--location", "fsn1", "--json")
+    assert code == 0
+    assert any("budget check is incomplete" in w for w in json.loads(out)["warnings"])
+    code, out, _ = run(capsys, "status")
+    assert "with unknown price" in out
+
+
+# Issue #16: a pause whose delete fails leaves an accurate, recoverable state.
+
+
+def test_pause_delete_failure_is_recorded_and_recoverable(capsys, isolated, cloud):
+    from devbox import config, db
+
+    run(capsys, "project", "add", "crm", "--path", str(isolated / "crm"))
+    run(capsys, "up", "crm", "--type", "cx23", "--location", "fsn1")
+    cloud.fail_delete = True
+    code, _, err = run(capsys, "pause", "crm")
+    assert code == 1
+    assert "is saved, but deleting server" in err and "still billed" in err
+    image = next(iter(cloud.images))
+    conn = db.connect(config.load().db_path)
+    assert db.active_server(conn, "crm")["power"] == "off"
+
+    code, out, _ = run(capsys, "status", "crm")
+    assert "powered off" in out and "still billed" in out
+    code, _, err = run(capsys, "exec", "crm", "--", "true")
+    assert code == 1 and "powered off" in err
+
+    # Retrying finishes the pause with the same snapshot.
+    cloud.fail_delete = False
+    snapshots_before = len([c for c in cloud.calls if c[0] == "snapshot"])
+    code, out, err = run(capsys, "pause", "crm")
+    assert code == 0, err
+    assert len([c for c in cloud.calls if c[0] == "snapshot"]) == snapshots_before
+    assert list(cloud.images) == [image] and cloud.servers == {}
+
+
+def test_up_powers_on_a_shut_down_server(capsys, isolated, cloud):
+    run(capsys, "project", "add", "crm", "--path", str(isolated / "crm"))
+    run(capsys, "up", "crm", "--type", "cx23", "--location", "fsn1")
+    cloud.fail_delete = True
+    run(capsys, "pause", "crm")
+    code, out, err = run(capsys, "up", "crm")
+    assert code == 0, err
+    assert "powered on server" in out
+    assert cloud.calls[-1][0] == "poweron"
+    code, out, _ = run(capsys, "status", "crm")
+    assert "crm: running" in out
+
+
+def test_snapshot_failure_records_power_state(capsys, isolated, cloud, monkeypatch):
+    from devbox import config, db
+
+    run(capsys, "project", "add", "crm", "--path", str(isolated / "crm"))
+    run(capsys, "up", "crm", "--type", "cx23", "--location", "fsn1")
+    cloud.fail_snapshot = True
+
+    def broken_poweron(server_id):
+        raise DevboxError("api down")
+
+    monkeypatch.setattr(cloud, "poweron", broken_poweron)
+    code, _, err = run(capsys, "pause", "crm")
+    assert code == 1 and "powered off (still billed)" in err
+    assert db.active_server(db.connect(config.load().db_path), "crm")["power"] == "off"
+
+
+# Issue #17: commands a person runs count as activity; status does not.
+
+
+@pytest.mark.parametrize("args", [["ps", "crm"], ["stop", "crm", "web"]])
+def test_inspection_commands_reset_idle_timer(capsys, isolated, cloud, monkeypatch, args):
+    monkeypatch.setattr(cli.Remote, "stop_unit", lambda self, name: True)
+    run(capsys, "project", "add", "crm", "--path", str(isolated / "crm"))
+    run(capsys, "up", "crm", "--type", "cx23", "--location", "fsn1")
+    make_idle(isolated)
+    code, _, _ = run(capsys, *args)
+    assert code == 0
+    code, out, _ = run(capsys, "idle-check", "--dry-run")
+    assert "would pause" not in out
+
+
+def test_status_does_not_reset_idle_timer(capsys, isolated, cloud):
+    run(capsys, "project", "add", "crm", "--path", str(isolated / "crm"))
+    run(capsys, "up", "crm", "--type", "cx23", "--location", "fsn1")
+    make_idle(isolated)
+    run(capsys, "status")
+    code, out, _ = run(capsys, "idle-check", "--dry-run")
+    assert "would pause" in out
