@@ -1,15 +1,15 @@
 # Devbox POC Plan
 
-**Goal:** Prove the basic loop. From the Hermes host, create a temporary Hetzner server for a project, copy the code there, install and start it (Docker Compose and/or a dev server), get a preview URL, keep editing locally, and delete the server when done.
+**Goal:** Prove the basic loop. From the Hermes host, create a temporary Hetzner server for a project, copy the code there, let the agent install and start it however that project needs, get a preview URL, keep editing locally, and delete the server when done.
 
-Built as a real CLI with a SQLite registry so that later features (snapshots, backups, idle shutdown) can be added without a rewrite. Everything else from the [original requirements](https://gist.github.com/banjo/961e2c548c74d249119b0732e8ce28d5) is left for later (section 8).
+The CLI does not know how any project is built. It only manages the server and runs commands on it. The agent works out how to start each project and keeps notes on it. A SQLite registry makes it possible to add snapshots, backups and idle shutdown later without a rewrite. Everything else from the [original requirements](https://gist.github.com/banjo/961e2c548c74d249119b0732e8ce28d5) is left for later (section 9).
 
 ## 1. Pieces
 
 - **`devbox` CLI**: a Python 3.11+ package in this repo, standard library only (`argparse`, `sqlite3`, `subprocess`). Installed with `uv tool install -e .`. It calls `hcloud`, `ssh` and `rsync` as subprocesses.
-- **Registry**: SQLite at `~/.local/state/devbox/devbox.db`. Holds projects, how to run them, and their servers.
-- **Skill**: `skills/hetzner-devbox/SKILL.md`, symlinked to `~/.hermes/skills/hetzner-devbox/`. Describes how the agent should work with the CLI.
-- Nothing is added to the project repos. How a project is started is stored in the registry through the CLI.
+- **Registry**: SQLite at `~/.local/state/devbox/devbox.db`, holding projects, their notes, and their servers.
+- **Skill**: `skills/hetzner-devbox/SKILL.md`, symlinked to `~/.hermes/skills/hetzner-devbox/`. Describes how the agent works with the CLI and how it figures out how to run a project.
+- Nothing is added to the project repos.
 
 ## 2. Config
 
@@ -25,17 +25,16 @@ ssh_key = "~/.ssh/devbox"                            # created with ssh-keygen i
 
 ## 3. Registry
 
-The schema version is kept in `PRAGMA user_version`. Migrations are numbered SQL strings in `db.py` and run at startup, so new tables (such as `snapshots`) are a new migration.
+The schema version is kept in `PRAGMA user_version`. Migrations are numbered SQL strings in `db.py` and run at startup, so new tables (such as `snapshots`) are just a new migration.
 
 ```sql
 -- migration 1
 CREATE TABLE projects (
   name        TEXT PRIMARY KEY,
   path        TEXT NOT NULL,      -- local project folder on Hermes
-  setup_cmd   TEXT,               -- runs once per new server
-  start_cmd   TEXT,               -- long-running: compose and/or dev server
-  port        INTEGER,            -- port the preview points at
-  created_at  TEXT NOT NULL
+  notes       TEXT NOT NULL DEFAULT '',  -- free text, written by the agent
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL
 );
 
 CREATE TABLE servers (
@@ -46,7 +45,7 @@ CREATE TABLE servers (
   server_type  TEXT,
   location     TEXT,
   status       TEXT NOT NULL,     -- creating | running | deleted
-  setup_done   INTEGER NOT NULL DEFAULT 0,
+  preview_port INTEGER,
   preview_url  TEXT,
   created_at   TEXT NOT NULL,
   deleted_at   TEXT
@@ -57,37 +56,57 @@ A project has at most one server with status other than `deleted`. Deleted rows 
 
 **Hetzner is the source of truth for whether a server exists.** Every server is created with labels `managed-by=devbox` and `project=<name>`. Before `up`, `status` and `down`, the CLI compares the registry with `hcloud server list -l managed-by=devbox -o json`:
 - The registry says running but the server is gone in Hetzner: mark the row `deleted`.
-- A labeled server exists but has no registry row (for example after a crash during `up`): add it to the registry.
+- A labeled server exists with no registry row (for example after a crash during `up`): add it to the registry.
+
+Background processes are not stored in the registry. They are systemd units on the server, and `ps` asks the server directly.
 
 Snapshots later: a `snapshots` table (project, hetzner_image_id, created_at, status) in migration 2. `up` then restores from the latest snapshot when one exists, and `down --snapshot` creates one first.
+
+### Project notes
+
+The notes are free text that the agent writes once it has got a project running, for example:
+
+```text
+Node 22 via mise (`mise use -g node@22`).
+`docker compose up -d db` (Postgres on 5432), then `npm ci`.
+Seed: `npm run db:seed` (only on a new server).
+Dev server: `exec --detach --name web -- npm run dev -- --host 0.0.0.0`, port 3000.
+Needs .env with DATABASE_URL=postgres://postgres:postgres@localhost:5432/app.
+```
+
+Next time the agent reads the notes first and does not have to work it out again. If something has changed, it updates them.
 
 ## 4. Commands
 
 | Command | What it does |
 |---|---|
-| `devbox project add NAME --path P [--setup CMD] [--start CMD] [--port N]` | Registers a project. |
-| `devbox project set NAME ...` | Changes setup, start or port. |
-| `devbox project show NAME` / `devbox project list` | Shows project settings. |
-| `devbox up NAME` | Creates the server if none is running, waits for cloud-init, syncs code, runs setup on a new server, (re)starts the app and the preview tunnel, prints the URL. Running it again reuses the server and only syncs and restarts. |
-| `devbox sync NAME` | Copies local code to the server. A dev server in watch mode picks up the changes. |
-| `devbox exec NAME -- CMD...` | Runs a command in `/srv/app` on the server and returns its exit code. |
-| `devbox logs NAME [-f]` | Shows app output. |
+| `devbox project add NAME --path P` | Registers a project. |
+| `devbox project list` | Lists projects and whether each has a server. |
+| `devbox project notes NAME [--set TEXT \| --set-file F]` | Shows or replaces the project's notes. |
+| `devbox up NAME` | Creates the server if none is running (waits for cloud-init), then syncs code. Runs no project commands. Running it again reuses the server and only syncs. |
+| `devbox sync NAME` | Copies local code to the server. |
+| `devbox exec NAME -- CMD...` | Runs a command in `/srv/app` on the server, waits for it, and returns its exit code. |
+| `devbox exec NAME --detach --name PROC -- CMD...` | Starts a long-running command (dev server, `compose up` in the foreground, watcher) as a systemd unit `devbox-PROC`. Replaces a running process with the same name. |
+| `devbox ps NAME` | Lists background processes and whether they are running. |
+| `devbox stop NAME PROC` | Stops a background process. |
+| `devbox logs NAME PROC [-f] [-n LINES]` | Shows output from a background process. |
+| `devbox expose NAME PORT` | Starts or moves the preview tunnel to a port on the server and prints the URL. |
 | `devbox ssh NAME` | Opens a shell on the server. |
-| `devbox status [NAME]` | Shows each project's server (or `none`), IP, type, uptime and preview URL. |
+| `devbox status [NAME]` | Shows each project's server (or `none`), IP, type, uptime, background processes and preview URL. |
 | `devbox down NAME` | Deletes the server and marks it `deleted`. Anything that exists only on the server (database contents, files not synced back) is lost. |
 
 All commands accept `--json` for output the agent can parse.
 
 ## 5. How it works
 
-- **Server:** `hcloud server create` with name `devbox-<name>`, the labels, the devbox SSH key, the firewall and `cloud-init.yaml`. Cloud-init installs Docker with the Compose plugin, `rsync`, `git`, `build-essential`, `mise` and `cloudflared`. Everything runs as root in `/srv/app`, which is fine for a throwaway POC box.
+- **Server:** `hcloud server create` with name `devbox-<name>`, the labels, the devbox SSH key, the firewall and `cloud-init.yaml`. Cloud-init installs only general tools: Docker with the Compose plugin, `rsync`, `git`, `build-essential`, `mise` and `cloudflared`. Anything project-specific is up to the agent. Everything runs as root in `/srv/app`, which is fine for a throwaway POC box.
 - **One server at a time:** `up` refuses to create a server if another project already has one running, unless `--force` is given.
 - **Firewall:** one Hetzner firewall, `devbox`. It allows only SSH, and only from the Hermes host's IP, and is created on first use.
 - **SSH:** `-i ssh_key`, `StrictHostKeyChecking=accept-new`, and a `known_hosts` file per server that `down` removes.
 - **Sync:** `rsync -az --delete --exclude .git --filter=':- .gitignore'` from the project path to `/srv/app`. Ignored folders such as `node_modules` stay on the server.
-- **App:** `start_cmd` runs as a systemd unit (`systemd-run --unit devbox-app bash -lc ...`), so it survives SSH disconnects. `up` stops the old unit before starting a new one. `logs` reads `journalctl -u devbox-app`.
-- **Preview:** a Cloudflare quick tunnel (`cloudflared tunnel --url http://localhost:<port>`) as a second unit. It needs no Cloudflare account, and the server exposes no ports. The URL is a public, random `*.trycloudflare.com` address read from the unit log, saved in the registry, and new each time the tunnel restarts.
-- **Remote only:** `exec`, `logs` and `ssh` fail if the project has no running server. Nothing falls back to running on the Hermes host.
+- **Background processes:** `systemd-run --unit devbox-<proc> --working-directory /srv/app bash -lc '<cmd>'`, so they survive SSH disconnects. `ps` lists `devbox-*` units, and `logs` reads `journalctl -u devbox-<proc>`.
+- **Preview:** a Cloudflare quick tunnel (`cloudflared tunnel --url http://localhost:<port>`) as the unit `devbox-tunnel`. It needs no Cloudflare account, and the server exposes no ports. The URL is a public, random `*.trycloudflare.com` address read from the unit log, saved in the registry, and new each time the tunnel restarts.
+- **Remote only:** `exec`, `ps`, `logs`, `expose` and `ssh` fail if the project has no running server. Nothing falls back to running on the Hermes host.
 
 ## 6. Files
 
@@ -102,7 +121,7 @@ src/devbox/hetzner.py    # hcloud wrapper: create, list, delete, firewall, ssh k
 src/devbox/remote.py     # ssh, rsync, systemd units, tunnel URL
 src/devbox/cloud-init.yaml
 skills/hetzner-devbox/SKILL.md
-tests/test_db.py         # migrations, one-server-per-project rule
+tests/test_db.py         # migrations, one-server-per-project rule, notes
 tests/test_reconcile.py  # registry vs fake hcloud output
 ```
 
@@ -111,28 +130,33 @@ tests/test_reconcile.py  # registry vs fake hcloud output
 The skill tells the agent:
 
 1. **Edit locally.** Reading code, editing, Git and small checks happen on the Hermes host. Do not start a server for that.
-2. **Run remotely.** Installs, builds, Compose, dev servers and tests go through `devbox exec` or `devbox up`, never directly on the Hermes host.
-3. **New project:** if `devbox project show <name>` fails, ask Anton how the project is started (runtime/version, setup command, start command, port), save it with `devbox project add`, and confirm it with him.
-4. **Ask before `devbox up` creates a server.** It costs money. Once a server is running, the agent can use it freely.
-5. **Development loop:** edit locally, then run `devbox sync`. For a restart or new dependencies, run `devbox exec` or `devbox up`. Use `devbox logs` to debug. Always give Anton the preview URL.
+2. **Run remotely.** Installs, builds, Compose, dev servers and tests go through `devbox exec`, never directly on the Hermes host.
+3. **Ask before `devbox up` creates a server.** It costs money. Once a server is running, the agent can use it freely.
+4. **Starting a project:**
+   1. `devbox project notes NAME`. If there are notes, follow them.
+   2. If there are none, read the project (README, `package.json`, `compose.yaml`, `Makefile`, `.env.example`, `.tool-versions`/`.nvmrc` and so on) and work out what it needs.
+   3. Install the runtime and dependencies with `devbox exec`, start services and dev servers with `devbox exec --detach`, check `devbox logs`, then `devbox expose` the right port.
+   4. Ask Anton if it is still unclear how the project is run, or which secrets or env values it needs.
+   5. Once it works, save or update the notes with `devbox project notes NAME --set ...`. Keep them short: steps, commands, ports, env values, gotchas.
+5. **Development loop:** edit locally, then run `devbox sync`. For new dependencies or a restart, use `devbox exec` or restart the process with `exec --detach`. Use `devbox logs` to debug. Always give Anton the preview URL.
 6. **When done** ("vi är klara", "stäng ner"): remind Anton that the server's data is lost, then run `devbox down`. Commit and push only if he asks.
 7. **Remind about forgotten servers.** If `devbox status` shows a server that has been up for a long time, tell Anton it still costs money.
 
 | Anton says | Agent does |
 |---|---|
-| "Starta CRM så jag kan testa" | Asks first if no server is running, then `devbox up crm` and gives the URL |
+| "Starta CRM så jag kan testa" | Asks first if no server is running, `devbox up crm`, follows the notes (or works it out), `expose`, gives the URL |
 | "Ändra layouten på dashboarden" | Edits locally, then `devbox sync crm` if a server is running |
 | "Kör testerna" | `devbox exec crm -- npm test` |
 | "Vi är klara för idag" | `devbox down crm` |
 
 ## 8. Steps
 
-1. Package skeleton, config, `db.py` with migration 1, `project add/set/show/list`, and tests for the registry.
+1. Package skeleton, config, `db.py` with migration 1, `project add/list/notes`, and tests for the registry.
 2. `hetzner.py`, reconcile and `status`. Check them against the real API with read-only calls.
-3. `cloud-init.yaml`, `up`, `sync`, `exec`, `logs`, `ssh`, `down`.
-4. Preview tunnel and URL in `up` and `status`.
+3. `cloud-init.yaml`, `up`, `sync`, `exec` (plain and `--detach`), `ps`, `stop`, `logs`, `ssh`, `down`.
+4. `expose` and the preview URL in `status`.
 5. `SKILL.md` and a short README covering setup and commands.
-6. Live test, approved by Anton first: run one real project end to end (`project add`, `up`, open the URL, edit and `sync`, see the change, `exec` a test, `down`, confirm the server is gone in Hetzner and `deleted` in the registry).
+6. Live test, approved by Anton first: let the agent take one real project with no notes from `up` to a working preview URL, check that it saved notes, edit and `sync` to see the change, `down`, then `up` again and confirm it starts the project from the notes alone. Finally check the server is gone in Hetzner and `deleted` in the registry.
 
 ## 9. Later, if the POC works
 
