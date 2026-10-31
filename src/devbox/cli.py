@@ -775,15 +775,7 @@ def cmd_status(ctx: Context) -> int:
 def cmd_costs(ctx: Context) -> int:
     a = ctx.args
     now = datetime.now(timezone.utc)
-    since = until = None
-    if a.month:
-        since, until = costs.parse_month(a.month)
-    if a.days:
-        since = now - timedelta(days=a.days)
-    if a.since:
-        since = costs.parse_day(a.since)
-    if a.until:
-        until = costs.parse_day(a.until)
+    since, until = costs.resolve_period(a.month, a.days, a.since, a.until, now)
     if a.project and not db.get_project(ctx.conn, a.project) and not db.all_servers(ctx.conn, a.project):
         raise DevboxError(f"unknown project '{a.project}'")
 
@@ -799,7 +791,7 @@ def cmd_costs(ctx: Context) -> int:
         cost = costs.money(g["cost"]) + ("*" if g["unknown_price"] else "")
         lines.append(
             f"{g['key']:<24} {g['servers']:>7} {g['snapshots']:>5} {costs.duration(g['seconds']):>8} "
-            f"{g['billed_hours']:>6} {cost:>9}"
+            f"{costs.hours(g['billed_hours']):>6} {cost:>9}"
         )
     lines.append(
         f"total {period}: {costs.money(summary['total'])} over {summary['servers']} "
@@ -808,7 +800,10 @@ def cmd_costs(ctx: Context) -> int:
     )
     if summary["unknown_price"]:
         lines.append(f"* {summary['unknown_price']} item(s) without a known price are not counted")
-    lines.append("Estimates incl. VAT: servers per started hour and snapshots per GB, both capped monthly. IPv4 and traffic not included.")
+    lines.append(
+        "Estimates incl. VAT: servers per started hour and snapshots per GB, both capped per calendar month, "
+        "with each month's cost spread over the time running in it. IPv4 and traffic not included."
+    )
     emit(ctx.args, summary, "\n".join(lines))
     return 0
 
@@ -1039,7 +1034,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--project", help="only this project")
     period = p.add_mutually_exclusive_group()
     period.add_argument("--month", metavar="YYYY-MM", help="one calendar month (UTC)")
-    period.add_argument("--days", type=int, metavar="N", help="the last N days")
+    period.add_argument("--days", metavar="N", help="the last N days (1 or more)")
     period.add_argument("--since", metavar="YYYY-MM-DD", help="from this day (UTC)")
     p.add_argument("--until", metavar="YYYY-MM-DD", help="up to, not including, this day")
     p.add_argument("--by", choices=costs.GROUPINGS, default="project", help="grouping (default: project)")

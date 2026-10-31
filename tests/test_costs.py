@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -103,3 +103,125 @@ def test_migration_from_v1_keeps_data(tmp_path):
     conn = db.connect(path)
     assert conn.execute("PRAGMA user_version").fetchone()[0] == len(db.MIGRATIONS)
     assert db.get_project(conn, "a")["path"] == "/a"
+
+
+# Issue #11: breakdowns and adjacent periods reconcile with totals.
+
+NOW = ts("2026-12-01T00:00:00")
+
+
+def capped_october():
+    return server(1, "app", "2026-10-01T00:00:00", "2026-11-01T00:00:00", hourly=0.01, monthly=5.0)
+
+
+@pytest.mark.parametrize("by", costs.GROUPINGS)
+def test_every_grouping_adds_up_to_the_total(by):
+    items = [
+        capped_october(),
+        server(2, "app", "2026-10-31T23:30:00", "2026-11-01T00:30:00"),
+        server(3, "blog", "2026-10-01T23:30:00", "2026-10-02T00:30:00", type="cx33"),
+    ]
+    s = costs.summarize(items, by=by, now=NOW)
+    assert sum(g["cost"] for g in s["groups"]) == pytest.approx(s["total"], abs=1e-3)
+    assert sum(g["billed_hours"] for g in s["groups"]) == pytest.approx(s["billed_hours"], abs=0.05)
+    # Grouping never changes the total.
+    assert s["total"] == pytest.approx(costs.summarize(items, by="project", now=NOW)["total"])
+
+
+def test_capped_month_by_day_keeps_the_cap():
+    s = costs.summarize([capped_october()], by="day", now=NOW)
+    assert s["total"] == pytest.approx(5.0)
+    assert len(s["groups"]) == 31
+    assert sum(g["cost"] for g in s["groups"]) == pytest.approx(5.0, abs=1e-3)
+
+
+def test_hour_across_midnight_is_not_counted_twice():
+    item = server(1, "app", "2026-10-01T23:30:00", "2026-10-02T00:30:00")
+    s = costs.summarize([item], by="day", now=NOW)
+    assert s["total"] == pytest.approx(0.01)
+    assert [g["cost"] for g in s["groups"]] == [pytest.approx(0.005), pytest.approx(0.005)]
+    assert sum(g["billed_hours"] for g in s["groups"]) == pytest.approx(1)
+
+
+def test_hour_across_month_boundary_has_same_billed_hours_in_every_grouping():
+    item = server(1, "app", "2026-10-31T23:30:00", "2026-11-01T00:30:00")
+    by_project = costs.summarize([item], by="project", now=NOW)
+    by_month = costs.summarize([item], by="month", now=NOW)
+    assert by_project["billed_hours"] == by_month["billed_hours"] == 2
+    assert by_project["groups"][0]["billed_hours"] == 2
+    assert [g["billed_hours"] for g in by_month["groups"]] == [1, 1]
+    assert by_project["total"] == by_month["total"] == pytest.approx(0.02)
+    assert costs.server_usage(item, now=NOW)["billed_hours"] == 2
+
+
+@pytest.mark.parametrize("cut", ["2026-10-31T00:00:00", "2026-10-15T12:00:00", "2026-10-02T00:00:00"])
+def test_adjacent_periods_add_up_even_after_the_cap(cut):
+    item = capped_october()
+    start, mid, end = ts("2026-10-01T00:00:00"), ts(cut), ts("2026-11-01T00:00:00")
+    first = costs.summarize([item], start, mid, now=NOW)["total"]
+    second = costs.summarize([item], mid, end, now=NOW)["total"]
+    whole = costs.summarize([item], start, end, now=NOW)["total"]
+    assert whole == pytest.approx(5.0)
+    assert first + second == pytest.approx(whole, abs=1e-3)
+
+
+def test_period_share_is_proportional_to_running_time():
+    item = capped_october()  # 744 h in October, capped at 5.0
+    s = costs.summarize([item], ts("2026-10-31T00:00:00"), ts("2026-11-01T00:00:00"), now=NOW)
+    assert s["total"] == pytest.approx(5.0 * 24 / 744, abs=1e-4)
+    assert s["billed_hours"] == pytest.approx(24)
+
+
+def test_running_server_cost_so_far_is_whole_hours():
+    item = server(1, "app", "2026-11-30T22:10:00")
+    usage = costs.server_usage(item, now=NOW)
+    assert usage["billed_hours"] == 2
+    assert usage["cost"] == pytest.approx(0.02)
+
+
+# Issue #12: period parsing and validation.
+
+from devbox import DevboxError  # noqa: E402
+
+
+@pytest.mark.parametrize("value", ["2024-02-29", "2026-12-31", "2000-01-01"])
+def test_valid_days(value):
+    assert costs.parse_day(value).date().isoformat() == value
+
+
+@pytest.mark.parametrize("value", ["2026-02-30", "2025-02-29", "garbage", "2026-13-01", "20261001", "2026-W01-1", "1999-12-31", "9999-12-31", ""])
+def test_invalid_days(value):
+    with pytest.raises(DevboxError):
+        costs.parse_day(value)
+
+
+@pytest.mark.parametrize("value", ["2026-13", "2026-00", "9999-12", "1999-12", "2026-1", "garbage"])
+def test_invalid_months(value):
+    with pytest.raises(DevboxError):
+        costs.parse_month(value)
+
+
+def test_month_bounds():
+    assert costs.parse_month("2026-12") == (ts("2026-12-01T00:00:00"), ts("2027-01-01T00:00:00"))
+    assert costs.parse_month("9998-12")[1] == ts("9999-01-01T00:00:00")
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1000000000", "abc", "1.5", str(costs.MAX_DAYS + 1)])
+def test_invalid_days_count(value):
+    with pytest.raises(DevboxError):
+        costs.parse_days(value)
+
+
+def test_days_period():
+    since, until = costs.resolve_period(None, "7", None, None, NOW)
+    assert since == NOW - timedelta(days=7) and until is None
+
+
+@pytest.mark.parametrize("args", [
+    (None, None, "2026-11-01", "2026-10-01"),
+    ("2026-10", None, None, "2026-09-01"),
+    (None, None, "2026-10-01", "2026-10-01"),
+])
+def test_empty_or_reversed_periods_are_rejected(args):
+    with pytest.raises(DevboxError, match="empty or reversed"):
+        costs.resolve_period(*args, NOW)

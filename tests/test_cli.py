@@ -433,3 +433,21 @@ def test_costs_include_snapshots(capsys, isolated, cloud):
     assert code == 0 and cloud.images == {}
     code, _, _ = run(capsys, "project", "remove", "crm")
     assert code == 0
+
+
+@pytest.mark.parametrize("args", [
+    ["--since", "2026-02-30"],
+    ["--until", "garbage"],
+    ["--month", "2026-13"],
+    ["--month", "9999-12"],
+    ["--days", "0"],
+    ["--days", "-1"],
+    ["--days", "1000000000"],
+    ["--since", "2026-11-01", "--until", "2026-10-01"],
+    ["--month", "2026-10", "--until", "2026-09-01"],
+])
+def test_costs_invalid_periods_give_json_errors(capsys, args):
+    code, out, err = run(capsys, "costs", *args, "--json")
+    assert code == 1
+    assert "Traceback" not in err
+    assert "error" in json.loads(out)

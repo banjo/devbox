@@ -122,6 +122,7 @@ All commands accept `--json`. `exec` runs a single argument as a shell script (`
 
 ### Costs and budget
 - `up` stores the server's hourly and monthly price from Hetzner when it creates it, and every server's and snapshot's start and end time stays in the registry. Servers are estimated the way Hetzner bills them: per started hour, capped at the monthly price per calendar month. Snapshots are estimated per GB per month, prorated by the hour. Prices include VAT; primary IPv4 and traffic are not included.
+- Reports compute each month's cost once and spread it evenly over the time the server ran that month. A period or a day/month row gets its share, so rows always add up to the total and adjacent periods add up to the combined period (billed hours in a partial period can be fractional). `costs` rejects impossible dates, `--days` outside 1–36500, and periods where `--until` is not after the start.
 - `status` shows the cost so far and this month's total, `down`/`pause` print the server's total and activity (syncs, execs, background starts, previews), and `devbox costs` sums any period by project, month, day, server type or server. Removing a project keeps its history.
 - `monthly_budget = 20` in the config makes `up` warn at 80% and when the month's spending reaches the budget; with `budget_action = "block"` it refuses to create a server unless `--over-budget` is passed. `status` shows what is left.
 
