@@ -26,6 +26,7 @@ Do **not** use it for reading or editing code, Git, or small checks such as lint
 
 - **Never run heavy commands on this machine.** No `docker`, `npm install`, `npm run build`, dev servers or test suites locally. Use `devbox exec`.
 - **Ask before `devbox up` creates a server.** It costs money. Check `devbox status NAME` first; if a server is already running, use it without asking.
+- **Order the cheapest type that fits, every time.** 4 GB when a cheap one exists, otherwise the cheapest 2 GB. Never default to a `cpx*` because it feels safe; see "Choosing a server".
 - **Only one server at a time.** If `up` says another server is running, ask the user whether to `devbox down` that one. Never pass `--force` without their approval.
 - **Prefer `devbox pause` over `devbox down`** when the user is done. Pause keeps everything in a snapshot (a few cents a month) and the next `up` restores it. Ask before `devbox down`: it deletes the server and everything that exists only there, such as database contents.
 - **Mind the budget.** If `up` warns about the monthly budget, tell the user. If it refuses, only pass `--over-budget` when the user says so.
@@ -44,7 +45,11 @@ Do **not** use it for reading or editing code, Git, or small checks such as lint
 Hetzner often runs out of server types in some locations, so pick from what is available right now instead of assuming a type.
 
 1. `devbox server-types --min-cores 2 --min-memory 4` lists what can be ordered now, cheapest first, with location, network zone, architecture and price. Add `--zone eu-central` (or `us-east`, `us-west`, `ap-southeast`) to stay in a region, `--arch x86` if the project needs x86 images.
-2. Pick a sensible default: the cheapest available type with at least 2 vCPU and 4 GB RAM, close to the user (same network zone as before, if you know it). Use more for heavy projects (large builds, several containers, a database plus a dev server); the notes can say what the project needs.
+2. Take the **cheapest** offer that fits, not the first comfortable one. The list is already cheapest first: prefer the user's network zone if you know it, otherwise the first entry.
+   - Cost-optimised types (`category: cost_optimized`, e.g. `cx23` at ~€0.011/h (€6.86/mo)) are several times cheaper than `regular_purpose` (`cpx*`, e.g. `cpx22` at ~€0.039/h) at the same 2 vCPU / 4 GB. Take the cheap one unless the project needs the extra disk, more RAM or a faster CPU class.
+   - If 4 GB is only available as an expensive type, drop the floor to 2 GB (`--min-memory 2`) and take the cheapest offer there instead of paying for 4 GB. 2 vCPU / 2 GB is enough for a single dev server, a small build and one database.
+   - Only size up for a project that actually needs it (large monorepo builds, several containers, a database plus a dev server) and say why in the notes ("needs 8 GB RAM; x86 only because of image X").
+   - Say which type, location and price you picked, so a wrong choice is visible before it runs for hours.
 3. Tell the user what you picked and the monthly price, and ask before creating it. Ask them to choose if the options differ in a way that matters: a different region, ARM instead of x86, or noticeably higher price.
 4. If `up` says the type is not available, it lists the cheapest alternatives. Pick one and ask again if it changes region or price noticeably.
 5. If the project needs a certain size or architecture, record it in the notes (for example "needs 8 GB RAM; x86 only because of image X").
