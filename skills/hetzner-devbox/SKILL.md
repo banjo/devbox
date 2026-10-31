@@ -56,6 +56,21 @@ Hetzner often runs out of server types in some locations, so pick from what is a
 
 Without `--type`/`--location`, `up` uses the config default, or else the project's last server type and location. That is usually what you want: run `devbox up NAME` and only go through the steps above if it says the choice is unavailable or there is no previous server. When restoring a snapshot, the server needs the same architecture and at least the snapshot's disk size; `up` checks this and lists compatible alternatives.
 
+### Swap and memory pressure
+
+- New servers configure 2 GiB swap in cloud-init. Do not create another swap file in app setup.
+- `swap_size_mib` in the controller's `config.toml` is a non-negative integer (default `2048`;
+  `0` skips setup without disabling existing swap). It applies on provisioning, not on reuse
+  of a running server. Existing active swap is reused; existing devbox files are never resized.
+- Verify after startup with `devbox exec NAME -- 'swapon --show --bytes; free -m'`. Do not
+  claim swap is active solely because the config or file exists. It must survive reboot via
+  `/etc/fstab`; snapshot restore reactivates an inactive devbox swap file without formatting.
+- Treat swap as spike protection, not permission to run every heavy process at once. Stop
+  dev servers during full builds on small machines. Persistent swap I/O means less parallel
+  work or more RAM. Reserve disk space and account for possible snapshot growth.
+- On bootstrap failure, inspect cloud-init logs; never overwrite an unknown `/swapfile`,
+  deactivate user-managed swap, or resize/format a live swap file to force startup to pass.
+
 ### Starting a project
 
 1. `devbox status NAME`. If there is no server, ask the user, then `devbox up NAME` (add `--type`/`--location` the first time, see above). If the project is paused (`status` shows a snapshot), `up` restores it. `up` waits for the server and syncs the code. It does not start anything.

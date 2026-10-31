@@ -43,6 +43,8 @@ class Config:
     server_type: str | None = None
     location: str | None = None
     image: str = "ubuntu-24.04"
+    # Safety margin for memory spikes on new servers; 0 skips swap setup.
+    swap_size_mib: int = 2048
     ssh_key: Path = field(default_factory=lambda: Path.home() / ".ssh" / "devbox")
     # CIDRs allowed to reach SSH on devboxes. "auto" means this host's public IPv4.
     ssh_allow: list[str] = field(default_factory=lambda: ["auto"])
@@ -118,6 +120,10 @@ def load(path: Path | None = None) -> Config:
             if not isinstance(value, (int, float)):
                 raise DevboxError(f"{path}: {key} must be a number")
             setattr(cfg, key, float(value))
+        elif key == "swap_size_mib":
+            if type(value) is not int or value < 0:
+                raise DevboxError(f"{path}: swap_size_mib must be a non-negative whole number")
+            cfg.swap_size_mib = value
         elif key == "keep_snapshots":
             if not isinstance(value, int) or value < 1:
                 raise DevboxError(f"{path}: keep_snapshots must be a whole number of at least 1")
