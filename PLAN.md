@@ -1,344 +1,290 @@
 # Devbox Implementation Plan
 
-> **For Hermes:** Use the subagent-driven-development skill to implement this plan task-by-task. This document is a plan, not an implementation or permission to provision resources.
+> **For Hermes:** Use the subagent-driven-development skill to implement this plan milestone by milestone. This document is a plan, not permission to provision billable resources.
 
-**Goal:** Build a standalone CLI that manages disposable Hetzner development environments while keeping code editing and orchestration lightweight on the Hermes server.
+**Goal:** A small CLI, `devbox`, that creates, uses, saves, deletes and restores temporary Hetzner development servers, plus a thin Hermes skill that calls it. Code is edited on the Hermes host; anything heavy runs on the devbox. Hetzner snapshots make the next session fast and cheap.
 
-**Architecture:** A Python CLI/library owns policy, SQLite state and recoverable workflows. Hetzner, SSH, S3-compatible backups and Cloudflare are explicit integrations; a thin Hermes skill invokes the same CLI a human would use. Source code and runtime state are stored separately.
+**Original requirements:** https://gist.github.com/banjo/961e2c548c74d249119b0732e8ce28d5. This plan follows them except where section 1 says otherwise.
 
-**Tech stack:** Python 3.11+ (stdlib argparse, sqlite3, tomllib, subprocess where suitable), official hcloud CLI, OpenSSH, rsync, remote Docker Compose, cloud-init, cloudflared, pytest; a maintained S3 SDK such as boto3 rather than hand-written request signing.
+**Tech stack:** Python 3.11+ using only the standard library (`argparse`, `sqlite3`, `tomllib`, `subprocess`, `urllib`, `fcntl`). External tools are called as subprocesses: `hcloud`, `ssh`, `rsync`, `age`, `rclone`. Tests use `pytest` and fake executables. No Python runtime dependencies, so the 4 GB Hermes host stays light.
 
-## 1. Scope and agreed decisions
+## 1. Decisions
 
-- Project lives at `/root/code/devbox` on the existing Hermes server.
-- This first deliverable creates only this plan and a local Git repository. No cloud resources, services, installed skill or executable implementation yet.
-- Standalone CLI first; no dependency on Hermes internals or chat history.
-- Local-first editing; expensive execution happens on disposable remote servers.
-- Hetzner snapshots are the fast-resume mechanism, with separate S3-compatible backups for persistent application data.
-- Cloudflare previews are included in v1, using public HTTPS URLs without Cloudflare Access. This supersedes the source prompt's mandatory Access requirement.
-- Default idle archival threshold is **3 days**, overridable per project or disabled explicitly.
-- At most one existing devbox VM across all projects by default, including powered-off VMs. A second requires explicit approval.
-- No first billable deployment until Anton explicitly approves it. No approval is implied by this plan.
-- Do not create a GitHub repository or choose its visibility implicitly; initially this is local Git only.
+| Topic | Decision | Differs from gist? |
+|---|---|---|
+| Shape | Standalone CLI in `/root/code/devbox` (GitHub: `banjo/devbox`, private). The Hermes skill is a thin wrapper that only calls the CLI. | Gist put the script inside the skill folder |
+| State paths | `~/.config/devbox/` for config and secrets, `~/.local/state/devbox/` for the registry and logs | Gist suggested `~/.hermes/devboxes/` |
+| Code transfer | Hermes is the source of truth. Code is pushed with rsync; the devbox never clones from GitHub and holds no Git credentials. | Gist cloned on the devbox |
+| Git | No automatic commit or push. Remote-only changes are pulled into a staging folder, never committed by the tool. | Gist allowed commit/push to a dev branch |
+| `save` | Backup + snapshot. Afterwards the VM is powered back on (or left off with `--off`). | Gist marked the project archived |
+| `archive` | `save`, then delete the VM. This is "Vi är klara för idag". | Same |
+| Idle timeout | 3 days by default, configurable per project or disabled | Gist said 60 minutes |
+| Previews | Cloudflare Tunnel with a public HTTPS hostname, no Cloudflare Access. Each project must opt in, in operator config. | Gist required Access |
+| VM limit | At most one devbox VM in total, powered-off VMs included. A second one needs `--allow-second-vm`. | Same |
+| Databases | PostgreSQL dumps are built in. Other data uses declared file paths or a custom dump/restore command. | Narrower than "detected databases" |
+| Volumes | Hetzner Volumes are not supported in v1. Data lives on the root disk and in S3 backups. | Gist said not to assume Volumes are in snapshots |
+| Live tests | No billable resource is created until Anton approves it explicitly | Same |
 
-### Recommendations awaiting practical validation
+## 2. How it works
 
-- Local workspace is authoritative. Remote Git clone supplies a clean baseline; sync overlays local uncommitted changes before execution.
-- Snapshots plus S3 backups are complementary, not interchangeable.
-- No automatic commit/push by default. Code preservation must work without inventing commits.
-- Stable project hostname and named Cloudflare tunnel rather than ephemeral preview URLs.
+```text
+Hermes host (4 GB VPS)                      Hetzner devbox (disposable)
+- devbox CLI + SQLite registry              - Ubuntu LTS, Docker + Compose
+- project source (authoritative)  --rsync-> - /srv/app (copy of source)
+- secrets (age-encrypted)         --ssh---> - /srv/app/.env (tmpfs-backed, removed before snapshot)
+- age + rclone ---------> S3 <---- pg_dump/tar streamed over ssh, encrypted on Hermes
+- hcloud CLI ----------> Hetzner API (servers, snapshots, firewall, ssh keys, all labeled)
+- Cloudflare API ------> tunnel + DNS          cloudflared (outbound only) -> app port
+```
 
-## 2. Source requirements and documentation
+- Every Hetzner resource the tool creates gets the labels `managed-by=devbox` and `devbox-project=<project-uuid>`. The tool only ever reads, changes or deletes resources that carry both labels.
+- One Hetzner Cloud Firewall (`devbox`, labeled) allows inbound SSH only from the Hermes host's IP. No other ports are open; previews leave the devbox outbound through cloudflared.
+- S3 credentials, the Hetzner token and the Cloudflare token stay on Hermes. The devbox only gets the app's runtime secrets and its own tunnel token.
 
-Original requirements: https://gist.github.com/banjo/961e2c548c74d249119b0732e8ce28d5
+## 3. Configuration
 
-Use the source requirements except where the decisions above deliberately supersede them. Consult current documentation and installed CLI help before implementing provider operations; do not treat example commands, products or prices as current facts.
+### Operator config: `~/.config/devbox/config.toml` (trusted)
 
-- Hermes skills: https://hermes-agent.nousresearch.com/docs/user-guide/features/skills/
-- Hetzner snapshot semantics: https://docs.hetzner.com/cloud/servers/backups-snapshots/overview/
-- hcloud: https://github.com/hetznercloud/cli and installed `hcloud --help`.
-- Cloudflare Tunnel: https://developers.cloudflare.com/tunnel/
-- S3 SDK: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3.html
+```toml
+[hetzner]
+token_file = "~/.config/devbox/hcloud.token"   # mode 600
+location = "fsn1"                              # fallback: nbg1
+default_server_type = "cx23"                   # validated against `hcloud server-type list` at run time
+max_server_type = "cx33"
+image = "ubuntu-24.04"
 
-Documentation checked during planning confirms that Hetzner snapshots copy server disks and exclude attached Volumes. They do not replace independent database backups. Exact provider commands and a public-tunnel API implementation remain implementation-time verification tasks.
+[limits]
+max_vms = 1
+monthly_warning_eur = 20
+max_runtime_warning = "7d"
+default_idle_timeout = "3d"
+allow_billable = false        # Anton flips this after approving the first live test
 
-## 3. Ownership, configuration and state
+[s3]
+remote = "devbox-backups:"    # rclone remote name; credentials live in rclone config
+bucket = "devbox-backups"
+age_recipient = "age1..."     # public key; the private key is kept offline
 
-### Filesystem layout
+[cloudflare]
+api_token_file = "~/.config/devbox/cloudflare.token"
+account_id = "..."
+zone = "example.com"
 
-- `/root/code/devbox/`: source, tests, templates, docs and the versioned skill.
-- `~/.config/devbox/config.toml`: trusted operator policy and credential references.
-- `~/.local/state/devbox/registry.sqlite3`: project registry and operation journal (respect XDG overrides).
-- `~/.local/state/devbox/locks/`: global and project locks.
-- `~/.local/state/devbox/known_hosts`: isolated SSH host-key registry.
-- `~/.local/state/devbox/recovery/`: temporary recovery artifacts, with configurable disk limits.
-- Each managed application's `devbox.toml`: declarative runtime settings without secrets.
-- Encrypted external backup: consistent registry export, code recovery artifacts and application data as applicable.
+[projects.crm]
+path = "/root/code/crm"
+idle_timeout = "3d"
+preview_public = true         # only operator config can turn public previews on
+```
 
-CLI owns registry updates. Cloud providers remain authoritative for actual resources; `reconcile` compares registry intent with provider observations. Hermes memory never stores operational state as the source of truth.
+### Project config: `devbox.toml` in the repository (untrusted)
 
-### Registry model
+```toml
+compose_file = "compose.yaml"
+health_url = "http://localhost:3000/health"
+exclude = ["node_modules", "dist", ".next"]
 
-Use versioned SQLite migrations, transactions, foreign keys and constrained statuses. Store:
+[preview]
+service_port = 3000
+hostname = "crm-dev"          # becomes crm-dev.<zone>
 
-- Projects: immutable UUID, unique name, canonical local path, repo URL, branch and trusted config digest.
-- Resources: provider ID, ownership labels, type, region, IPs, SSH identity reference and observed state.
-- Operations: UUID, project, kind, stage, intended request fingerprint, external action ID, timestamps and error category.
-- Snapshots: image ID, parent operation, creation time, disk size, architecture, readiness and restore-test results.
-- Backups: object key/version, manifest, checksum, encryption metadata reference and verification result.
-- Runtime jobs: remote job ID, PID/start identity or runner record, heartbeat, lease and exit status.
-- Preview mapping, lifecycle, last meaningful activity, last successful save and pricing observations.
-- Approval receipts tied to a specific plan/config digest, not a universal unchecked boolean.
+[[backup]]
+type = "postgres"
+service = "db"
+database = "crm"
 
-Never store API keys, SSH private keys, database passwords or tunnel tokens in the registry or JSON logs. Back up SQLite with its backup API rather than copying a live database file blindly.
+[[backup]]
+type = "files"
+path = "uploads"
 
-### Configuration trust
+[secrets]
+required = ["DATABASE_URL", "SESSION_SECRET"]
+```
 
-Repository configuration and scripts are untrusted input. Operator policy caps instance size/count, spending and remote capabilities. A repository cannot authorize public exposure, raise limits or request credential access. Import/approval explicitly records trusted configuration; changes to security-sensitive settings invalidate that approval.
+The repository config describes how to run the app. It cannot raise limits, choose a server type above the operator maximum, enable public previews, or point at credentials. Unknown keys are an error.
 
-## 4. Code workflow: local primary, remote runtime
+### Secrets
 
-1. Register the existing local repository; do not move or rewrite it.
-2. Bootstrap a remote project directory from its Git baseline. Use short-lived read-only repository credentials when necessary; never copy a personal GitHub token or forward the host SSH agent.
-3. Build a sync manifest including tracked files, eligible untracked files, deletions, commit/branch and content digests.
-4. Exclude `.git`, dependency directories, build output and credentials by default. Provision explicitly approved runtime secrets separately.
-5. Validate canonical local and remote roots. Preview deletions; never blindly run broad rsync `--delete` on an unchecked directory.
-6. Detect remote changes against the last successful sync manifest. Fail on divergent edits rather than silently overwriting either copy.
-7. On remote changes, offer a diff and explicit `sync pull`; stage downloaded files separately before applying them locally.
-8. Preserve selected dirty/untracked source files, binary changes, deletion manifest and Git metadata to a verified recovery bundle before archiving. Do not depend on a text patch alone.
-9. Git commits and pushes remain explicit operations. Never force-push or reset dirty worktrees automatically.
+The values are stored on Hermes in `~/.config/devbox/secrets/<project>.env.age`. On `start`/`resume` they are decrypted in memory and written over SSH to `/run/devbox/<project>.env` on the devbox (tmpfs), where Compose reads them. `/run` is cleared on shutdown, so snapshots do not contain them. The tunnel token is handled the same way.
 
-Builds, dependency installation, application servers, Compose and database tools execute remotely. CLI never silently falls back to local execution. Local execution is reserved for management, lightweight validation and bounded streaming/transfer work.
+## 4. Registry
 
-## 5. CLI contract (proposed, not implemented)
+SQLite at `~/.local/state/devbox/registry.sqlite3`, with a schema version and simple numbered migrations.
 
-All commands support stable exit codes and structured `--json` output. Mutations support a side-effect-free `--dry-run`; provider reads may occur but no writes. Non-interactive invocations fail clearly if approval is missing.
+- `projects`: uuid, name, local path, git remote and branch (informational), status, idle timeout, last activity, current server id, server type, location, ipv4, preview hostname.
+- `operations`: uuid, project, kind, stage, started/finished, error. Written before each provider call and updated after it.
+- `snapshots`: hetzner image id, project, operation uuid, created, size, `ready` / `restore_tested`, role (`baseline` / `latest` / `previous`).
+- `backups`: project, operation uuid, object key, sha256, size, kind, verified.
+- `jobs`: detached remote jobs (systemd unit name, started, last seen).
 
-- `devbox init PROJECT --path PATH`: register and validate configuration without provisioning.
-- `devbox create PROJECT`: create once and bootstrap; reject duplicates.
-- `devbox start PROJECT`: reuse, start a stopped VM, or restore/create when absent.
-- `devbox resume PROJECT`: restore the latest eligible snapshot; fail clearly if none exists.
-- `devbox status [PROJECT]`: lifecycle, observed resources, backups, snapshots, preview, runtime and estimated costs.
-- `devbox sync PROJECT [push|pull]`: manifest-based synchronization with conflict protection.
-- `devbox exec PROJECT -- COMMAND [ARG ...]`: tracked remote execution with timeout and exit status.
-- `devbox logs PROJECT`: bounded remote application/runner logs.
-- `devbox backup PROJECT`: independently back up and verify configured persistent data.
-- `devbox save PROJECT`: preserve code/data, stop cleanly, create snapshot; keep VM, mark stopped/saved.
-- `devbox stop PROJECT`: graceful service/VM shutdown without a new save; warn it remains billable.
-- `devbox archive PROJECT`: save and verify, then delete owned VM; retain persistent resources.
-- `devbox destroy PROJECT`: show an exact deletion plan and require explicit confirmation; persistent deletions need separately enumerated approval.
-- `devbox reconcile [PROJECT]`: recover interrupted operations and discover only owned resources.
-- `devbox maintenance`: deterministic idle/cost/recovery checks for a systemd timer.
-- `devbox backup restore-test PROJECT`: restore selected backups to an isolated remote test database.
+No secrets in the registry. `devbox registry export` writes a consistent copy (SQLite backup API), which `archive` uploads to S3 next to the backups so the registry can be rebuilt if the Hermes host is lost.
 
-Validate remote arguments and use a fixed remote runner protocol rather than trusting shell interpolation. General remote execution is intentionally capable of running arbitrary application code, not a claimed security sandbox. Reject management-host targets, localhost/loopback, host IPs, unexpected project roots and unowned cloud resources.
+**Locking:** every mutating command takes one global `flock` (`~/.local/state/devbox/lock`). With at most one VM, running all mutations one at a time is enough and rules out duplicate servers. Read-only commands (`status`, `logs`) do not lock.
 
-## 6. Lifecycle, idempotency and recovery
+## 5. Lifecycle
 
-Lifecycle: `registered -> provisioning -> bootstrapping -> running -> saving -> stopped -> archiving -> archived`. `restoring` transitions from archived to running; failures record a recoverable operation stage rather than pretending completion.
+States: `registered`, `running`, `stopped`, `archived`, `failed`, `destroyed`.
 
-- Persist operation intent before provider mutations.
-- Acquire global capacity/provisioning lock plus project lock in fixed order.
-- Label all supported cloud resources with tool owner, project UUID and operation UUID.
-- When an API request times out after submission, reconcile by action ID/ownership labels before any retry. Ambiguous outcomes block new provisioning.
-- Recover cloud actions already completed if the process died before recording success.
-- Never delete unrelated resources or infer ownership from a display name alone.
-- Reconcile a successful delete followed by a local crash to archived without issuing unrelated cleanup.
+| Command | From | To | What happens |
+|---|---|---|---|
+| `init` | – | registered | Validate path and both configs. No cloud calls. |
+| `create` | registered | running | Estimate cost, create SSH key, firewall and server with cloud-init, wait for cloud-init, push code, write secrets, `compose up`, health check. A `baseline` snapshot is taken on the first successful `archive`. |
+| `start` | registered | running | Same as `create`. |
+| `start` | stopped | running | Power on, push code, write secrets, `compose up`, health check. |
+| `start` / `resume` | archived | running | Create a server from the latest `ready` snapshot, then as above. If health passes, mark the snapshot `restore_tested`. |
+| `start` | running | running | Reuse. Never create a second server. |
+| `stop` | running | stopped | `compose down`, power off. Warns that a stopped server is still billed. |
+| `save` | running/stopped | same | See section 6. |
+| `archive` | running/stopped | archived | `save`, then delete the server and verify it is gone. |
+| `destroy` | any | destroyed | Prints the exact list of resources; needs `--confirm <project>`. Snapshots, backups and DNS/tunnel are only deleted with `--delete-snapshots`, `--delete-backups`, `--delete-preview`. |
 
-### Save/archive sequence
+Any step that fails moves the project to `failed` with the operation stage recorded. Running `reconcile` (or the next mutating command, which runs it first) works out what really happened.
 
-1. Lock, reconcile and validate server identity; report health and degraded state.
-2. Block new remote jobs; wait for active work or require explicit cancellation.
-3. Detect and preserve local/remote code differences without overwriting either copy.
-4. Quiesce writers and run database-native consistent dumps plus declared file-data backups.
-5. Upload encrypted backups and code recovery bundles; verify manifest and read-back checksums.
-6. Stop services gracefully, shut down VM, and create a snapshot through the verified provider workflow.
-7. Wait for action success/image readiness, then record `ready` (not `restore-tested`).
-8. Keep baseline and previous known-good restore point; no automatic persistent deletions without approved retention policy.
-9. For `save`, keep the stopped, billable server. For `archive`, delete only the exact owned VM after persistence gates pass; verify deletion before marking archived.
-10. Report saved artifacts, restore-test status, deleted resources and remaining storage charges.
+**Reconcile:** list all labeled servers and images in Hetzner and compare them with the registry and any unfinished operation. Typical cases:
+- Server created but not recorded: adopt it.
+- Snapshot created after a crash: find it by its `devbox-operation` label and record it instead of creating a new one.
+- Server deleted after a crash: mark the project archived.
+- Unexpected labeled server: report it and block provisioning; never delete it automatically.
 
-Failed backup/snapshot/code preservation blocks deletion. Permit saving an unhealthy application through an explicit recovery path; health failure must not make data rescue impossible. Attached Volumes are unsupported in v1 unless explicit backup/restore hooks cover them; never imply the VM snapshot protects them.
+Provider calls that time out are never retried blindly. Reconcile first.
 
-## 7. Snapshots and independent S3 backups
+## 6. Save, archive and restore
 
-Snapshots capture a stopped root disk, not RAM/process state. Restore restarts services and verifies health. Match architecture and minimum disk constraints; never assume restoration to a smaller machine is supported.
+`save`:
+1. Lock, reconcile, check the server is reachable. If the app is unhealthy, continue only with `--force-unhealthy`, so data can still be rescued.
+2. Refuse if a detached job is running, unless `--cancel-jobs` is given.
+3. Compare remote files with the manifest from the last push. Remote-only changes are copied to `~/.local/state/devbox/recovery/<project>/<timestamp>/` and listed. Local files are never overwritten.
+4. For each `[[backup]]`: `pg_dump -Fc` (via `docker compose exec`) or `tar` of the path, streamed over SSH, through `age` on Hermes, straight into `rclone rcat`. Nothing is written to Hermes's disk.
+5. Verify every backup: `rclone cat` it back, compare sha256, decrypt and run `pg_restore --list` or `tar -t`. If any backup fails, stop here; the server is not touched.
+6. `compose down`, power off, create a snapshot labeled with the operation uuid, and wait until it is `available`.
+7. Record the snapshot as `latest` and move the old `latest` to `previous`. Delete snapshots older than that only if they are neither `baseline` nor the newest `restore_tested` snapshot. The only known-good restore point is never deleted.
+8. Power the server back on unless `--off` was given.
 
-- Track `ready`, `restore-tested`, `failed` and previous eligible snapshot separately.
-- Prefer latest restore-tested snapshot; permit a newer ready-only image with an honest warning and fallback path.
-- Provide an explicitly approved, billable restore drill to prove recoverability.
-- Restore only backups newer than or explicitly paired with a snapshot; never overwrite newer snapshot data with an older dump blindly.
+`archive` is `save --off`, then registry export to S3, then server delete, then verifying the server is gone. If any step before the delete fails, the server stays and the error is reported.
 
-S3 backend is included in v1, with configurable endpoint, region, bucket and prefix. Selection/creation of a real bucket is a separate setup step.
+**Restore** (`resume`, or `start` on an archived project): create a server from the newest `ready` snapshot. If it fails to come up healthy, offer the previous snapshot. Data in the snapshot already matches its backups (they were taken in the same operation), so backups are only restored with `devbox backup restore PROJECT --from <operation>`, for example after a broken database.
 
-- Start with explicit PostgreSQL dump/restore support and declared file paths; detect other databases and require hooks instead of assuming a generic copy is safe.
-- Every persistent dataset must have a declared strategy or be explicitly marked disposable before archival.
-- Use bounded streams or direct scoped uploads; do not fill the small Hermes host disk or load dumps into RAM.
-- Keep broad S3 credentials on the controller; avoid permanent storage keys in devbox snapshots.
-- Use maintained encryption tooling (e.g. age) with a public encryption recipient and recovery-key handling documented before deployment; never invent cryptography.
-- Verify an uploaded object by read-back checksum and archive readability; an ETag alone is not a general content checksum. Distinguish integrity verification from an actual database restore test.
-- Export registry and code recovery artifacts to external storage. Document how to recover a lost Hermes host using registry backup and cloud labels.
-- Automatic maintenance never prunes the only known-good recovery point.
+## 7. Remote execution
 
-Snapshots may contain application secrets on disk. Minimize persistent secret material, restrict snapshot access and document rotation/reinjection after restore. Never claim snapshots are secret-free without verification.
+- `devbox exec PROJECT [--timeout 30m] [--detach] -- CMD ARGS...` runs over SSH as the `dev` user in `/srv/app`. Arguments are quoted with `shlex.join`; the project and server come from the registry, never from the arguments.
+- SSH runs with `-o StrictHostKeyChecking=yes` and a project-specific `known_hosts`. The host key is generated by Hermes per project and injected through cloud-init (`ssh_keys`), so it is known before the first connection and stays the same after a snapshot restore.
+- The SSH target must be a server whose id and IP match the registry and that carries the project's labels. Loopback, the Hermes host's own IPs and unknown hosts are rejected.
+- If SSH fails, the command fails with a clear error and a non-zero exit code. There is no code path that runs the command locally.
+- `--detach` starts the command with `systemd-run --unit devbox-job-<id>` on the devbox, so long builds survive a dropped connection and the idle check can see them.
+- `devbox logs PROJECT [--service X] [--lines 200]` runs `docker compose logs --tail`.
+- `devbox sync PROJECT` pushes code without restarting anything. `devbox pull PROJECT` copies remote-only changes into the recovery folder (see section 6).
+- All commands write one JSON line per operation to `~/.local/state/devbox/log.jsonl`, with secret values masked. All commands support `--json` and `--dry-run` (reads allowed, no writes to provider, registry or devbox).
 
-## 8. Hetzner bootstrap, security and costs
+## 8. Cost management
 
-- Dedicated Hetzner project/token; least privilege available for required operations.
-- Discover current economical EU server types, images, availability and prices; prefer an economical 2 vCPU/4 GB option without hardcoding obsolete products.
-- Ubuntu LTS, Docker Engine/Compose, cloud-init completion checks and non-root application/runner account.
-- SSH key-only access restricted to controller addresses, no public database/Docker API ports, no host Docker socket inside untrusted containers.
-- Pin/verify SSH host identity through a documented bootstrap mechanism; fail on unexpected changes. Snapshot clones require host-key identity handling, not global StrictHostKeyChecking bypass.
-- Do not copy cloud-management credentials onto the devbox. Use scoped preview/repository credentials only where required.
-- Resolve live estimates before provisioning and show server, snapshot and any other relevant charges separately, with currency/tax assumptions.
-- Configurable maximum instance class, concurrency, monthly warning threshold and optional maximum runtime. Threshold warning is not a provider-enforced hard budget.
-- Stopped VMs remain billable; deletion stops ordinary VM charges, not retained storage charges.
-- Credentials and command output receive best-effort redaction; arbitrary application output cannot be guaranteed secret-free. Avoid logging sensitive arguments altogether.
+- Prices come from `hcloud server-type list -o json` and the snapshot price, not hardcoded.
+- `create`/`start`/`resume` print the hourly and monthly estimate before provisioning. If `allow_billable = false` they stop there.
+- `status` shows uptime, cost so far this month (from registry operation timestamps), snapshot storage cost, and warns when the server is stopped but still billed.
+- Warnings for runtime over `max_runtime_warning` and for an estimated month over `monthly_warning_eur`. These are warnings, not a hard budget.
+- Server types above `max_server_type` are refused.
 
-## 9. Cloudflare v1: deliberately public previews
+## 9. Idle archival
 
-- Named per-project tunnel plus explicit hostname under a configured domain; no wildcard DNS.
-- Run cloudflared on the devbox with outbound connections; keep application ports private.
-- Public HTTPS without Access is approved as the requested v1 design, not permission to expose production or arbitrary services.
-- Require trusted per-project `preview.public = true`, an exact hostname/service mapping, and an explicit preview configuration step. Mark status clearly as public/unauthenticated.
-- Use synthetic development data. Warn that the URL is not an authentication mechanism; avoid exposing admin/debug endpoints without application protection.
-- Archive disconnects the connector but preserves DNS/tunnel configuration for resume. Do not overwrite unrelated DNS records.
-- Restore reinjects or rotates scoped connector credentials where needed.
-- Verify DNS mapping, tunnel state and HTTPS response before claiming preview availability.
-- Cloudflare is optional per project; core CLI works without credentials.
-- Domain/zone/account and token scopes remain setup inputs, not guessed values.
+- A systemd timer runs `devbox maintenance` every 15 minutes.
+- Activity is any devbox command for the project, or a detached job that `systemctl is-active` reports as running.
+- When a project has been inactive longer than its `idle_timeout`, maintenance runs `archive` with exactly the same checks as the manual command.
+- If archive fails, the server is kept, the failure is logged, and maintenance waits 24 hours before trying that project again.
+- `idle_timeout = "off"` disables it per project.
 
-## 10. Idle archival and maintenance
+## 10. Cloudflare previews
 
-- Default `idle_timeout = "3d"`, with per-project override and explicit disable option.
-- systemd timer invokes `devbox maintenance`; agent conversation activity is not required.
-- Track meaningful CLI activity plus remote runner jobs and heartbeats. Background web servers do not keep a box alive forever.
-- Long builds/tests protect against idle archival. Handle stale leases with remote process reconciliation; do not equate a missing heartbeat with permission to delete.
-- Preview traffic can optionally count as activity; off by default to avoid crawlers extending lifetime indefinitely.
-- Lock and recheck activity immediately before archival to avoid a race with a new job.
-- Automatic archival uses exactly the same verified persistence gates as manual archival.
-- Report failures, keep the VM and avoid tight repeated retry loops. Keep notifications separate from the CLI core.
+- Optional. Without `[cloudflare]` config, everything else works.
+- On first `start` with `[preview]`: create a remotely managed tunnel `devbox-<project>` through the API, set its ingress to `http://localhost:<service_port>`, and create a proxied CNAME `<hostname>.<zone>`. Refuse if that DNS name already exists and was not created by devbox (tracked in the registry). No wildcard records.
+- Refuse unless `preview_public = true` is set for the project in operator config. `status` shows the URL marked `PUBLIC, no authentication`.
+- The tunnel token is written to the devbox like other secrets, and cloudflared runs as a systemd service there.
+- `archive` leaves the tunnel and DNS in place; the connector stops with the VM. `resume` reconnects it.
+- `start` reports the preview as working only after an HTTPS request to the hostname succeeds.
+- The Cloudflare token needs only Tunnel edit on the account and DNS edit on the zone.
 
-## 11. Proposed implementation files
+## 11. Hermes skill
+
+`skills/hetzner-devbox/SKILL.md` in this repository, symlinked to `~/.hermes/skills/hetzner-devbox/`. It contains:
+
+- **When to start a devbox:** only to run things (Compose, servers, databases, production builds, integration tests, large installs) or when the user asks. Editing, reading code, Git and small checks stay local.
+- **Never run heavy commands on the Hermes host.** Use `devbox exec` instead.
+- **Ask Anton first** before using `--allow-second-vm`, `--force-unhealthy`, `--delete-*`, `destroy`, or changing `allow_billable` / `preview_public`.
+- **Phrase mapping:**
+
+| Anton says | Hermes runs |
+|---|---|
+| "Starta utvecklingsmiljön för CRM" | `devbox start crm`, then gives the preview URL |
+| "Ändra layouten på CRM-dashboarden" | Edits locally, no devbox command |
+| "Starta appen så jag kan testa ändringarna" | `devbox start crm` (pushes code), then gives the preview URL |
+| "Vi är klara för idag" | `devbox archive crm`, then reports what was saved and the remaining storage cost |
+| "Fortsätt med CRM" | `devbox start crm` (restores from snapshot) |
+
+## 12. Files
 
 ```text
 PLAN.md
 README.md
 pyproject.toml
-.gitignore
-src/devbox/__init__.py
 src/devbox/__main__.py
-src/devbox/cli.py
-src/devbox/config.py
-src/devbox/policy.py
-src/devbox/state.py
-src/devbox/locks.py
-src/devbox/operations.py
-src/devbox/reconcile.py
-src/devbox/sync.py
-src/devbox/remote.py
-src/devbox/backups.py
-src/devbox/snapshots.py
-src/devbox/maintenance.py
-src/devbox/costs.py
-src/devbox/providers/hetzner.py
-src/devbox/providers/cloudflare.py
-src/devbox/providers/s3.py
+src/devbox/cli.py          # argparse, --json, --dry-run, exit codes
+src/devbox/config.py       # operator + project config, trust rules
+src/devbox/registry.py     # SQLite schema, migrations, export, lock
+src/devbox/hcloud.py       # hcloud subprocess wrapper, labels, prices
+src/devbox/remote.py       # ssh, rsync, exec, logs, secrets push
+src/devbox/backup.py       # dump -> age -> rclone, verification, restore
+src/devbox/lifecycle.py    # create/start/stop/save/archive/resume/destroy/reconcile
+src/devbox/cloudflare.py   # tunnel + DNS via urllib
+src/devbox/maintenance.py  # idle check, cost warnings
 src/devbox/templates/cloud-init.yaml
-src/devbox/templates/remote-runner.py
-examples/devbox.toml
-examples/config.toml
-contrib/systemd/devbox-maintenance.service
-contrib/systemd/devbox-maintenance.timer
 skills/hetzner-devbox/SKILL.md
-skills/hetzner-devbox/references/workflows.md
-docs/architecture.md
-docs/recovery.md
-docs/security.md
-tests/conftest.py
-tests/test_cli.py
-tests/test_config.py
-tests/test_policy.py
-tests/test_state.py
-tests/test_lifecycle.py
-tests/test_reconcile.py
-tests/test_sync.py
-tests/test_remote.py
-tests/test_backups.py
-tests/test_snapshots.py
-tests/test_cloudflare.py
-tests/test_maintenance.py
-tests/test_costs.py
+contrib/systemd/devbox-maintenance.{service,timer}
+examples/config.toml
+examples/devbox.toml
+docs/setup.md              # tokens, rclone, age keys, firewall IP, install
+docs/recovery.md           # rebuilding Hermes state from S3 + labels
+tests/fakes/hcloud         # fake hcloud executable backed by a JSON file
+tests/fakes/ssh            # fake ssh/rsync that run against a temp directory
+tests/test_*.py
 ```
 
-Split files only when warranted; these are component boundaries, not a requirement for empty abstractions. No generic provider/plugin framework or daemon in v1.
+## 13. Milestones
 
-## 12. Ordered implementation work packages
+Each milestone is test-first and ends with a commit. Nothing before milestone 7 calls a real provider.
 
-These packages are sequencing boundaries. Implement each as small test-first changes: write a failing test, run it, add minimal implementation, run focused tests and commit. Expectations below are future acceptance criteria, not claimed test results.
+1. **Preflight and skeleton.** Check Python, hcloud, rsync, age and rclone on Hermes; read the current Hermes skill docs and `hcloud --help`. Write findings to `docs/setup.md`. Create the package, CLI with `--help`, `--json`, exit codes, config loading and trust rules, registry with migrations and lock.
+2. **Hetzner adapter and reconcile.** The `hcloud` wrapper with labels, JSON parsing and timeouts; the fake hcloud executable; dry-run; reconcile including crash-after-create and crash-after-snapshot cases.
+3. **Create, start, stop, status, exec, logs, sync.** Cloud-init template (Docker, `dev` user, firewall, host key), SSH and rsync, secrets push, Compose up/down, health check, detached jobs, cost estimate.
+4. **Backups, save, archive, resume, destroy.** The backup pipeline and verification, snapshot rotation, delete gating, restore from snapshot with fallback, destroy confirmation.
+5. **Cloudflare previews.** Tunnel and DNS creation, ownership checks, connector service, HTTPS check.
+6. **Maintenance, skill and docs.** Idle archival, cost warnings, systemd units, SKILL.md, README with the Swedish phrase examples, setup and recovery docs. Run the full test suite and a dry-run walkthrough.
+7. **Live acceptance (only after Anton approves).** Show the estimated cost, server type, location, bucket and hostname first. Then: create, push dirty code, start a sample app with Postgres, check the public URL, write data, archive, confirm the server is gone, resume, check code, data and URL, archive again. Report the remaining snapshots, backups, DNS records and their monthly cost.
 
-### A. Read-only preflight and contracts
+## 14. Tests
 
-Inspect actual OS/resources, Python, Git, SSH/rsync/hcloud versions, Hermes skill discovery and existing credentials by names/presence only. Verify current official command/API semantics. Record findings in `docs/architecture.md`, including snapshot readiness and billable resource behavior. Do not touch unrelated infrastructure.
+All run offline with the fake executables. Required cases from the gist, plus the ones this design adds:
 
-### B. Package and CLI skeleton
+- First-time create; start on a running project reuses the server
+- Restore from snapshot; fallback to the previous snapshot when the newest is unhealthy
+- No duplicate servers: two `start` calls in parallel processes, and two projects against `max_vms = 1`
+- SSH connection failure; host key mismatch; remote execution never falls back to localhost
+- Compose/Docker build failure; unhealthy app blocks save without `--force-unhealthy`
+- Backup failure and checksum mismatch block snapshot and delete
+- Snapshot creation failure; crash after snapshot (found by label, not duplicated)
+- Interrupted archive at each stage, then reconcile
+- Destroy without `--confirm` deletes nothing; snapshots and backups survive without `--delete-*`
+- Rotation never removes the baseline or the newest restore-tested snapshot
+- Idle: exactly 3 days, override, `off`, running detached job, failed archive backs off
+- Repository config cannot enable public preview or raise limits
+- Dry-run changes nothing in the fake provider, registry or remote directory
+- Secret values do not appear in logs or the registry
 
-Create `pyproject.toml`, `src/devbox/{__init__,__main__,cli}.py`, `tests/test_cli.py`. Verify `python -m pytest tests/test_cli.py -q`, editable installation in an isolated environment, `devbox --help`, JSON errors and exit codes. No cloud calls for help/config validation.
+## 15. Needed before live setup
 
-### C. Configuration, trust and policy
+- Dedicated Hetzner project and API token
+- S3 bucket and rclone remote; age key pair, with the private key stored offline
+- Cloudflare account id, zone, and a scoped API token
+- A sample project with `devbox.toml`, health endpoint and secrets
+- Monthly warning amount and maximum server type
+- Anton's explicit approval for the first billable test
 
-Create `config.py`, `policy.py`, example TOML and focused tests. Validate schemas, paths, three-day default/project override, public-preview opt-in and policy precedence. Reject repository attempts to elevate policy or select management credentials.
+## 16. Not in v1
 
-### D. Registry and locking
-
-Create `state.py`, `locks.py`, registry migration tests and subprocess concurrency tests. Prove atomic updates, rollback, consistent registry export and global/project lock ordering. Race two projects against a single-VM capacity limit.
-
-### E. Provider adapter and dry-run
-
-Create `providers/hetzner.py` with an injected command runner and fake hcloud executable. Parse actual documented JSON contracts, bound timeouts and verify resource ownership. Test uncertain POST outcomes, no duplicate retries and zero writes in dry-run.
-
-### F. Operations and reconciliation
-
-Create `operations.py`, `reconcile.py`, lifecycle tests. Simulate crashes before/after each external mutation, then restart against persistent fake provider state. Prove recovery without duplicate creation and exact-target deletion.
-
-### G. Bootstrap and remote execution
-
-Create cloud-init, remote runner and `remote.py`. Test host validation, SSH key mismatch, timeout, exit propagation, disconnect/reconnect and long-job tracking. Include injection/path traversal tests. No command may fall back to the local machine.
-
-### H. Git baseline and conflict-aware sync
-
-Create `sync.py` and tests using isolated local Git repos/fake remote directories. Cover dirty/untracked/binary files, deletions, excluded credentials, remote divergence, staged pull and resumable code recovery bundles. Prove no force push or implicit commit.
-
-### I. Remote Compose and health
-
-Implement explicit start/stop/log/health actions through the runner, and test Compose failures, unhealthy applications and bounded logs. Host never runs a real application build or database during tests.
-
-### J. S3 backups and recovery
-
-Create `backups.py`, `providers/s3.py`, database/file hooks and tests. Verify encryption invocation, streaming limits, multipart interruption, read-back hash failure, unreadable archives and registry recovery. Archive fails closed on undeclared persistent data or missing/unverified backup.
-
-### K. Snapshot save/restore/archive
-
-Create `snapshots.py` and lifecycle coverage. Test ready-only vs restore-tested images, architecture/disk mismatch, interrupted image creation, clean shutdown, backup/snapshot failure, fallback retention and crash after VM deletion. Stopped state is not archived.
-
-### L. Cloudflare previews
-
-Create `providers/cloudflare.py` and tests with mocked API/connector. Cover hostname ownership, no wildcard records, public-mode approval, existing unrelated DNS, unavailable tunnel, reconnection and verified HTTPS status. No real DNS writes during unit tests.
-
-### M. Idle and cost management
-
-Create `maintenance.py`, `costs.py`, systemd templates and tests with an injected clock. Cover three-day boundary, overrides/disable, active jobs, stale leases, new-job race, stopped-VM billing, cost warnings and failed persistence. Timer installation is an explicit setup step.
-
-### N. Skill, documentation and full offline verification
-
-Create the thin versioned Hermes skill and operator/recovery docs. Skill invokes CLI only; no duplicated lifecycle logic or global terminal backend change. Document explicit installation into the active profile without modifying another profile. Run the full mocked suite and dry-run walkthrough; report exact results and remaining limits.
-
-### O. Explicitly approved live acceptance
-
-Only after approval: show current estimated spend, chosen instance/region, backup location, hostname and planned resource changes. Create one devbox, sync dirty code, start a sample app, verify public HTTPS, write persistent test data, back up/save/archive, confirm VM deletion, restore, check data/code/preview and archive again. A second restore VM must not bypass the one-VM limit. Report residual snapshots/DNS/storage and costs; do not delete persistent artifacts without approval.
-
-## 13. Required acceptance evidence
-
-- Unit/integration tests with mocked cloud services run without real tokens or provider writes.
-- Real subprocess concurrency proves no duplicate servers across projects.
-- Failure injection demonstrates recoverability for every persistence/destruction boundary.
-- Dry-run leaves provider state and project/runtime state unchanged (diagnostic logs may be written separately).
-- Command-routing tests prove remote failure cannot execute heavy commands locally.
-- Code sync/recovery tests cover uncommitted and remote-only work without data loss.
-- Backup integrity and actual restore success are reported separately.
-- Public preview creation/restore and exact provider deletions are verified by reading the target back.
-- Independent recovery instructions exist for loss of the Hermes controller.
-- Final report distinguishes implemented, mocked-tested, live-tested and unimplemented features; no fabricated test output.
-
-## 14. Inputs needed before live setup (not blockers for planning)
-
-- Dedicated Hetzner project/token and SSH identity.
-- Cloudflare account/zone/domain, hostname convention and scoped API credentials.
-- S3 endpoint/bucket/prefix, credential reference and encryption recipient/recovery key ownership.
-- Initial sample project, runtime secrets, health endpoint, persistent datasets and backup hooks.
-- Monthly warning amount/currency and maximum approved instance class.
-- Explicit approval for the first billable test and any required external account changes.
-
-## 15. Non-goals for v1
-
-No general IDE, agent hosting platform, Kubernetes, arbitrary provider marketplace, production deployment controller, multi-controller HA or automatic database-engine inference claimed as safe backup. The project must remain a small, composable management tool rather than a new cloud platform.
+Two-way live sync, Hetzner Volumes, databases other than PostgreSQL without a custom hook, restore drills on a separate VM, Cloudflare Access, notifications, hard spending limits, more than one controller, production deployments.
