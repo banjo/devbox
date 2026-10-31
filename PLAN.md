@@ -17,11 +17,14 @@ The CLI does not know how any project is built. It only manages the server and r
 
 ```toml
 hcloud_token_file = "~/.config/devbox/hcloud.token"  # dedicated Hetzner project
-server_type = "cx23"
-location = "fsn1"
 image = "ubuntu-24.04"
 ssh_key = "~/.ssh/devbox"                            # created with ssh-keygen if missing
+# server_type / location: optional defaults, normally left out
 ```
+
+### Choosing a server
+
+Hetzner regularly sells out of server types in some locations, so the server is not fixed in config. `devbox server-types` reads `hcloud server-type list` and `hcloud location list` and prints every type/location that can be ordered now (per-location `available` flag, not deprecated), cheapest first, with vCPU, RAM, disk, architecture, network zone and price. The agent picks one (cheapest available with at least 2 vCPU / 4 GB near the user by default), tells the user the price, and asks before `devbox up NAME --type T --location L`. If the choice is sold out, `up` refuses and lists the cheapest comparable alternatives.
 
 ## 3. Registry
 
@@ -84,7 +87,8 @@ Next time the agent reads the notes first and does not have to work it out again
 | `devbox project list` | Lists projects and whether each has a server. |
 | `devbox project notes NAME [--set TEXT \| --set-file F]` | Shows or replaces the project's notes. |
 | `devbox project remove NAME` | Forgets a project that has no server. |
-| `devbox up NAME` | Creates the server if none is running (waits for cloud-init), then syncs code. Runs no project commands. Running it again reuses the server and only syncs. |
+| `devbox server-types [--min-cores N] [--min-memory GB] [--arch x86\|arm] [--location L] [--zone Z] [--all]` | Lists server types that can be ordered now, cheapest first. |
+| `devbox up NAME [--type T --location L]` | Creates the server if none is running (waits for cloud-init), then syncs code. Runs no project commands. Running it again reuses the server and only syncs. |
 | `devbox sync NAME` | Copies local code to the server. |
 | `devbox exec NAME -- CMD...` | Runs a command in `/srv/app` on the server, waits for it, and returns its exit code. |
 | `devbox exec NAME --detach --name PROC -- CMD...` | Starts a long-running command (dev server, `compose up` in the foreground, watcher) as a systemd unit `devbox-PROC`. Replaces a running process with the same name. |

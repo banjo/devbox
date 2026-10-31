@@ -1,11 +1,15 @@
 # ~/.config/devbox/config.toml
-# Only hcloud_token_file is required. The other values are the defaults.
+# Only hcloud_token_file is required.
 
 hcloud_token_file = "~/.config/devbox/hcloud.token"
-server_type = "cx23"
-location = "fsn1"
+
+# Optional defaults for `devbox up` when --type/--location are not given.
+# Leave them out to let the agent pick from `devbox server-types` each time.
+# server_type = "cx23"
+# location = "fsn1"
+
 image = "ubuntu-24.04"
 ssh_key = "~/.ssh/devbox"
 
-# CIDRs allowed to SSH into devboxes. "auto" = this host's public IPv4.
+# CIDRs allowed to SSH into devboxes. "auto" = this machine's public IPv4.
 ssh_allow = ["auto"]

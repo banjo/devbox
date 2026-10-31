@@ -17,7 +17,7 @@ On the machine where the agent runs:
    $EDITOR ~/.config/devbox/hcloud.token
    ```
 
-3. Write `~/.config/devbox/config.toml`. Every key is optional except the token file; the defaults are shown in [`examples/config.toml`](examples/config.toml).
+3. Write `~/.config/devbox/config.toml`. Only the token file is required; see [`examples/config.toml`](examples/config.toml) for the other keys.
 
    ```toml
    hcloud_token_file = "~/.config/devbox/hcloud.token"
@@ -55,7 +55,8 @@ devbox project notes NAME                 show the notes on how to run it
 devbox project notes NAME --set TEXT      replace them (or --set-file FILE, - for stdin)
 devbox project remove NAME                forget a project
 
-devbox up NAME [--force]                  create or reuse the server, sync code
+devbox server-types [filters]             server types that can be ordered now, cheapest first
+devbox up NAME --type T --location L      create (or reuse) the server, sync code
 devbox sync NAME                          copy local code to the server
 devbox exec NAME -- CMD...                run a command in /srv/app and wait
 devbox exec NAME --detach --name P -- CMD start a background process P
@@ -73,6 +74,7 @@ All commands accept `--json`. `exec` runs a single argument as a shell script (`
 ## How it works
 
 - State lives in SQLite at `~/.local/state/devbox/devbox.db`. Hetzner is the source of truth for which servers exist; `up`, `status` and `down` reconcile against servers labeled `managed-by=devbox`.
+- Hetzner often sells out of server types in some locations, so the server is chosen per `up` rather than fixed in config. `devbox server-types` lists what is available now (filters: `--min-cores`, `--min-memory`, `--arch`, `--location`, `--zone`, `--all`), and `up` rejects a sold-out choice and suggests the cheapest alternatives. Availability is Hetzner's indicator, not a guarantee. Optional `server_type`/`location` defaults can go in the config.
 - One server at a time. `up --force` allows a second one.
 - Servers run Ubuntu with Docker + Compose, `mise`, `cloudflared`, `git` and build tools. Everything runs as root in `/srv/app`.
 - Sync is `rsync --delete` that skips `.git` and anything in `.gitignore`, so `node_modules` and `.env` on the server are left alone.

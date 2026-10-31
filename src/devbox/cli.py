@@ -12,7 +12,7 @@ from importlib import resources
 from pathlib import Path
 
 from devbox import DevboxError, config, db
-from devbox.hetzner import Hcloud
+from devbox.hetzner import Hcloud, filter_offers
 from devbox.remote import TUNNEL, Remote, to_script, validate_proc
 
 
@@ -187,9 +187,79 @@ def resolve_ssh_allow(entries: list[str]) -> list[str]:
     return cidrs
 
 
+def describe_offer(o: dict) -> str:
+    where = ", ".join(x for x in (o["city"], o["country"]) if x)
+    price = f"€{o['price_monthly']:.2f}/mo" if o["price_monthly"] is not None else "price ?"
+    return (
+        f"{o['type']} in {o['location']} ({where}): {o['cores']} vCPU, {o['memory_gb']:g} GB RAM, "
+        f"{o['disk_gb']} GB disk, {o['architecture']}, {price}"
+    )
+
+
+def choose_offer(ctx: Context) -> dict:
+    server_type = ctx.args.type or ctx.cfg.server_type
+    location = ctx.args.location or ctx.cfg.location
+    if not server_type or not location:
+        raise DevboxError(
+            "no server chosen: run `devbox server-types` and pass --type and --location"
+        )
+    offers = ctx.hcloud.offers()
+    for o in offers:
+        if o["type"] == server_type and o["location"] == location:
+            if o["available"] is False:
+                break
+            return o
+    else:
+        if not any(o["type"] == server_type for o in offers):
+            raise DevboxError(f"unknown server type '{server_type}'; see `devbox server-types`")
+
+    wanted = next((o for o in offers if o["type"] == server_type), None)
+    alternatives = filter_offers(
+        offers,
+        min_cores=wanted["cores"] if wanted else None,
+        min_memory=wanted["memory_gb"] if wanted else None,
+    )[:5]
+    lines = [f"{server_type} is not available in {location}. Cheapest available alternatives:"]
+    lines += [f"  {describe_offer(o)}" for o in alternatives] or ["  none found"]
+    raise DevboxError("\n".join(lines))
+
+
+def cmd_server_types(ctx: Context) -> int:
+    a = ctx.args
+    offers = filter_offers(
+        ctx.hcloud.offers(),
+        min_cores=a.min_cores,
+        min_memory=a.min_memory,
+        architecture=a.arch,
+        location=a.location,
+        network_zone=a.zone,
+        include_unavailable=a.all,
+    )
+    lines = [
+        f"{'TYPE':<8} {'LOC':<5} {'ZONE':<13} {'CPU':>3} {'RAM':>5} {'DISK':>5} {'ARCH':<5} {'€/MONTH':>8} {'€/HOUR':>7}  NOTE"
+    ]
+    for o in offers:
+        note = []
+        if o["available"] is False:
+            note.append("unavailable")
+        elif o["available"] is None:
+            note.append("availability unknown")
+        if o["recommended"]:
+            note.append("recommended")
+        monthly = f"{o['price_monthly']:.2f}" if o["price_monthly"] is not None else "?"
+        hourly = f"{o['price_hourly']:.4f}" if o["price_hourly"] is not None else "?"
+        lines.append(
+            f"{o['type']:<8} {o['location']:<5} {o['network_zone'] or '?':<13} {o['cores']:>3} "
+            f"{o['memory_gb']:>4g}G {o['disk_gb']:>4}G {o['architecture']:<5} {monthly:>8} {hourly:>7}  {', '.join(note)}"
+        )
+    emit(ctx.args, offers, "\n".join(lines) if offers else "no matching server types")
+    return 0
+
+
 def cmd_up(ctx: Context) -> int:
     name = ctx.args.name
     cfg = ctx.cfg
+    offer = None
     with ctx.lock():
         project = db.require_project(ctx.conn, name)
         orphans = ctx.reconcile()
@@ -204,17 +274,18 @@ def cmd_up(ctx: Context) -> int:
                     f"another devbox server is running ({', '.join(others)}); "
                     "stop it with `devbox down` or pass --force"
                 )
+            offer = choose_offer(ctx)
             public_key = ensure_local_ssh_key(cfg.ssh_key)
             ctx.hcloud.ensure_ssh_key(public_key)
             ctx.hcloud.ensure_firewall(resolve_ssh_allow(cfg.ssh_allow))
 
-            print(f"creating {cfg.server_type} in {cfg.location} for {name}...", file=sys.stderr)
+            print(f"creating {describe_offer(offer)} for {name}...", file=sys.stderr)
             user_data = resources.files("devbox").joinpath("cloud-init.yaml").read_text()
             with tempfile.NamedTemporaryFile("w", suffix=".yaml") as f:
                 f.write(user_data)
                 f.flush()
                 info = ctx.hcloud.create_server(
-                    f"devbox-{name}", name, cfg.server_type, cfg.image, cfg.location, Path(f.name)
+                    f"devbox-{name}", name, offer["type"], cfg.image, offer["location"], Path(f.name)
                 )
             db.insert_server(
                 ctx.conn, name, info["id"], "creating",
@@ -238,10 +309,12 @@ def cmd_up(ctx: Context) -> int:
         "created": created,
         "server": row(server),
         "has_notes": bool(project["notes"].strip()),
+        "offer": offer,
         "warnings": warnings,
     }
     text = [
-        f"{name}: {'created' if created else 'reusing'} server {server['hetzner_id']} at {server['ip']}, code synced",
+        f"{name}: {'created' if created else 'reusing'} server {server['hetzner_id']} "
+        f"({server['server_type']} in {server['location']}) at {server['ip']}, code synced",
         *(f"warning: {w}" for w in warnings),
     ]
     if not data["has_notes"]:
@@ -433,8 +506,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name")
     p.set_defaults(func=cmd_project_remove)
 
+    p = add("server-types", cmd_server_types, "list server types that can be ordered, cheapest first")
+    p.add_argument("--min-cores", type=int, metavar="N")
+    p.add_argument("--min-memory", type=float, metavar="GB")
+    p.add_argument("--arch", choices=["x86", "arm"])
+    p.add_argument("--location", help="e.g. fsn1, nbg1, hel1, ash, hil, sin")
+    p.add_argument("--zone", help="network zone, e.g. eu-central, us-east, us-west, ap-southeast")
+    p.add_argument("--all", action="store_true", help="include types that are currently unavailable")
+
     p = add("up", cmd_up, "create or reuse the server and sync code")
     p.add_argument("name")
+    p.add_argument("--type", help="server type for a new server (see `devbox server-types`)")
+    p.add_argument("--location", help="location for a new server (see `devbox server-types`)")
     p.add_argument("--force", action="store_true", help="allow a second devbox server")
 
     p = add("down", cmd_down, "delete the server")

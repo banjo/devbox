@@ -78,6 +78,13 @@ class Hcloud:
     def delete_server(self, server_id: int) -> None:
         self.run("server", "delete", str(server_id), parse=False)
 
+    # Server types and locations
+
+    def offers(self) -> list[dict]:
+        types = self.run("server-type", "list", "-o", "json") or []
+        locations = self.run("location", "list", "-o", "json") or []
+        return build_offers(types, locations)
+
     # SSH key and firewall
 
     def ensure_ssh_key(self, public_key: str) -> None:
@@ -125,6 +132,83 @@ def firewall_rules(ssh_cidrs: list[str]) -> list[dict]:
             "description": "ssh from devbox controller",
         }
     ]
+
+
+def build_offers(server_types: list[dict], locations: list[dict]) -> list[dict]:
+    """One entry per (server type, location) that can be ordered, cheapest first.
+
+    `available` is Hetzner's current stock indicator; it is not a guarantee, and
+    is None when the hcloud version does not report it.
+    """
+    loc_info = {loc["name"]: loc for loc in locations}
+    offers = []
+    for st in server_types:
+        if st.get("deprecation") or st.get("deprecated"):
+            continue
+        prices = {p["location"]: p for p in st.get("prices") or []}
+        for loc in st.get("locations") or []:
+            if loc.get("deprecation"):
+                continue
+            name = loc["name"]
+            price = prices.get(name, {})
+            info = loc_info.get(name, {})
+            offers.append({
+                "type": st["name"],
+                "location": name,
+                "city": info.get("city"),
+                "country": info.get("country"),
+                "network_zone": info.get("network_zone"),
+                "cores": st.get("cores"),
+                "memory_gb": st.get("memory"),
+                "disk_gb": st.get("disk"),
+                "architecture": st.get("architecture"),
+                "cpu_type": st.get("cpu_type"),
+                "category": st.get("category"),
+                "price_hourly": _price(price.get("price_hourly")),
+                "price_monthly": _price(price.get("price_monthly")),
+                "available": loc.get("available"),
+                "recommended": loc.get("recommended"),
+            })
+    offers.sort(key=lambda o: (o["price_monthly"] is None, o["price_monthly"] or 0, o["type"], o["location"]))
+    # Older hcloud versions do not know the field and report false everywhere.
+    if offers and not any(o["available"] for o in offers):
+        for o in offers:
+            o["available"] = None
+    return offers
+
+
+def filter_offers(
+    offers: list[dict],
+    min_cores: int | None = None,
+    min_memory: float | None = None,
+    architecture: str | None = None,
+    location: str | None = None,
+    network_zone: str | None = None,
+    include_unavailable: bool = False,
+) -> list[dict]:
+    result = []
+    for o in offers:
+        if not include_unavailable and o["available"] is False:
+            continue
+        if min_cores and (o["cores"] or 0) < min_cores:
+            continue
+        if min_memory and (o["memory_gb"] or 0) < min_memory:
+            continue
+        if architecture and o["architecture"] != architecture:
+            continue
+        if location and o["location"] != location:
+            continue
+        if network_zone and o["network_zone"] != network_zone:
+            continue
+        result.append(o)
+    return result
+
+
+def _price(p: dict | None) -> float | None:
+    if not p:
+        return None
+    value = p.get("gross") or p.get("net")
+    return float(value) if value is not None else None
 
 
 def server_info(s: dict) -> dict:

@@ -19,8 +19,9 @@ def state_dir() -> Path:
 @dataclass
 class Config:
     hcloud_token_file: Path | None = None
-    server_type: str = "cx23"
-    location: str = "fsn1"
+    # Optional defaults for `devbox up`. When unset, the agent picks from `devbox server-types`.
+    server_type: str | None = None
+    location: str | None = None
     image: str = "ubuntu-24.04"
     ssh_key: Path = field(default_factory=lambda: Path.home() / ".ssh" / "devbox")
     # CIDRs allowed to reach SSH on devboxes. "auto" means this host's public IPv4.

@@ -38,9 +38,21 @@ Do **not** use it for reading or editing code, Git, or small checks such as lint
 
 1. `devbox project list`. If the project is missing, find its local folder and run `devbox project add NAME --path PATH`.
 
+### Choosing a server
+
+Hetzner often runs out of server types in some locations, so pick from what is available right now instead of assuming a type.
+
+1. `devbox server-types --min-cores 2 --min-memory 4` lists what can be ordered now, cheapest first, with location, network zone, architecture and price. Add `--zone eu-central` (or `us-east`, `us-west`, `ap-southeast`) to stay in a region, `--arch x86` if the project needs x86 images.
+2. Pick a sensible default: the cheapest available type with at least 2 vCPU and 4 GB RAM, close to the user (same network zone as before, if you know it). Use more for heavy projects (large builds, several containers, a database plus a dev server); the notes can say what the project needs.
+3. Tell the user what you picked and the monthly price, and ask before creating it. Ask them to choose if the options differ in a way that matters: a different region, ARM instead of x86, or noticeably higher price.
+4. If `up` says the type is not available, it lists the cheapest alternatives. Pick one and ask again if it changes region or price noticeably.
+5. If the project needs a certain size or architecture, record it in the notes (for example "needs 8 GB RAM; x86 only because of image X").
+
+A config default (`server_type`/`location` in `~/.config/devbox/config.toml`) is used when `--type`/`--location` are left out. Still check availability with `devbox server-types` first.
+
 ### Starting a project
 
-1. `devbox status NAME`. If there is no server, ask the user, then `devbox up NAME`. `up` waits for the server and syncs the code. It does not start anything.
+1. `devbox status NAME`. If there is no server, choose one (see below), ask the user, then `devbox up NAME --type TYPE --location LOC`. `up` waits for the server and syncs the code. It does not start anything.
 2. `devbox project notes NAME`.
    - **Notes exist:** follow them.
    - **No notes:** read the project to work out what it needs: README, `package.json` scripts, `compose.yaml`/`docker-compose.yml`, `Makefile`, `Dockerfile`, `.env.example`, `.tool-versions`, `.nvmrc`, `mise.toml`, `pyproject.toml` and so on.
@@ -85,7 +97,7 @@ Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/a
 
 | The user says | Do |
 |---|---|
-| "Start the app so I can test it" | Ask if no server is running, `up`, follow or work out the notes, `expose`, give the URL |
+| "Start the app so I can test it" | If no server is running, pick an available server type, ask, `up`; then follow or work out the notes, `expose`, give the URL |
 | "Change the dashboard layout" | Edit locally; `sync` if a server is running |
 | "Run the tests" | `devbox exec NAME -- 'npm test'` (or whatever the notes say) |
 | "Which servers are running?" | `devbox status` |
@@ -99,6 +111,7 @@ Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/a
 - Processes do not restart on their own. After a crash, check `logs` and run the same `exec --detach` again.
 - A new server has nothing installed: runtimes, `node_modules`, databases and `.env` must be set up again. Notes should say which steps that means.
 - If `exec` fails with an SSH error, run `devbox status`; the server may have been deleted.
+- ARM servers (`cax*`) are often cheaper, but some Docker images and native dependencies only exist for x86.
 - If `devbox status` shows a server that has been up a long time, remind the user that it still costs money.
 
 ## Verification

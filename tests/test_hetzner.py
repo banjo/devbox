@@ -97,3 +97,71 @@ def test_ssh_key_mismatch_is_an_error(fake_hcloud):
 def test_missing_hcloud_binary():
     with pytest.raises(DevboxError, match="hcloud CLI not found"):
         Hcloud(None, binary="/nonexistent/hcloud").list_servers()
+
+
+def server_type(name, cores, memory, arch, locations, deprecation=None):
+    return {
+        "name": name,
+        "cores": cores,
+        "memory": memory,
+        "disk": 40,
+        "architecture": arch,
+        "cpu_type": "shared",
+        "category": "cost_optimized",
+        "deprecation": deprecation,
+        "locations": [
+            {"name": loc, "available": avail, "recommended": False, "deprecation": None}
+            for loc, avail, _ in locations
+        ],
+        "prices": [
+            {
+                "location": loc,
+                "price_hourly": {"net": "0.0060", "gross": "0.0072"},
+                "price_monthly": {"net": str(price), "gross": str(price * 1.2)},
+            }
+            for loc, _, price in locations
+        ],
+    }
+
+
+LOCATIONS = [
+    {"name": "fsn1", "city": "Falkenstein", "country": "DE", "network_zone": "eu-central"},
+    {"name": "ash", "city": "Ashburn, VA", "country": "US", "network_zone": "us-east"},
+]
+
+TYPES = [
+    server_type("cx33", 4, 8.0, "x86", [("fsn1", True, 6.0)]),
+    server_type("cx23", 2, 4.0, "x86", [("fsn1", False, 4.0), ("ash", True, 5.0)]),
+    server_type("cax11", 2, 4.0, "arm", [("fsn1", True, 4.5)]),
+    server_type("cx22", 2, 4.0, "x86", [("fsn1", True, 1.0)], deprecation={"announced": "x"}),
+]
+
+
+def test_build_offers_sorted_by_price_without_deprecated():
+    from devbox.hetzner import build_offers
+
+    offers = build_offers(TYPES, LOCATIONS)
+    assert [(o["type"], o["location"]) for o in offers] == [
+        ("cx23", "fsn1"), ("cax11", "fsn1"), ("cx23", "ash"), ("cx33", "fsn1"),
+    ]
+    first = offers[0]
+    assert first["available"] is False
+    assert first["network_zone"] == "eu-central"
+    assert first["price_monthly"] == pytest.approx(4.8)
+
+
+def test_filter_offers():
+    from devbox.hetzner import build_offers, filter_offers
+
+    offers = build_offers(TYPES, LOCATIONS)
+    assert [o["type"] for o in filter_offers(offers)] == ["cax11", "cx23", "cx33"]
+    assert [o["type"] for o in filter_offers(offers, architecture="x86", network_zone="eu-central")] == ["cx33"]
+    assert [o["type"] for o in filter_offers(offers, min_memory=8)] == ["cx33"]
+    assert len(filter_offers(offers, include_unavailable=True)) == 4
+
+
+def test_no_available_flag_anywhere_means_unknown():
+    from devbox.hetzner import build_offers
+
+    types = [server_type("cx23", 2, 4.0, "x86", [("fsn1", False, 4.0)])]
+    assert build_offers(types, LOCATIONS)[0]["available"] is None
