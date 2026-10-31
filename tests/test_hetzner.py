@@ -255,3 +255,44 @@ def test_shutdown_falls_back_to_poweroff(tmp_path):
     hc.run = fake_run
     hc.shutdown(42)
     assert seen == [("server", "shutdown"), ("server", "poweroff")]
+
+
+def test_legacy_ssh_key_with_same_material_is_reused(fake_hcloud):
+    # Issue #4: earlier versions registered the key as "devbox" without a controller label.
+    hc, calls, respond = fake_hcloud
+    respond("ssh-key_list", [
+        {"id": 11, "name": "devbox", "public_key": "ssh-ed25519 AAAA old-comment", "labels": {"managed-by": "devbox"}},
+    ])
+    assert hc.ensure_ssh_key("ssh-ed25519 AAAA devbox") == 11
+    assert not any(c["args"][:2] in (["ssh-key", "create"], ["ssh-key", "add-label"]) for c in calls())
+
+
+def test_same_key_owned_by_this_controller_under_other_name_is_reused(fake_hcloud):
+    hc, _, respond = fake_hcloud
+    respond("ssh-key_list", [{"id": 12, "name": "mine", "public_key": "ssh-ed25519 AAAA", "labels": OWNED}])
+    assert hc.ensure_ssh_key("ssh-ed25519 AAAA devbox") == 12
+
+
+@pytest.mark.parametrize("labels, owner", [
+    ({}, "something other than devbox"),
+    ({"managed-by": "devbox", "devbox-controller": "other"}, "controller 'other'"),
+])
+def test_same_key_owned_by_someone_else_gives_actionable_error(fake_hcloud, labels, owner):
+    hc, calls, respond = fake_hcloud
+    respond("ssh-key_list", [{"id": 13, "name": "laptop", "public_key": "ssh-ed25519 AAAA", "labels": labels}])
+    with pytest.raises(DevboxError) as e:
+        hc.ensure_ssh_key("ssh-ed25519 AAAA devbox")
+    msg = str(e.value)
+    assert "'laptop' (id 13)" in msg and owner in msg
+    assert "hcloud ssh-key add-label --overwrite 13 managed-by=devbox devbox-controller=abc123" in msg
+    assert "ssh_key" in msg
+    assert not any(c["args"][:2] == ["ssh-key", "create"] for c in calls())
+
+
+def test_new_key_is_created_when_not_registered(fake_hcloud):
+    hc, calls, respond = fake_hcloud
+    respond("ssh-key_list", [{"id": 14, "name": "other", "public_key": "ssh-ed25519 ZZZZ", "labels": {}}])
+    respond("ssh-key_create", {"ssh_key": {"id": 15}})
+    assert hc.ensure_ssh_key("ssh-ed25519 AAAA devbox") == 15
+    create = calls()[-1]["args"]
+    assert create[:4] == ["ssh-key", "create", "--name", "devbox-abc123"]

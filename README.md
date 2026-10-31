@@ -46,7 +46,7 @@ On the machine where the agent runs:
 
 The first `devbox up` creates an SSH key at `~/.ssh/devbox` (if missing), uploads it to Hetzner, and creates a firewall that allows SSH only from this machine's public IP. Both are named `devbox-<controller id>`, where the controller id is a random id stored in `~/.local/state/devbox/controller-id` (or set with `controller_id` in the config).
 
-Upgrading from a version before controller ids: the old SSH key and firewall named `devbox` are no longer used and can be deleted in the Hetzner console once no server uses them. Running servers keep working.
+Upgrading from a version before controller ids: Hetzner allows each public key only once per project, so if your local key is already registered as the old `devbox` key (labeled `managed-by=devbox`, no controller label), devbox keeps using that key as it is. If the same public key is registered under another owner, `up` stops and tells you how to either label that key for this install or use a different `ssh_key`. The old firewall named `devbox` is no longer used and can be deleted in the Hetzner console once no server uses it. Running servers keep working.
 
 ## Commands
 
@@ -92,7 +92,7 @@ All commands accept `--json`. `exec` runs a single argument as a shell script (`
 - Servers run Ubuntu with Docker + Compose, `mise`, `cloudflared`, `git` and build tools. Everything runs as root in `/srv/app`.
 - Sync sends exactly the files Git sees in the working tree: tracked files plus untracked files that are not ignored, using Git's own ignore rules (so `!.env.example` style exceptions work). Ignored files on the server, such as `node_modules` and `.env`, are left alone. A file that was synced before and has since been deleted locally is deleted on the server too. Outside a Git repo, everything except `.git` is copied and nothing is deleted. Submodule contents are not synced.
 - Background processes are systemd units named `devbox-<name>`. They survive SSH disconnects; logs are in the journal.
-- `exec --timeout S` is enforced on the server: the command runs in its own systemd scope with `RuntimeMaxSec`, so after S seconds systemd sends SIGTERM to every process in it and SIGKILL 10 seconds later, even if the SSH connection is gone. `exec` then exits with 124. Containers started in the background (`docker compose up -d`, `docker run -d`) belong to Docker, not the scope, and keep running. Without `--timeout`, a foreground command keeps running on the server if the connection drops.
+- `exec --timeout S` is enforced on the server: the command runs in its own systemd scope with `RuntimeMaxSec`, so after S seconds systemd sends SIGTERM to every process in it and SIGKILL 10 seconds later, even if the SSH connection is gone. `exec` checks the scope's result on the server and then exits with 124 (`timed_out: true` with `--json`); a real SSH failure is still reported as one. Containers started in the background (`docker compose up -d`, `docker run -d`) belong to Docker, not the scope, and keep running. Without `--timeout`, a foreground command keeps running on the server if the connection drops.
 - Previews use a Cloudflare quick tunnel: a public, random `*.trycloudflare.com` URL that changes whenever the tunnel restarts. No Cloudflare account and no open ports.
 - `down` deletes the server. Anything that exists only there (database contents, unsynced files) is gone.
 

@@ -118,20 +118,74 @@ def test_exec_timeout_runs_in_scope_with_runtime_limit(monkeypatch):
     assert local_timeout > 2
 
 
-def test_exec_timeout_reports_and_verifies_stop(monkeypatch):
-    r = Remote("192.0.2.1", Path("/key"), Path("/kh"))
-    calls = []
-    clock = iter([0.0, 5.0])
-    monkeypatch.setattr(remote_mod.time, "monotonic", lambda: next(clock))
+class ScopeServer:
+    """Fake `_ssh` for timed exec: the command's exit code and the scope's systemd state."""
 
-    def fake_ssh(remote_cmd, *a, **kw):
-        calls.append(remote_cmd)
+    def __init__(self, returncode, result=None, active=False, reachable=True):
+        self.returncode = returncode
+        self.result = result
+        self.active = active
+        self.reachable = reachable
+        self.calls = []
+
+    def __call__(self, remote_cmd, *a, **kw):
+        self.calls.append(remote_cmd)
         if "systemd-run --scope" in remote_cmd:
-            return subprocess.CompletedProcess([], 143, "", "")
-        # is-active: scope is gone
-        return subprocess.CompletedProcess([], 3, "", "")
+            assert kw.get("raise_on_255") is False
+            return subprocess.CompletedProcess([], self.returncode, "partial out", "")
+        if not self.reachable:
+            from devbox import DevboxError
+            raise DevboxError("ssh to 192.0.2.1 failed")
+        if "show -p Result" in remote_cmd:
+            return subprocess.CompletedProcess([], 0, f"{self.result}\n" if self.result else "", "")
+        if "is-active" in remote_cmd:
+            return subprocess.CompletedProcess([], 0 if self.active else 3, "", "")
+        return subprocess.CompletedProcess([], 0, "", "")
 
-    monkeypatch.setattr(r, "_ssh", fake_ssh)
-    result = r.exec("sleep 10", timeout=1)
+
+def remote_with(monkeypatch, server):
+    r = Remote("192.0.2.1", Path("/key"), Path("/kh"))
+    monkeypatch.setattr(r, "_ssh", server)
+    return r
+
+
+@pytest.mark.parametrize("code", [255, 143, 137])
+def test_exec_timeout_is_reported_as_timeout(monkeypatch, code):
+    # OpenSSH exits 255 when the remote command is killed by a signal.
+    server = ScopeServer(code, result="timeout")
+    result = remote_with(monkeypatch, server).exec("sleep 5", timeout=2, capture=True)
     assert result.timed_out
-    assert any("is-active" in c for c in calls)
+    assert result.stdout == "partial out"
+    assert "--collect" not in server.calls[0]
+    assert any("reset-failed" in c for c in server.calls)
+
+
+def test_exec_real_ssh_failure_is_still_an_error(monkeypatch):
+    from devbox import DevboxError
+
+    server = ScopeServer(255, reachable=False)
+    with pytest.raises(DevboxError, match="ssh to 192.0.2.1 failed"):
+        remote_with(monkeypatch, server).exec("true", timeout=2)
+
+
+def test_exec_connection_lost_while_still_running(monkeypatch):
+    from devbox import DevboxError
+
+    server = ScopeServer(255, result="success", active=True)
+    with pytest.raises(DevboxError, match="still running"):
+        remote_with(monkeypatch, server).exec("sleep 60", timeout=30)
+
+
+def test_exec_killed_by_something_else(monkeypatch):
+    from devbox import DevboxError
+
+    server = ScopeServer(255, result="signal")
+    with pytest.raises(DevboxError, match="killed on the server"):
+        remote_with(monkeypatch, server).exec("sleep 60", timeout=30)
+
+
+def test_exec_normal_exit_codes_pass_through(monkeypatch):
+    server = ScopeServer(17)
+    result = remote_with(monkeypatch, server).exec("exit 17", timeout=30)
+    assert result.returncode == 17 and not result.timed_out
+    assert not any("show -p Result" in c for c in server.calls)

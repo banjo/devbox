@@ -15,6 +15,8 @@ APP_DIR = "/srv/app"
 UNIT_PREFIX = "devbox-"
 EXEC_UNIT_PREFIX = "devbox-exec-"
 EXEC_KILL_AFTER = 10
+# Exit codes of a command killed by a signal: ssh reports 255, a shell 128+N.
+SIGNAL_EXITS = (255, 128 + 15, 128 + 9, -15, -9)
 TUNNEL = "tunnel"
 PROC_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
 TUNNEL_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
@@ -121,6 +123,7 @@ class Remote:
         timeout: float | None = 120,
         connect_timeout: int = 10,
         input: str | None = None,
+        raise_on_255: bool = True,
     ) -> subprocess.CompletedProcess:
         cmd = self.ssh_cmd(remote, connect_timeout=connect_timeout)
         try:
@@ -134,7 +137,7 @@ class Remote:
             )
         except subprocess.TimeoutExpired:
             raise DevboxError(f"remote command timed out after {timeout}s")
-        if proc.returncode == 255:
+        if proc.returncode == 255 and raise_on_255:
             detail = (proc.stderr or "").strip() if capture else ""
             raise DevboxError(f"ssh to {self.ip} failed{': ' + detail if detail else ''}")
         if check and proc.returncode != 0:
@@ -148,6 +151,7 @@ class Remote:
         With a timeout, the command runs in its own systemd scope with
         RuntimeMaxSec, so the server itself stops it (SIGTERM to every process
         in the scope, SIGKILL after 10s) even if the SSH connection is lost.
+        Whether the deadline was hit is read back from the scope's result.
         """
         if timeout is None:
             proc = self.run(script, capture=capture, check=False, timeout=None)
@@ -155,14 +159,18 @@ class Remote:
 
         secs = max(1, math.ceil(timeout))
         unit = f"{EXEC_UNIT_PREFIX}{secrets.token_hex(4)}"
+        # No --collect: a scope stopped by RuntimeMaxSec stays loaded as failed
+        # with Result=timeout until reset-failed, so it can be checked below.
         remote = (
-            f"cd {APP_DIR} && systemd-run --scope --quiet --collect --unit {unit} "
+            f"cd {APP_DIR} && systemd-run --scope --quiet --unit {unit} "
             f"-p RuntimeMaxSec={secs}s -p TimeoutStopSec={EXEC_KILL_AFTER}s "
             f"--setenv=HOME=/root bash -lc {shlex.quote(script)}"
         )
-        started = time.monotonic()
         try:
-            proc = self._ssh(remote, capture=capture, check=False, timeout=secs + EXEC_KILL_AFTER + 30)
+            proc = self._ssh(
+                remote, capture=capture, check=False, timeout=secs + EXEC_KILL_AFTER + 30,
+                raise_on_255=False,
+            )
         except DevboxError as e:
             if "timed out" not in str(e):
                 raise
@@ -171,11 +179,39 @@ class Remote:
             raise DevboxError(
                 f"no response {secs}s after the deadline; remote command {state} (scope {unit})"
             )
-        elapsed = time.monotonic() - started
-        timed_out = elapsed >= secs and proc.returncode in (128 + 15, 128 + 9, -15, -9)
+
+        # Exit 255 is either an SSH failure or the remote command being killed
+        # by a signal (which is what a deadline does). Ask the server which.
+        result = self.scope_result(unit) if proc.returncode in SIGNAL_EXITS else None
+        timed_out = result == "timeout"
+        if proc.returncode == 255 and not timed_out:
+            detail = (proc.stderr or "").strip() if capture else ""
+            if result is None:
+                raise DevboxError(f"ssh to {self.ip} failed{': ' + detail if detail else ''}")
+            if not self.scope_gone(unit):
+                raise DevboxError(
+                    f"lost the connection; the command is still running on the server "
+                    f"and will be stopped at the deadline (scope {unit})"
+                )
+            self._ssh(f"systemctl reset-failed {unit}.scope 2>/dev/null; true", check=False, timeout=30)
+            raise DevboxError(f"the command was killed on the server (systemd result: {result})")
         if timed_out and not self.scope_gone(unit):
             self.stop_scope(unit)
+        self._ssh(f"systemctl reset-failed {unit}.scope 2>/dev/null; true", check=False, timeout=30)
         return ExecResult(proc.returncode, proc.stdout, proc.stderr, timed_out=timed_out)
+
+    def scope_result(self, unit: str) -> str | None:
+        """systemd's Result for an exec scope ('timeout', 'signal', ...), or None if unknown."""
+        try:
+            proc = self._ssh(
+                f"systemctl show -p Result --value {unit}.scope", check=False, timeout=30
+            )
+        except DevboxError:
+            return None
+        if proc.returncode != 0:
+            return None
+        value = (proc.stdout or "").strip()
+        return value or None
 
     def stop_scope(self, unit: str) -> bool:
         self._ssh(f"systemctl kill --signal=SIGKILL {unit}.scope 2>/dev/null; true", check=False, timeout=30)

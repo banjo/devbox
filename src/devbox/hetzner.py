@@ -209,6 +209,34 @@ class Hcloud:
             if not _same_key(key["public_key"], public_key):
                 raise DevboxError(f"Hetzner SSH key '{name}' does not match the local devbox key")
             return key["id"]
+
+        # Hetzner allows each public key only once per project, so the local key
+        # may already be registered under another name.
+        keys = self.run("ssh-key", "list", "-o", "json") or []
+        same = [k for k in keys if _same_key(k["public_key"], public_key)]
+        for k in same:
+            labels = k.get("labels") or {}
+            if self.owns(k):
+                return k["id"]
+            if labels.get("managed-by") == "devbox" and CONTROLLER_LABEL not in labels:
+                # Created by a devbox version before controller ids; reuse it unchanged.
+                return k["id"]
+        if same:
+            k = same[0]
+            labels = k.get("labels") or {}
+            if labels.get("managed-by") == "devbox":
+                owner = f"another devbox install (controller '{labels.get(CONTROLLER_LABEL)}')"
+            else:
+                owner = "something other than devbox"
+            raise DevboxError(
+                f"the local devbox SSH key is already registered in Hetzner as '{k['name']}' "
+                f"(id {k['id']}), owned by {owner}, and Hetzner does not allow the same key twice. "
+                f"Either point `ssh_key` in the devbox config at a different key, or, if that key "
+                f"may be used by this install, label it: "
+                f"hcloud ssh-key add-label --overwrite {k['id']} managed-by=devbox "
+                f"{CONTROLLER_LABEL}={self.controller_id}"
+            )
+
         data = self.run(
             "ssh-key", "create",
             "--name", name,
