@@ -1,3 +1,4 @@
+import json
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -66,6 +67,16 @@ MIGRATIONS = [
 
     ALTER TABLE servers ADD COLUMN snapshot_id INTEGER REFERENCES snapshots(id);
     ALTER TABLE projects ADD COLUMN idle_timeout TEXT;
+    """,
+    """
+    CREATE TABLE databases (
+      project     TEXT NOT NULL REFERENCES projects(name),
+      name        TEXT NOT NULL,
+      engine      TEXT NOT NULL,
+      settings    TEXT NOT NULL,
+      created_at  TEXT NOT NULL,
+      PRIMARY KEY (project, name)
+    );
     """,
 ]
 
@@ -423,3 +434,40 @@ def reconcile(conn: sqlite3.Connection, hetzner_servers: list[dict]) -> list[dic
         else:
             orphans.append(s)
     return orphans
+
+
+# Databases (for `devbox db dump/restore`)
+
+
+def add_database(conn: sqlite3.Connection, project: str, name: str, engine: str, settings: dict) -> None:
+    require_project(conn, project)
+    if not NAME_RE.match(name):
+        raise DevboxError(f"invalid database name '{name}': use lowercase letters, digits and dashes")
+    if get_database(conn, project, name):
+        raise DevboxError(f"{project} already has a database '{name}'; remove it first")
+    conn.execute(
+        "INSERT INTO databases (project, name, engine, settings, created_at) VALUES (?, ?, ?, ?, ?)",
+        (project, name, engine, json.dumps(settings, sort_keys=True), now()),
+    )
+
+
+def get_database(conn: sqlite3.Connection, project: str, name: str) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM databases WHERE project = ? AND name = ?", (project, name)
+    ).fetchone()
+    return _database(row) if row else None
+
+
+def list_databases(conn: sqlite3.Connection, project: str) -> list[dict]:
+    rows = conn.execute("SELECT * FROM databases WHERE project = ? ORDER BY name", (project,)).fetchall()
+    return [_database(r) for r in rows]
+
+
+def remove_database(conn: sqlite3.Connection, project: str, name: str) -> bool:
+    return conn.execute(
+        "DELETE FROM databases WHERE project = ? AND name = ?", (project, name)
+    ).rowcount > 0
+
+
+def _database(row) -> dict:
+    return {**dict(row), "settings": json.loads(row["settings"])}

@@ -119,6 +119,11 @@ Next time the agent reads the notes first and does not have to work it out again
 | `devbox doctor` | Read-only checks with fixes (issue #8). |
 | `devbox cleanup [--yes]` | Unused devbox resources and stale local files; deletes only with `--yes` (issue #8). |
 | `devbox history [NAME] [--limit N]` | Past servers and snapshots with cost and activity (issue #8). |
+| `devbox sync NAME --watch` | Poll for local changes and sync after each burst (issue #7). |
+| `devbox pull NAME [PATHS] [--all]` | Stage server-side changes locally for review (issue #7). |
+| `devbox forward NAME PORT...` | SSH port forwarding on 127.0.0.1 (issue #7). |
+| `devbox secrets set/list/unset/push` | Per-project env values, local 0600 file, merged into server env files on `up` (issue #7). |
+| `devbox db engines/add/list/remove/dump/restore` | Pluggable database engines (postgres, sqlite) with local dump files (issue #7). |
 
 All commands accept `--json` for output the agent can parse.
 
@@ -154,6 +159,9 @@ tests/test_remote.py     # Git-based sync file list and deletions, exec timeout 
 tests/test_costs.py      # billing math, period summaries, cost history
 src/devbox/costs.py      # cost estimates
 src/devbox/admin.py      # doctor, cleanup, history
+src/devbox/databases.py  # database engines
+src/devbox/envsecrets.py # per-project secrets
+src/devbox/watch.py      # polling watcher for sync --watch
 ```
 
 ## 7. The skill

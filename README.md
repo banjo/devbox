@@ -62,7 +62,19 @@ devbox server-types [filters]             server types that can be ordered now, 
 devbox up NAME [--type T --location L]    reuse the server, or create one (from the latest snapshot
                                           if there is one; --fresh for a clean image), sync code
 devbox resume NAME                        like up, but only from a snapshot
-devbox sync NAME                          copy local code to the server
+devbox sync NAME [--watch]                copy local code to the server (keep syncing on save with --watch)
+devbox pull NAME [PATHS...] [--all]       copy files that differ on the server into a local staging folder
+devbox forward NAME PORT...               forward local ports to the server (PORT or LOCAL:REMOTE)
+devbox secrets set NAME KEY=VALUE... [--file F] [--from-file F|-]
+                                          store env values locally; written to the server now and on every up
+devbox secrets list|unset|push NAME       show key names, forget keys, write to the server again
+devbox db engines                         supported database engines and their options
+devbox db add NAME DB --engine E --option K=V...
+                                          describe a project database (postgres, sqlite)
+devbox db list|remove NAME [DB]           databases and their latest dumps
+devbox db dump NAME [DB] [-o FILE]        dump a database from the server to a local file
+devbox db restore NAME [DB] [--file F] --yes
+                                          replace a database on the server with a dump
 devbox exec NAME [--timeout S] -- CMD...  run a command in /srv/app and wait
 devbox exec NAME --detach --name P -- CMD start a background process P
 devbox ps NAME                            list background processes
@@ -72,7 +84,7 @@ devbox expose NAME PORT                   public preview URL for PORT
 devbox ssh NAME                           shell on the server
 devbox status [NAME]                      servers, processes, preview URLs, cost so far
 devbox pause NAME                         snapshot the server, then delete it (= down --snapshot)
-devbox down NAME [--snapshot]             delete the server; prints its cost and activity
+devbox down NAME [--snapshot] [--dump]    delete the server (dumping databases first with --dump); prints cost and activity
 devbox touch NAME                         record activity so idle shutdown waits
 devbox idle-check [--dry-run]             pause/delete servers idle past their timeout (for cron)
 devbox snapshot list [NAME]               snapshots with size and cost
@@ -98,6 +110,21 @@ All commands accept `--json`. `exec` runs a single argument as a shell script (`
 - `exec --timeout S` is enforced on the server: the command runs in its own systemd scope with `RuntimeMaxSec`, so after S seconds systemd sends SIGTERM to every process in it and SIGKILL 10 seconds later, even if the SSH connection is gone. `exec` checks the scope's result on the server and then exits with 124 (`timed_out: true` with `--json`); a real SSH failure is still reported as one. Containers started in the background (`docker compose up -d`, `docker run -d`) belong to Docker, not the scope, and keep running. Without `--timeout`, a foreground command keeps running on the server if the connection drops.
 - Previews use a Cloudflare quick tunnel: a public, random `*.trycloudflare.com` URL that changes whenever the tunnel restarts. No Cloudflare account and no open ports.
 - `down` deletes the server. Anything that exists only there (database contents, unsynced files) is gone.
+
+### Development loop
+
+- `sync --watch` checks the files sync would send every second (`--interval`), waits until a burst of saves is over, and syncs. Every sync counts as activity for idle shutdown. Stop it with Ctrl-C.
+- `pull` lists the files on the server (skipping `.git`, `node_modules`, virtualenvs and caches), drops what Git ignores unless `--all` or explicit paths are given, and copies the ones whose content differs from the local copy into `~/.local/state/devbox/pulls/NAME/<time>/`. Nothing in the project is changed: review with `diff -ru`, then copy what you want. It also lists tracked local files that don't exist on the server.
+- `forward NAME 5432 15432:5432` runs SSH port forwarding bound to `127.0.0.1` until Ctrl-C, for local database tools and debuggers.
+- Secrets live in `~/.config/devbox/secrets/NAME.json` (mode 0600, folder 0700). They are **not encrypted**; like SSH keys they rely on file permissions. Values are never printed. `up` and `secrets set` write them into the chosen env files on the server, replacing only those keys and keeping every other line. Prefer `--from-file -` over `KEY=VALUE` arguments so values don't end up in shell history. `project remove` deletes a project's secrets.
+
+### Databases
+
+- Databases are described per project with an engine and options; `devbox db engines` lists them:
+  - `postgres`: `database` (required), `service` (Docker Compose service; omit to use `pg_dump` on the server), `user` (default `postgres`), `host`, `port`. Dumps use `pg_dump -Fc`; restores use `pg_restore --clean --if-exists --single-transaction`.
+  - `sqlite`: `path` (relative to the project). Uses the server's `python3` and SQLite's backup API, so no `sqlite3` CLI is needed and the copy is consistent while the app runs. A restore is checked with `PRAGMA integrity_check` before it replaces anything.
+- Dumps are streamed to `~/.local/state/devbox/dumps/NAME/DB-<time>.<ext>`; `restore` uses the latest one unless `--file` is given, and always needs `--yes`.
+- More engines are a small class in `src/devbox/databases.py`: options, a dump command that writes to stdout and a restore command that reads stdin.
 
 ### Snapshots, pause and resume
 

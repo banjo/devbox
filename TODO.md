@@ -22,16 +22,22 @@ Nothing below has run against Hetzner yet. Check each step and fix what breaks.
 - [ ] `idle-check` from cron/systemd timer pauses a server after the timeout, `touch` postpones it
 - [ ] `doctor` on a real setup: hcloud version, token, SSH key (owned/legacy/conflict), firewall IP drift, idle-check scheduling detection (cron and systemd)
 - [ ] `cleanup`: finds the old `devbox` firewall and orphaned servers/snapshots; `--yes` deletes only those; attached firewalls and foreign resources untouched
+- [ ] `sync --watch` on a real project: one sync per save burst, idle timer reset
+- [ ] `pull`: lockfile changed by `npm install` on the server and a new generated file show up; ignored output skipped; staging only contains differing files
+- [ ] `forward NAME 5432` with a local `psql`
+- [ ] `secrets set` before and after `up`: values land in the right env files, other lines kept, mode 600
+- [ ] `db dump/restore` with Postgres in Compose and with SQLite; `down --dump`; restore into a fresh server
 - [ ] Full agent run with the skill: a project with no notes goes from `up` to a working preview, the agent saves notes, then `down` and `up` again work from the notes alone
 
 ## Next
 
-- [ ] Database backups to S3
+- [ ] Database backups to S3 (dumps are local only for now)
+- [ ] More database engines (MySQL/MariaDB, Redis) in `databases.py`
+- [ ] Encrypt stored secrets (e.g. with `age`) instead of relying on file permissions
 - [ ] Fixed preview hostname with a named Cloudflare tunnel, optionally behind Cloudflare Access
 - [ ] Include primary IPv4 in cost estimates
 - [ ] Count preview traffic (tunnel requests) as activity for idle shutdown
 - [ ] Notify (email/webhook) when idle-check pauses a server or the budget is reached
-- [ ] Pull changes made on the server back to the local copy (`devbox pull`)
 - [ ] Run as a non-root user on the server and pin SSH host keys instead of `accept-new`
 
 ## Known limitations

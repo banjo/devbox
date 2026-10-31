@@ -63,8 +63,10 @@ Without `--type`/`--location`, `up` uses the config default, or else the project
    - `devbox exec NAME -- 'mise use -g node@22'` (mise is installed on the server)
    - `devbox exec NAME -- 'npm ci'`
 4. Create env files on the server if needed. Gitignored files such as `.env` are **not** synced, and sync never overwrites them on the server:
-   - `devbox exec NAME -- 'cp .env.example .env'`, then edit values with `sed` or a heredoc.
+   - `devbox exec NAME -- 'cp .env.example .env'` for non-secret defaults.
+   - Real secrets (API keys, passwords) go through `devbox secrets set NAME --file PATH --from-file -` with the values on stdin. They are stored locally and written into that env file on every `up`, so you only ask the user once. Never echo secret values back, and never put them in project notes.
    - Ask the user for any secrets you cannot derive. Never invent real credentials.
+   - If the project has a database worth keeping, register it once: `devbox db add NAME main --engine postgres --option service=db --option database=app` (or `--engine sqlite --option path=data/app.db`; see `devbox db engines`). Note it in the project notes.
 5. Start long-running things as named background processes. Bind dev servers to `0.0.0.0` or `localhost`:
    - `devbox exec NAME -- 'docker compose up -d'` (returns when containers have started)
    - `devbox exec NAME --detach --name web -- 'npm run dev -- --host 0.0.0.0'`
@@ -86,15 +88,17 @@ Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/a
 ### Development loop
 
 1. Edit locally.
-2. `devbox sync NAME`. Dev servers in watch mode pick up the change.
+2. `devbox sync NAME`. Dev servers in watch mode pick up the change. For long editing sessions you can run `devbox sync NAME --watch` in the background instead, which syncs on every save.
 3. If dependencies changed: `devbox exec NAME -- 'npm ci'`, then restart the process with the same `exec --detach --name web ...` command (it replaces the old one).
 4. Run tests with foreground `exec`: `devbox exec NAME -- 'npm test'`. Add `--timeout SECONDS` for anything that might hang; the server stops the command when time is up and `exec` exits with 124.
 5. Debug with `devbox logs NAME PROC` and `devbox exec`. For a broken preview, check `devbox logs NAME tunnel`.
+6. When commands on the server change files (lockfiles after `npm install`, generated migrations, formatter output), bring them back with `devbox pull NAME`. It only stages them; review with the printed `diff` command and copy what belongs in the repo. Never pull over local changes without checking.
+7. If the user wants to inspect the database or debug with a local tool, `devbox forward NAME 5432` (runs until stopped).
 
 ### Finishing
 
 1. Default: `devbox pause NAME`. It shuts the server down, saves a snapshot and deletes the server. Pass on the summary: how long it ran, its cost, the snapshot's size and monthly cost, and the project total.
-2. If the user wants nothing kept, remind them that `down` deletes the server and its data (for example the database), then `devbox down NAME` when they confirm. Existing snapshots stay unless deleted with `devbox snapshot delete IMAGE_ID`.
+2. If the user wants nothing kept, remind them that `down` deletes the server and its data (for example the database), then `devbox down NAME` when they confirm. `devbox down NAME --dump` saves registered databases locally first; `devbox db restore NAME --yes` puts the data back on a later server (ask before restoring: it replaces the data). Existing snapshots stay unless deleted with `devbox snapshot delete IMAGE_ID`.
 3. Code is always safe because it lives on this machine.
 
 ### Idle shutdown

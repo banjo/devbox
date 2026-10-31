@@ -3,6 +3,7 @@ import contextlib
 import fcntl
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -11,9 +12,9 @@ from datetime import datetime, timedelta, timezone
 from importlib import resources
 from pathlib import Path
 
-from devbox import DevboxError, admin, config, costs, db
+from devbox import DevboxError, admin, config, costs, databases, db, envsecrets, watch
 from devbox.hetzner import Hcloud, filter_offers
-from devbox.remote import TUNNEL, Remote, to_script, validate_proc
+from devbox.remote import PULL_PRUNE, TUNNEL, Remote, git_files, git_ignored, to_script, validate_proc
 
 
 EXIT_TIMEOUT = 124
@@ -217,6 +218,7 @@ def cmd_project_set(ctx: Context) -> int:
 
 def cmd_project_remove(ctx: Context) -> int:
     db.remove_project(ctx.conn, ctx.args.name)
+    envsecrets.SecretStore(config.config_dir(), ctx.args.name).delete_all()
     emit(ctx.args, {"name": ctx.args.name, "removed": True}, f"removed {ctx.args.name}")
     return 0
 
@@ -447,12 +449,14 @@ def cmd_up(ctx: Context) -> int:
             warnings.append(sync["warning"])
         ctx.event(server, "up")
         ctx.event(server, "sync")
+        secrets_written = push_secrets(ctx, server, name)
         server = db.active_server(ctx.conn, name)
 
     data = {
         "project": name,
         "created": created,
         "restored_from_snapshot": row(snapshot) if created and snapshot else None,
+        "secrets_written": secrets_written,
         "server": row(server),
         "has_notes": bool(project["notes"].strip()),
         "offer": offer,
@@ -472,6 +476,8 @@ def cmd_up(ctx: Context) -> int:
             f"  from snapshot taken {snapshot['created_at'][:16].replace('T', ' ')}: installed tools, "
             f"dependencies and data from then are back; background processes and the preview must be started again"
         )
+    if secrets_written:
+        text.append("  secrets written to " + ", ".join(f"{f} ({n} keys)" for f, n in secrets_written.items()))
     text += [f"warning: {w}" for w in warnings]
     if not data["has_notes"]:
         text.append(f"no notes for {name} yet; work out how to start it, then save them with `devbox project notes {name} --set ...`")
@@ -503,7 +509,8 @@ def server_summary(ctx: Context, server, snapshot=None, pruned=None) -> dict:
 
 ACTIVITY_LABELS = [
     ("sync", "sync"), ("exec", "exec"), ("exec_detach", "background start"),
-    ("expose", "expose"), ("up", "up"), ("touch", "touch"),
+    ("expose", "expose"), ("up", "up"), ("touch", "touch"), ("pull", "pull"),
+    ("forward", "port forward"), ("db_dump", "database dump"), ("db_restore", "database restore"),
 ]
 
 
@@ -597,9 +604,21 @@ def cmd_down(ctx: Context) -> int:
         if server is None:
             emit(ctx.args, {"project": name, "deleted": None}, f"{name} has no server")
             return 0
+        dumps = []
+        if getattr(ctx.args, "dump", False):
+            if server["status"] != "running":
+                raise DevboxError(f"server for {name} is not running; cannot dump databases")
+            dbs = db.list_databases(ctx.conn, name)
+            if not dbs:
+                raise DevboxError(f"{name} has no databases to dump; see `devbox db add`")
+            for database in dbs:
+                print(f"dumping {database['name']}...", file=sys.stderr)
+                dumps.append(dump_database(ctx, server, name, database))
         summary = take_down(ctx, server, snapshot, "pause" if snapshot else "down")
         remaining = db.latest_snapshot(ctx.conn, name)
+    summary["dumps"] = dumps
     lines = [f"{'paused' if snapshot else 'deleted'} server {server['hetzner_id']} for {name}", *summary_lines(summary)]
+    lines += [f"  dumped {d['database']} ({human_size(d['bytes'])}) to {d['path']}" for d in dumps]
     if not snapshot and remaining:
         lines.append(
             f"  note: snapshot {remaining['hetzner_image_id']} from {remaining['created_at'][:10]} is kept; "
@@ -927,16 +946,334 @@ def cmd_history(ctx: Context) -> int:
 
 
 def cmd_sync(ctx: Context) -> int:
+    name = ctx.args.name
+    server = ctx.running_server(name)
+    project = db.require_project(ctx.conn, name)
+    remote = ctx.remote(server)
+
+    def do_sync() -> dict:
+        result = remote.sync(project["path"], ctx.manifest(name))
+        ctx.event(server, "sync")
+        return result
+
+    def describe(result: dict) -> str:
+        if result["mode"] == "git":
+            return f"synced {result['files']} files, deleted {result['deleted']}"
+        return f"synced (warning: {result['warning']})"
+
+    result = do_sync()
+    if not ctx.args.watch:
+        emit(ctx.args, {"project": name, **result}, describe(result))
+        return 0
+
+    if ctx.args.interval <= 0:
+        raise DevboxError("--interval must be more than 0")
+    root = Path(project["path"])
+    print(f"{describe(result)}; watching {root} (Ctrl-C to stop)", file=sys.stderr)
+
+    def on_change(paths: list[str]) -> None:
+        shown = ", ".join(paths[:3]) + (f" and {len(paths) - 3} more" if len(paths) > 3 else "")
+        r = do_sync()
+        stamp = datetime.now().strftime("%H:%M:%S")
+        if ctx.args.json:
+            print(json.dumps({"at": stamp, "changed": paths, **r}), flush=True)
+        else:
+            print(f"{stamp} {shown}: {describe(r)}", flush=True)
+
+    try:
+        watch.watch(lambda: watch.snapshot(root), on_change, interval=ctx.args.interval)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def cmd_pull(ctx: Context) -> int:
+    name = ctx.args.name
+    server = ctx.running_server(name)
+    project = db.require_project(ctx.conn, name)
+    root = Path(project["path"])
+    remote = ctx.remote(server)
+
+    files = remote.list_files()
+    on_server = set(files)
+    if ctx.args.paths:
+        prefixes = [p.strip("/") for p in ctx.args.paths]
+        files = [f for f in files if any(f == p or f.startswith(p + "/") for p in prefixes)]
+    elif not ctx.args.all:
+        ignored = git_ignored(root, files)
+        if ignored:
+            files = [f for f in files if f not in ignored]
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    staging = ctx.cfg.state_dir / "pulls" / name / stamp
+    n = 1
+    while staging.exists():
+        n += 1
+        staging = staging.with_name(f"{stamp}-{n}")
+    pulled = remote.pull(files, staging, root) if files else []
+    if not pulled:
+        shutil.rmtree(staging, ignore_errors=True)
+
+    entries = [{"path": p, "change": "changed" if (root / p).exists() else "new"} for p in pulled]
+    missing = []
+    if not ctx.args.paths:
+        local = git_files(root) or []
+        missing = [f for f in local if f not in on_server and not any(part in PULL_PRUNE for part in Path(f).parts)]
+    ctx.event(server, "pull")
+
+    data = {"project": name, "staging": str(staging) if pulled else None, "files": entries, "missing_on_server": missing}
+    if not pulled:
+        lines = ["no files on the server differ from the local copy"]
+    else:
+        lines = [f"{len(pulled)} file(s) differ on the server; copied to {staging}"]
+        lines += [f"  {e['change']:<8} {e['path']}" for e in entries[:50]]
+        if len(entries) > 50:
+            lines.append(f"  ... and {len(entries) - 50} more")
+        lines.append(f"review with: diff -ru {root} {staging}   (new files show as 'Only in')")
+        lines.append(f"apply with:  rsync -a {staging}/ {root}/   (or copy single files)")
+    if missing:
+        lines.append(f"{len(missing)} local file(s) do not exist on the server (deleted there, or not synced yet):")
+        lines += [f"  {m}" for m in missing[:20]]
+    emit(ctx.args, data, "\n".join(lines))
+    return 0
+
+
+def parse_port_spec(spec: str) -> tuple[int, int]:
+    local, sep, remote_port = spec.partition(":")
+    if not sep:
+        remote_port = local
+    try:
+        ports = int(local), int(remote_port)
+    except ValueError:
+        raise DevboxError(f"invalid port '{spec}': use PORT or LOCAL:REMOTE, e.g. 5432 or 15432:5432")
+    if not all(1 <= p <= 65535 for p in ports):
+        raise DevboxError(f"invalid port '{spec}'")
+    return ports
+
+
+def cmd_forward(ctx: Context) -> int:
     server = ctx.running_server(ctx.args.name)
-    project = db.require_project(ctx.conn, ctx.args.name)
-    result = ctx.remote(server).sync(project["path"], ctx.manifest(ctx.args.name))
-    ctx.event(server, "sync")
-    text = (
-        f"synced {result['files']} files, deleted {result['deleted']}"
-        if result["mode"] == "git"
-        else f"synced (warning: {result['warning']})"
+    ports = [parse_port_spec(p) for p in ctx.args.ports]
+    ctx.event(server, "forward")
+    cmd = ctx.remote(server).forward_cmd(ports)
+    for local, remote_port in ports:
+        print(f"forwarding localhost:{local} -> {ctx.args.name}:{remote_port}", file=sys.stderr)
+    print("Ctrl-C to stop", file=sys.stderr)
+    try:
+        return subprocess.run(cmd).returncode
+    except KeyboardInterrupt:
+        return 0
+
+
+# Secrets
+
+
+def secret_store(ctx: Context, name: str) -> envsecrets.SecretStore:
+    return envsecrets.SecretStore(config.config_dir(), name)
+
+
+def push_secrets(ctx: Context, server, name: str) -> dict[str, int]:
+    """Write stored secrets into the server's env files. Returns file -> number of keys."""
+    files = secret_store(ctx, name).load()
+    remote = ctx.remote(server)
+    written = {}
+    for path, values in sorted(files.items()):
+        existing = remote.read_file(path) or ""
+        remote.write_file(path, envsecrets.merge_env(existing, values))
+        written[path] = len(values)
+    return written
+
+
+def cmd_secrets_set(ctx: Context) -> int:
+    name = ctx.args.name
+    db.require_project(ctx.conn, name)
+    values = dict(envsecrets.parse_assignment(a) for a in ctx.args.assignments)
+    if ctx.args.from_file:
+        text = sys.stdin.read() if ctx.args.from_file == "-" else Path(ctx.args.from_file).read_text()
+        values = {**envsecrets.parse_env(text), **values}
+    if not values:
+        raise DevboxError("nothing to set: pass KEY=VALUE or --from-file")
+    file = envsecrets.validate_file(ctx.args.file)
+    secret_store(ctx, name).set(file, values)
+    pushed = None
+    server = db.active_server(ctx.conn, name)
+    if server and server["status"] == "running" and not ctx.args.no_push:
+        pushed = push_secrets(ctx, server, name)
+    text = f"stored {len(values)} key(s) for {file}: {', '.join(sorted(values))}"
+    if pushed is not None:
+        text += "; written to the server"
+    emit(ctx.args, {"project": name, "file": file, "keys": sorted(values), "pushed": pushed is not None}, text)
+    return 0
+
+
+def cmd_secrets_list(ctx: Context) -> int:
+    name = ctx.args.name
+    db.require_project(ctx.conn, name)
+    summary = secret_store(ctx, name).summary()
+    lines = [f"{f}: {', '.join(keys)}" for f, keys in summary.items()]
+    emit(ctx.args, {"project": name, "files": summary}, "\n".join(lines) or f"no secrets stored for {name}")
+    return 0
+
+
+def cmd_secrets_unset(ctx: Context) -> int:
+    name = ctx.args.name
+    db.require_project(ctx.conn, name)
+    file = envsecrets.validate_file(ctx.args.file)
+    removed = secret_store(ctx, name).unset(file, ctx.args.keys)
+    emit(
+        ctx.args, {"project": name, "file": file, "removed": removed},
+        f"removed {', '.join(removed) or 'nothing'} from stored secrets for {file} "
+        "(the server's env file is unchanged)",
     )
-    emit(ctx.args, {"project": ctx.args.name, **result}, text)
+    return 0
+
+
+def cmd_secrets_push(ctx: Context) -> int:
+    server = ctx.running_server(ctx.args.name)
+    written = push_secrets(ctx, server, ctx.args.name)
+    lines = [f"{path}: {n} key(s) written" for path, n in written.items()]
+    emit(ctx.args, {"project": ctx.args.name, "written": written}, "\n".join(lines) or "no secrets stored")
+    return 0
+
+
+# Databases
+
+
+def pick_database(ctx: Context, project: str, name: str | None) -> dict:
+    dbs = db.list_databases(ctx.conn, project)
+    if name:
+        found = db.get_database(ctx.conn, project, name)
+        if not found:
+            raise DevboxError(f"{project} has no database '{name}'; see `devbox db list {project}`")
+        return found
+    if len(dbs) == 1:
+        return dbs[0]
+    if not dbs:
+        raise DevboxError(f"{project} has no databases; add one with `devbox db add {project} NAME --engine ...`")
+    raise DevboxError(f"{project} has several databases ({', '.join(d['name'] for d in dbs)}); name one")
+
+
+def dumps_dir(ctx: Context, project: str) -> Path:
+    return ctx.cfg.state_dir / "dumps" / project
+
+
+def list_dumps(ctx: Context, project: str, database: str | None = None) -> list[dict]:
+    folder = dumps_dir(ctx, project)
+    if not folder.is_dir():
+        return []
+    result = []
+    for f in sorted(folder.iterdir(), key=lambda p: p.name, reverse=True):
+        if not f.is_file() or f.name.endswith(".partial"):
+            continue
+        db_name = f.name.rsplit("-", 2)[0]
+        if database and db_name != database:
+            continue
+        result.append({"database": db_name, "path": str(f), "bytes": f.stat().st_size, "name": f.name})
+    return result
+
+
+def dump_database(ctx: Context, server, project: str, database: dict, output: Path | None = None) -> dict:
+    engine = databases.get_engine(database["engine"])
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    dest = output or dumps_dir(ctx, project) / f"{database['name']}-{stamp}.{engine.extension}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    size = ctx.remote(server).stream_out(engine.dump_command(database["settings"]), dest)
+    ctx.event(server, "db_dump")
+    return {"database": database["name"], "engine": engine.name, "path": str(dest), "bytes": size}
+
+
+def human_size(n: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def cmd_db_engines(ctx: Context) -> int:
+    data = [
+        {"engine": e.name, "description": e.description,
+         "options": [{"name": o.name, "required": o.required, "default": o.default, "help": o.help} for o in e.options]}
+        for e in databases.ENGINES.values()
+    ]
+    lines = []
+    for e in data:
+        lines.append(f"{e['engine']}: {e['description']}")
+        for o in e["options"]:
+            flag = "required" if o["required"] else (f"default {o['default']}" if o["default"] else "optional")
+            lines.append(f"  {o['name']:<10} {flag:<16} {o['help']}")
+    emit(ctx.args, data, "\n".join(lines))
+    return 0
+
+
+def cmd_db_add(ctx: Context) -> int:
+    engine = databases.get_engine(ctx.args.engine)
+    settings = engine.validate(databases.parse_options(ctx.args.option or []))
+    db.add_database(ctx.conn, ctx.args.name, ctx.args.database, engine.name, settings)
+    emit(
+        ctx.args, {"project": ctx.args.name, "database": ctx.args.database, "engine": engine.name, "settings": settings},
+        f"added {engine.name} database '{ctx.args.database}' to {ctx.args.name} ({engine.describe(settings)})",
+    )
+    return 0
+
+
+def cmd_db_list(ctx: Context) -> int:
+    name = ctx.args.name
+    db.require_project(ctx.conn, name)
+    dbs = db.list_databases(ctx.conn, name)
+    dumps = list_dumps(ctx, name)
+    data = []
+    lines = []
+    for d in dbs:
+        own = [x for x in dumps if x["database"] == d["name"]]
+        data.append({**d, "dumps": own})
+        engine = databases.get_engine(d["engine"])
+        latest = f"latest dump {own[0]['name']} ({human_size(own[0]['bytes'])})" if own else "no dumps"
+        lines.append(f"{d['name']}: {d['engine']} ({engine.describe(d['settings'])}), {latest}")
+    emit(ctx.args, data, "\n".join(lines) or f"no databases for {name}; see `devbox db engines`")
+    return 0
+
+
+def cmd_db_remove(ctx: Context) -> int:
+    db.require_project(ctx.conn, ctx.args.name)
+    if not db.remove_database(ctx.conn, ctx.args.name, ctx.args.database):
+        raise DevboxError(f"{ctx.args.name} has no database '{ctx.args.database}'")
+    emit(ctx.args, {"removed": ctx.args.database}, f"removed database '{ctx.args.database}' (dump files are kept)")
+    return 0
+
+
+def cmd_db_dump(ctx: Context) -> int:
+    name = ctx.args.name
+    server = ctx.running_server(name)
+    database = pick_database(ctx, name, ctx.args.database)
+    output = Path(ctx.args.output).expanduser().resolve() if ctx.args.output else None
+    result = dump_database(ctx, server, name, database, output)
+    emit(ctx.args, result, f"dumped {result['database']} ({human_size(result['bytes'])}) to {result['path']}")
+    return 0
+
+
+def cmd_db_restore(ctx: Context) -> int:
+    name = ctx.args.name
+    server = ctx.running_server(name)
+    database = pick_database(ctx, name, ctx.args.database)
+    if ctx.args.file:
+        src = Path(ctx.args.file).expanduser().resolve()
+        if not src.is_file():
+            raise DevboxError(f"{src} does not exist")
+    else:
+        dumps = list_dumps(ctx, name, database["name"])
+        if not dumps:
+            raise DevboxError(f"no dumps of '{database['name']}'; pass --file or run `devbox db dump {name}`")
+        src = Path(dumps[0]["path"])
+    if not ctx.args.yes:
+        raise DevboxError(
+            f"this replaces the data in '{database['name']}' on the server with {src.name}; "
+            "pass --yes to confirm"
+        )
+    engine = databases.get_engine(database["engine"])
+    ctx.remote(server).stream_in(engine.restore_command(database["settings"]), src)
+    ctx.event(server, "db_restore")
+    emit(ctx.args, {"database": database["name"], "restored_from": str(src)}, f"restored {database['name']} from {src}")
     return 0
 
 
@@ -1094,9 +1431,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("down", cmd_down, "delete the server")
     p.add_argument("name")
     p.add_argument("--snapshot", action="store_true", help="snapshot the server first (same as pause)")
+    p.add_argument("--dump", action="store_true", help="dump all project databases locally first")
 
     p = add("pause", cmd_down, "snapshot the server, then delete it; `up` restores it")
     p.add_argument("name")
+    p.add_argument("--dump", action="store_true", help="also dump all project databases locally first")
     p.set_defaults(snapshot=True)
 
     p = add("touch", cmd_touch, "record activity so idle shutdown waits")
@@ -1137,6 +1476,67 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = add("sync", cmd_sync, "copy local code to the server")
     p.add_argument("name")
+    p.add_argument("--watch", action="store_true", help="keep running and sync whenever local files change")
+    p.add_argument("--interval", type=float, default=1.0, metavar="SECONDS", help="how often --watch checks (default 1)")
+
+    p = add("pull", cmd_pull, "copy files that differ on the server into a local staging folder for review")
+    p.add_argument("name")
+    p.add_argument("paths", nargs="*", help="only these files or folders (Git-ignored ones included)")
+    p.add_argument("--all", action="store_true", help="include files Git ignores (dependencies are still skipped)")
+
+    p = add("forward", cmd_forward, "forward local ports to ports on the server until Ctrl-C")
+    p.add_argument("name")
+    p.add_argument("ports", nargs="+", metavar="PORT", help="REMOTE or LOCAL:REMOTE, e.g. 5432 or 15432:5432")
+
+    sec = sub.add_parser("secrets", help="env values stored locally and written to the server", parents=[common])
+    sec_sub = sec.add_subparsers(dest="secrets_command", required=True)
+    p = sec_sub.add_parser("set", help="store KEY=VALUE pairs (written to the server now and on every up)", parents=[common])
+    p.add_argument("name")
+    p.add_argument("assignments", nargs="*", metavar="KEY=VALUE")
+    p.add_argument("--file", default=envsecrets.DEFAULT_FILE, help="env file in the project (default .env)")
+    p.add_argument("--from-file", metavar="PATH", help="read KEY=VALUE lines from a .env file ('-' for stdin)")
+    p.add_argument("--no-push", action="store_true", help="only store; don't write to a running server")
+    p.set_defaults(func=cmd_secrets_set)
+    p = sec_sub.add_parser("list", help="show stored key names (never values)", parents=[common])
+    p.add_argument("name")
+    p.set_defaults(func=cmd_secrets_list)
+    p = sec_sub.add_parser("unset", help="forget stored keys", parents=[common])
+    p.add_argument("name")
+    p.add_argument("keys", nargs="+", metavar="KEY")
+    p.add_argument("--file", default=envsecrets.DEFAULT_FILE)
+    p.set_defaults(func=cmd_secrets_unset)
+    p = sec_sub.add_parser("push", help="write stored secrets to the running server", parents=[common])
+    p.add_argument("name")
+    p.set_defaults(func=cmd_secrets_push)
+
+    dbp = sub.add_parser("db", help="database dumps and restores", parents=[common])
+    db_sub = dbp.add_subparsers(dest="db_command", required=True)
+    p = db_sub.add_parser("engines", help="supported engines and their options", parents=[common])
+    p.set_defaults(func=cmd_db_engines)
+    p = db_sub.add_parser("add", help="describe a project database", parents=[common])
+    p.add_argument("name")
+    p.add_argument("database", help="a short name for this database, e.g. main")
+    p.add_argument("--engine", required=True, choices=sorted(databases.ENGINES))
+    p.add_argument("--option", action="append", metavar="KEY=VALUE", help="engine option (see `devbox db engines`)")
+    p.set_defaults(func=cmd_db_add)
+    p = db_sub.add_parser("list", help="project databases and their latest dumps", parents=[common])
+    p.add_argument("name")
+    p.set_defaults(func=cmd_db_list)
+    p = db_sub.add_parser("remove", help="forget a database (dump files are kept)", parents=[common])
+    p.add_argument("name")
+    p.add_argument("database")
+    p.set_defaults(func=cmd_db_remove)
+    p = db_sub.add_parser("dump", help="dump a database from the server to a local file", parents=[common])
+    p.add_argument("name")
+    p.add_argument("database", nargs="?")
+    p.add_argument("--output", "-o", metavar="FILE", help="default: ~/.local/state/devbox/dumps/NAME/")
+    p.set_defaults(func=cmd_db_dump)
+    p = db_sub.add_parser("restore", help="replace a database on the server with a dump", parents=[common])
+    p.add_argument("name")
+    p.add_argument("database", nargs="?")
+    p.add_argument("--file", metavar="FILE", help="default: the latest dump of this database")
+    p.add_argument("--yes", action="store_true", help="confirm replacing the data")
+    p.set_defaults(func=cmd_db_restore)
 
     p = add(
         "exec", cmd_exec, "run a command on the server",

@@ -18,6 +18,8 @@ EXEC_KILL_AFTER = 10
 # Exit codes of a command killed by a signal: ssh reports 255, a shell 128+N.
 SIGNAL_EXITS = (255, 128 + 15, 128 + 9, -15, -9)
 TUNNEL = "tunnel"
+# Folders never listed by `pull`: dependencies, VCS data and caches.
+PULL_PRUNE = (".git", "node_modules", ".venv", "venv", "__pycache__", ".cache", ".next", ".turbo")
 PROC_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
 TUNNEL_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 
@@ -62,6 +64,20 @@ def git_files(root: Path) -> list[str] | None:
             continue
         files.add(name)
     return sorted(files)
+
+
+def git_ignored(root: Path, paths: list[str]) -> set[str] | None:
+    """Which of `paths` Git would ignore in this repo (tracked files never are), or None outside Git."""
+    if not paths:
+        return set()
+    proc = subprocess.run(
+        ["git", "-C", str(root), "check-ignore", "-z", "--stdin"],
+        input="\0".join(paths).encode(),
+        capture_output=True,
+    )
+    if proc.returncode not in (0, 1):
+        return None
+    return {p for p in proc.stdout.decode().split("\0") if p}
 
 
 def read_manifest(path: Path) -> set[str]:
@@ -289,6 +305,88 @@ class Remote:
         manifest.parent.mkdir(parents=True, exist_ok=True)
         manifest.write_text(json.dumps(sorted(current)))
         return {"mode": "git", "files": len(files), "deleted": len(to_delete), "warning": None}
+
+    # Files on the server
+
+    def read_file(self, path: str) -> str | None:
+        """Text of a file in the project folder, or None if it does not exist."""
+        quoted = shlex.quote(path)
+        proc = self.run(f"if [ -f {quoted} ]; then cat {quoted}; else exit 3; fi", check=False)
+        if proc.returncode == 3:
+            return None
+        if proc.returncode != 0:
+            raise DevboxError(f"cannot read {path} on the server: {(proc.stderr or '').strip()}")
+        return proc.stdout
+
+    def write_file(self, path: str, content: str, mode: str = "600") -> None:
+        """Replace a file in the project folder atomically, creating parent folders."""
+        quoted = shlex.quote(path)
+        tmp = shlex.quote(path + ".devbox-tmp")
+        self.run(
+            f"mkdir -p \"$(dirname {quoted})\" && umask 077 && cat > {tmp} && chmod {mode} {tmp} && mv {tmp} {quoted}",
+            input=content,
+        )
+
+    def stream_out(self, script: str, dest: Path) -> int:
+        """Run a command in the project folder and save its stdout to `dest`. Returns bytes written."""
+        remote = f"cd {APP_DIR} && bash -o pipefail -lc {shlex.quote(script)}"
+        tmp = dest.with_name(dest.name + ".partial")
+        try:
+            with open(tmp, "wb") as out:
+                proc = subprocess.run(self.ssh_cmd(remote), stdout=out, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+            if proc.returncode != 0:
+                detail = proc.stderr.decode(errors="replace").strip()
+                raise DevboxError(f"remote command failed (exit {proc.returncode}){': ' + detail if detail else ''}")
+            os.replace(tmp, dest)
+        finally:
+            tmp.unlink(missing_ok=True)
+        return dest.stat().st_size
+
+    def stream_in(self, script: str, src: Path) -> None:
+        """Run a command in the project folder with `src` as its stdin."""
+        remote = f"cd {APP_DIR} && bash -o pipefail -lc {shlex.quote(script)}"
+        with open(src, "rb") as f:
+            proc = subprocess.run(self.ssh_cmd(remote), stdin=f, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            detail = proc.stderr.decode(errors="replace").strip()
+            raise DevboxError(f"remote command failed (exit {proc.returncode}){': ' + detail if detail else ''}")
+
+    def list_files(self, prune: tuple[str, ...] = PULL_PRUNE) -> list[str]:
+        """Regular files in the project folder, relative paths, skipping pruned folder names."""
+        prune_expr = " -o ".join(f"-name {shlex.quote(p)}" for p in prune)
+        script = f"find . \\( {prune_expr} \\) -prune -o -type f -print0"
+        proc = self._ssh(f"cd {APP_DIR} && {script}", timeout=300)
+        return sorted(f[2:] if f.startswith("./") else f for f in proc.stdout.split("\0") if f)
+
+    def pull(self, files: list[str], staging: Path, compare_dest: Path) -> list[str]:
+        """Copy the given server files that differ from `compare_dest` into `staging`."""
+        staging.mkdir(parents=True, exist_ok=True)
+        ssh = shlex.join(["ssh", *self.ssh_opts()])
+        proc = subprocess.run(
+            [
+                "rsync", "-a", "--checksum", "--from0", "--files-from=-",
+                f"--compare-dest={compare_dest.resolve()}/", "-e", ssh,
+                f"root@{self.ip}:{APP_DIR}/", f"{staging}/",
+            ],
+            input="\0".join(files).encode(),
+            capture_output=True,
+        )
+        if proc.returncode != 0:
+            raise DevboxError(f"rsync failed: {proc.stderr.decode(errors='replace').strip()}")
+        # rsync creates folders for skipped files too; drop the empty ones.
+        for dirpath, dirnames, filenames in os.walk(staging, topdown=False):
+            if Path(dirpath) != staging and not os.listdir(dirpath):
+                os.rmdir(dirpath)
+        return sorted(
+            str(p.relative_to(staging)) for p in staging.rglob("*") if p.is_file() or p.is_symlink()
+        )
+
+    def forward_cmd(self, ports: list[tuple[int, int]]) -> list[str]:
+        """ssh command that forwards local ports to ports on the server until stopped."""
+        cmd = ["ssh", *self.ssh_opts(), "-N", "-o", "ExitOnForwardFailure=yes"]
+        for local, remote in ports:
+            cmd += ["-L", f"127.0.0.1:{local}:localhost:{remote}"]
+        return [*cmd, f"root@{self.ip}"]
 
     # Background processes (systemd units on the server)
 
