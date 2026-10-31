@@ -15,27 +15,32 @@ Nothing below has run against Hetzner yet. Check each step and fix what breaks.
 - [ ] `expose`: quick tunnel URL is found in the journal and loads
 - [ ] `status` and `down`; reconcile after deleting a server by hand in the Hetzner console
 - [ ] Firewall: SSH works from this machine, nothing else is reachable; behavior when this machine's IP changes; old `devbox` firewall/key from earlier versions are left untouched
+- [ ] `pause`: clean shutdown, snapshot reaches `available`, size and price recorded, server deleted; failure path powers the server back on
+- [ ] `up` after `pause`: server created from the snapshot, cloud-init re-runs without reinstalling (idempotent `runcmd`), new SSH host key accepted, Docker containers and data are back
+- [ ] Snapshot prices: Hetzner pricing API is reachable with the token; snapshot cost in `costs` matches the console
+- [ ] Snapshot rotation: second `pause` deletes the older snapshot only after the new one exists
+- [ ] `idle-check` from cron/systemd timer pauses a server after the timeout, `touch` postpones it
 - [ ] Full agent run with the skill: a project with no notes goes from `up` to a working preview, the agent saves notes, then `down` and `up` again work from the notes alone
 
 ## Next
 
-- [ ] Snapshots (migration 3): `down --snapshot`, restore from the latest snapshot on `up`
 - [ ] Database backups to S3
 - [ ] Fixed preview hostname with a named Cloudflare tunnel, optionally behind Cloudflare Access
-- [ ] Automatic shutdown of idle servers
-- [ ] Warning for long-running servers and a monthly budget threshold
-- [ ] Include primary IPv4 and snapshot storage in cost estimates
+- [ ] Include primary IPv4 in cost estimates
+- [ ] Count preview traffic (tunnel requests) as activity for idle shutdown
+- [ ] Notify (email/webhook) when idle-check pauses a server or the budget is reached
 - [ ] Pull changes made on the server back to the local copy (`devbox pull`)
 - [ ] Run as a non-root user on the server and pin SSH host keys instead of `accept-new`
-- [ ] Remember the last server type/location per project and suggest it first
 
 ## Known limitations
 
 - Previews are public: anyone with the URL can open them.
 - The preview URL changes every time the tunnel restarts.
-- `down` loses everything that exists only on the server (database contents, files not synced back).
+- `down` without `--snapshot` loses everything that exists only on the server (database contents, files not synced back). `pause` keeps it in a snapshot.
+- Idle shutdown only sees devbox commands, not people using the preview, and only runs when `idle-check` is scheduled.
+- A restored server keeps the snapshot's disk size, so it can't move to a smaller server type.
 - Availability from Hetzner is an indicator, not a guarantee; `up` can still fail if a type sells out between listing and creating.
 - One server at a time unless `up --force`.
-- Costs are estimates of the server price only. Servers deleted outside devbox are recorded as deleted when devbox next notices, which can overstate their cost.
+- Costs are estimates of server and snapshot prices; IPv4 and traffic are not included. Servers deleted outside devbox are recorded as deleted when devbox next notices, which can overstate their cost.
 - Submodule contents are not synced.
 - `exec --timeout` does not stop containers started in the background (`-d`).

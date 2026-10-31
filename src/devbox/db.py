@@ -47,6 +47,26 @@ MIGRATIONS = [
 
     CREATE INDEX events_server ON events(server_id);
     """,
+    """
+    CREATE TABLE snapshots (
+      id                  INTEGER PRIMARY KEY,
+      project             TEXT NOT NULL REFERENCES projects(name),
+      hetzner_image_id    INTEGER NOT NULL UNIQUE,
+      server_id           INTEGER REFERENCES servers(id),
+      server_type         TEXT,
+      location            TEXT,
+      architecture        TEXT,
+      size_gb             REAL,
+      disk_gb             INTEGER,
+      price_per_gb_month  REAL,
+      status              TEXT NOT NULL CHECK (status IN ('available', 'deleted')),
+      created_at          TEXT NOT NULL,
+      deleted_at          TEXT
+    );
+
+    ALTER TABLE servers ADD COLUMN snapshot_id INTEGER REFERENCES snapshots(id);
+    ALTER TABLE projects ADD COLUMN idle_timeout TEXT;
+    """,
 ]
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
@@ -132,6 +152,13 @@ def list_projects(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def set_idle_timeout(conn: sqlite3.Connection, name: str, value: str | None) -> None:
+    require_project(conn, name)
+    conn.execute(
+        "UPDATE projects SET idle_timeout = ?, updated_at = ? WHERE name = ?", (value, now(), name)
+    )
+
+
 def set_notes(conn: sqlite3.Connection, name: str, notes: str) -> None:
     require_project(conn, name)
     conn.execute(
@@ -144,6 +171,11 @@ def remove_project(conn: sqlite3.Connection, name: str) -> None:
     require_project(conn, name)
     if active_server(conn, name):
         raise DevboxError(f"project '{name}' has a server; run `devbox down {name}` first")
+    if snapshots(conn, name):
+        raise DevboxError(
+            f"project '{name}' has snapshots that still cost money; "
+            f"delete them with `devbox snapshot delete` first"
+        )
     conn.execute(
         "UPDATE projects SET removed_at = ?, updated_at = ? WHERE name = ?", (now(), now(), name)
     )
@@ -175,16 +207,128 @@ def insert_server(
     created_at: str | None = None,
     price_hourly: float | None = None,
     price_monthly: float | None = None,
+    snapshot_id: int | None = None,
 ) -> int:
     cur = conn.execute(
         """INSERT INTO servers
            (project, hetzner_id, ip, server_type, location, status, created_at,
-            price_hourly, price_monthly)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            price_hourly, price_monthly, snapshot_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (project, hetzner_id, ip, server_type, location, status, created_at or now(),
-         price_hourly, price_monthly),
+         price_hourly, price_monthly, snapshot_id),
     )
     return cur.lastrowid
+
+
+def last_server(conn: sqlite3.Connection, project: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM servers WHERE project = ? ORDER BY created_at DESC, id DESC LIMIT 1", (project,)
+    ).fetchone()
+
+
+def last_activity(conn: sqlite3.Connection, server) -> datetime:
+    row = conn.execute("SELECT MAX(at) AS at FROM events WHERE server_id = ?", (server["id"],)).fetchone()
+    stamps = [server["created_at"], row["at"]]
+    return max(_parse(s) for s in stamps if s)
+
+
+def _parse(value: str) -> datetime:
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+# Snapshots
+
+
+def insert_snapshot(
+    conn: sqlite3.Connection,
+    project: str,
+    hetzner_image_id: int,
+    server_id: int | None = None,
+    server_type: str | None = None,
+    location: str | None = None,
+    architecture: str | None = None,
+    size_gb: float | None = None,
+    disk_gb: int | None = None,
+    price_per_gb_month: float | None = None,
+    created_at: str | None = None,
+) -> int:
+    cur = conn.execute(
+        """INSERT INTO snapshots
+           (project, hetzner_image_id, server_id, server_type, location, architecture,
+            size_gb, disk_gb, price_per_gb_month, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'available', ?)""",
+        (project, hetzner_image_id, server_id, server_type, location, architecture,
+         size_gb, disk_gb, price_per_gb_month, created_at or now()),
+    )
+    return cur.lastrowid
+
+
+def snapshots(conn: sqlite3.Connection, project: str | None = None, include_deleted: bool = False) -> list[sqlite3.Row]:
+    sql = "SELECT * FROM snapshots WHERE 1 = 1"
+    args: list = []
+    if project:
+        sql += " AND project = ?"
+        args.append(project)
+    if not include_deleted:
+        sql += " AND status = 'available'"
+    sql += " ORDER BY created_at DESC, id DESC"
+    return conn.execute(sql, args).fetchall()
+
+
+def get_snapshot(conn: sqlite3.Connection, snapshot_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM snapshots WHERE id = ?", (snapshot_id,)).fetchone()
+
+
+def latest_snapshot(conn: sqlite3.Connection, project: str) -> sqlite3.Row | None:
+    found = snapshots(conn, project)
+    return found[0] if found else None
+
+
+def get_snapshot_by_image(conn: sqlite3.Connection, image_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM snapshots WHERE hetzner_image_id = ?", (image_id,)).fetchone()
+
+
+def mark_snapshot_deleted(conn: sqlite3.Connection, snapshot_id: int) -> None:
+    conn.execute(
+        "UPDATE snapshots SET status = 'deleted', deleted_at = ? WHERE id = ?", (now(), snapshot_id)
+    )
+
+
+def update_snapshot(conn: sqlite3.Connection, snapshot_id: int, **fields) -> None:
+    allowed = {"size_gb", "disk_gb", "architecture", "price_per_gb_month"}
+    unknown = set(fields) - allowed
+    if unknown:
+        raise ValueError(f"unknown snapshot fields: {unknown}")
+    if fields:
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        conn.execute(f"UPDATE snapshots SET {sets} WHERE id = ?", (*fields.values(), snapshot_id))
+
+
+def reconcile_snapshots(conn: sqlite3.Connection, images: list[dict]) -> list[dict]:
+    """Match registry snapshots with labeled Hetzner snapshots. Returns unknown ones."""
+    by_id = {i["id"]: i for i in images}
+    for snap in snapshots(conn):
+        live = by_id.get(snap["hetzner_image_id"])
+        if live is None:
+            mark_snapshot_deleted(conn, snap["id"])
+        elif live["size_gb"] is not None and live["size_gb"] != snap["size_gb"]:
+            update_snapshot(conn, snap["id"], size_gb=live["size_gb"])
+
+    unknown = []
+    for image in images:
+        if get_snapshot_by_image(conn, image["id"]):
+            continue
+        project = image.get("project")
+        if project and get_project(conn, project) and image["status"] == "available":
+            # For example a snapshot created just before a crash during `pause`.
+            insert_snapshot(
+                conn, project, image["id"], architecture=image["architecture"],
+                size_gb=image["size_gb"], disk_gb=image["disk_gb"], created_at=image.get("created"),
+            )
+        else:
+            unknown.append(image)
+    return unknown
 
 
 def get_server(conn: sqlite3.Connection, server_id: int) -> sqlite3.Row | None:

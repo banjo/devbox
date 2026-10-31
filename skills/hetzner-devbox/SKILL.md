@@ -27,7 +27,8 @@ Do **not** use it for reading or editing code, Git, or small checks such as lint
 - **Never run heavy commands on this machine.** No `docker`, `npm install`, `npm run build`, dev servers or test suites locally. Use `devbox exec`.
 - **Ask before `devbox up` creates a server.** It costs money. Check `devbox status NAME` first; if a server is already running, use it without asking.
 - **Only one server at a time.** If `up` says another server is running, ask the user whether to `devbox down` that one. Never pass `--force` without their approval.
-- **Ask before `devbox down`.** It deletes the server and everything that exists only there, such as database contents.
+- **Prefer `devbox pause` over `devbox down`** when the user is done. Pause keeps everything in a snapshot (a few cents a month) and the next `up` restores it. Ask before `devbox down`: it deletes the server and everything that exists only there, such as database contents.
+- **Mind the budget.** If `up` warns about the monthly budget, tell the user. If it refuses, only pass `--over-budget` when the user says so.
 - **Previews are public.** Anyone with the URL can open it. Do not expose admin tools or real data.
 - **Do not commit or push** unless the user asks.
 - Add `--json` when you need to parse output.
@@ -48,11 +49,13 @@ Hetzner often runs out of server types in some locations, so pick from what is a
 4. If `up` says the type is not available, it lists the cheapest alternatives. Pick one and ask again if it changes region or price noticeably.
 5. If the project needs a certain size or architecture, record it in the notes (for example "needs 8 GB RAM; x86 only because of image X").
 
-A config default (`server_type`/`location` in `~/.config/devbox/config.toml`) is used when `--type`/`--location` are left out. Still check availability with `devbox server-types` first.
+Without `--type`/`--location`, `up` uses the config default, or else the project's last server type and location. That is usually what you want: run `devbox up NAME` and only go through the steps above if it says the choice is unavailable or there is no previous server. When restoring a snapshot, the server needs the same architecture and at least the snapshot's disk size; `up` checks this and lists compatible alternatives.
 
 ### Starting a project
 
-1. `devbox status NAME`. If there is no server, choose one (see below), ask the user, then `devbox up NAME --type TYPE --location LOC`. `up` waits for the server and syncs the code. It does not start anything.
+1. `devbox status NAME`. If there is no server, ask the user, then `devbox up NAME` (add `--type`/`--location` the first time, see above). If the project is paused (`status` shows a snapshot), `up` restores it. `up` waits for the server and syncs the code. It does not start anything.
+   - **Restored from a snapshot:** runtimes, dependencies, `.env` and database data are already there. Only run the notes' "every start" steps (start containers, dev servers, `expose`), not the "new server" steps.
+   - **Clean server:** follow all the steps below.
 2. `devbox project notes NAME`.
    - **Notes exist:** follow them.
    - **No notes:** read the project to work out what it needs: README, `package.json` scripts, `compose.yaml`/`docker-compose.yml`, `Makefile`, `Dockerfile`, `.env.example`, `.tool-versions`, `.nvmrc`, `mise.toml`, `pyproject.toml` and so on.
@@ -90,15 +93,22 @@ Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/a
 
 ### Finishing
 
-1. Remind the user that `down` deletes the server and its data (for example the database). Code is safe because it lives on this machine.
-2. When they confirm: `devbox down NAME`.
-3. Pass on the summary `down` prints: how long the server ran, its estimated cost, and the project's total so far.
+1. Default: `devbox pause NAME`. It shuts the server down, saves a snapshot and deletes the server. Pass on the summary: how long it ran, its cost, the snapshot's size and monthly cost, and the project total.
+2. If the user wants nothing kept, remind them that `down` deletes the server and its data (for example the database), then `devbox down NAME` when they confirm. Existing snapshots stay unless deleted with `devbox snapshot delete IMAGE_ID`.
+3. Code is always safe because it lives on this machine.
+
+### Idle shutdown
+
+- Servers without devbox activity for the idle timeout (default 8h) are paused automatically by `devbox idle-check`, if the user has scheduled it. `devbox status` shows how long is left.
+- Viewing the preview in a browser does not count as activity. While the user is testing by hand for a long time, run `devbox touch NAME` now and then.
+- For projects that need longer: `devbox project set NAME --idle-timeout 1d` (or `off`).
 
 ### Costs
 
-- `devbox status` shows each running server's cost so far and the total for this month.
+- `devbox status` shows each running server's cost so far, kept snapshots and their monthly cost, the total for this month and the budget left.
+- `devbox snapshot list` shows snapshots with size and cost; old ones beyond the configured number are deleted automatically on the next pause.
 - `devbox costs` answers questions like "what did this cost?": `--month 2026-10`, `--days 7`, `--since 2026-10-01 --until 2026-11-01`, `--project NAME`, and `--by project|month|day|type|server`.
-- Costs are estimates of the server price only (incl. VAT, per started hour, capped monthly). Say so when reporting them.
+- Costs are estimates (incl. VAT): servers per started hour, snapshots per GB, both capped monthly; IPv4 and traffic are not included. Say so when reporting them.
 
 ## Examples
 
@@ -109,7 +119,9 @@ Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/a
 | "Run the tests" | `devbox exec NAME -- 'npm test'` (or whatever the notes say) |
 | "Which servers are running?" | `devbox status` |
 | "What have I spent this month?" | `devbox costs --month YYYY-MM` |
-| "We're done for today" | Remind about data loss, `devbox down NAME`, report the cost summary |
+| "We're done for today" | `devbox pause NAME`, report the cost summary |
+| "Delete everything for this project" | Confirm, `devbox down NAME`, `devbox snapshot delete` for its snapshots |
+| "Continue where we left off" | `devbox up NAME` (restores the snapshot), then the notes' every-start steps |
 
 ## Pitfalls
 
@@ -117,7 +129,7 @@ Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/a
 - Foreground `exec` blocks until the command exits. Never use it for dev servers or `compose up` without `-d`; use `--detach`.
 - A single argument after `--` is run as a shell script, so quote it: `-- 'npm ci && npm test'`. Several arguments are quoted individually, so `&&` between them is passed literally.
 - Processes do not restart on their own. After a crash, check `logs` and run the same `exec --detach` again.
-- A new server has nothing installed: runtimes, `node_modules`, databases and `.env` must be set up again. Notes should say which steps that means.
+- A clean server has nothing installed: runtimes, `node_modules`, databases and `.env` must be set up again. Notes should separate "new server" steps from "every start" steps, because a server restored from a snapshot only needs the latter.
 - If `exec` fails with an SSH error, run `devbox status`; the server may have been deleted.
 - Without `--timeout`, a foreground command keeps running on the server if the connection drops. `--timeout` does not stop containers started with `-d`; stop those with `docker compose down`.
 - Sync follows the project's Git ignore rules. Ignored files (such as `.env`) never reach the server, and files you delete locally are deleted on the server at the next sync.

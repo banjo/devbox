@@ -4,7 +4,7 @@
 hcloud_token_file = "~/.config/devbox/hcloud.token"
 
 # Optional defaults for `devbox up` when --type/--location are not given.
-# Leave them out to let the agent pick from `devbox server-types` each time.
+# Without them, `up` uses the project's last server type and location.
 # server_type = "cx23"
 # location = "fsn1"
 
@@ -17,3 +17,17 @@ ssh_allow = ["auto"]
 # Identifies this install in Hetzner labels and resource names. Generated and
 # stored in ~/.local/state/devbox/controller-id when not set.
 # controller_id = "my-laptop"
+
+# Snapshots kept per project (older ones are deleted after a new one exists).
+keep_snapshots = 1
+# Fallback snapshot price if Hetzner's pricing API can't be read (EUR per GB per month).
+# snapshot_price_per_gb_month = 0.012
+
+# `devbox idle-check` (run from cron or the systemd timer) acts on servers
+# without devbox activity for this long: "pause" (snapshot + delete) or "down".
+idle_timeout = "8h"
+idle_action = "pause"
+
+# Monthly spending limit in EUR. "warn" or "block" when `up` would exceed it.
+# monthly_budget = 20
+# budget_action = "warn"

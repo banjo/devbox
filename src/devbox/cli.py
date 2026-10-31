@@ -25,6 +25,8 @@ class Context:
         self._cfg = None
         self._conn = None
         self._hcloud = None
+        self._snapshot_price = None
+        self.snapshot_orphans: list[dict] = []
 
     @property
     def cfg(self) -> config.Config:
@@ -49,8 +51,9 @@ class Context:
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
-    def manifest(self, server) -> Path:
-        return self.cfg.state_dir / "manifests" / f"{server['project']}-{server['hetzner_id']}.json"
+    def manifest(self, project: str) -> Path:
+        """Files synced to the project's server (kept across pause/resume)."""
+        return self.cfg.state_dir / "manifests" / f"{project}.json"
 
     def remote(self, server) -> Remote:
         return Remote(server["ip"], self.cfg.ssh_key, self.known_hosts(server))
@@ -66,8 +69,22 @@ class Context:
 
     def reconcile(self) -> list[dict]:
         orphans = db.reconcile(self.conn, self.hcloud.list_servers())
+        self.snapshot_orphans = db.reconcile_snapshots(self.conn, self.hcloud.list_snapshots())
         self.fill_missing_prices()
         return orphans
+
+    def snapshot_price(self) -> float | None:
+        if self._snapshot_price is None:
+            self._snapshot_price = (
+                self.hcloud.snapshot_price_per_gb_month() or self.cfg.snapshot_price_per_gb_month
+            )
+        return self._snapshot_price
+
+    def cost_items(self, project: str | None = None) -> list[dict]:
+        """Servers and snapshots, ready for `costs.summarize`."""
+        items = [costs.server_item(s) for s in db.all_servers(self.conn, project)]
+        items += [costs.snapshot_item(s) for s in db.snapshots(self.conn, project, include_deleted=True)]
+        return items
 
     def fill_missing_prices(self) -> None:
         """Servers adopted by reconcile (or created before prices were stored) get today's price."""
@@ -85,6 +102,12 @@ class Context:
                 db.update_server(
                     self.conn, s["id"], price_hourly=o["price_hourly"], price_monthly=o["price_monthly"]
                 )
+        for snap in db.snapshots(self.conn):
+            if snap["price_per_gb_month"] is None:
+                price = self.snapshot_price()
+                if price is None:
+                    break
+                db.update_snapshot(self.conn, snap["id"], price_per_gb_month=price)
 
     def event(self, server, kind: str) -> None:
         db.add_event(self.conn, server["project"], server["id"], kind)
@@ -177,6 +200,21 @@ def cmd_project_notes(ctx: Context) -> int:
     return 0
 
 
+def cmd_project_set(ctx: Context) -> int:
+    name = ctx.args.name
+    value = ctx.args.idle_timeout
+    if value is not None:
+        if value == "default":
+            value = None
+        else:
+            config.parse_duration(value)
+        db.set_idle_timeout(ctx.conn, name, value)
+    project = db.require_project(ctx.conn, name)
+    effective = project["idle_timeout"] or f"{ctx.cfg.idle_timeout} (default)"
+    emit(ctx.args, {"name": name, "idle_timeout": project["idle_timeout"]}, f"{name}: idle timeout {effective}")
+    return 0
+
+
 def cmd_project_remove(ctx: Context) -> int:
     db.remove_project(ctx.conn, ctx.args.name)
     emit(ctx.args, {"name": ctx.args.name, "removed": True}, f"removed {ctx.args.name}")
@@ -221,31 +259,57 @@ def describe_offer(o: dict) -> str:
     )
 
 
-def choose_offer(ctx: Context) -> dict:
+def choose_offer(ctx: Context, project: str, snapshot=None) -> dict:
+    """Pick the offer for a new server.
+
+    Order: --type/--location, then config defaults, then the project's last
+    server. When restoring a snapshot, the server must have the same
+    architecture and at least the snapshot's disk size.
+    """
     server_type = ctx.args.type or ctx.cfg.server_type
     location = ctx.args.location or ctx.cfg.location
+    source = "requested" if (ctx.args.type or ctx.args.location) else "config default"
+    if not server_type and not location:
+        last = db.last_server(ctx.conn, project)
+        if last and last["server_type"] and last["location"]:
+            server_type, location, source = last["server_type"], last["location"], "last used"
     if not server_type or not location:
         raise DevboxError(
             "no server chosen: run `devbox server-types` and pass --type and --location"
         )
-    offers = ctx.hcloud.offers()
-    for o in offers:
-        if o["type"] == server_type and o["location"] == location:
-            if o["available"] is False:
-                break
-            return o
-    else:
-        if not any(o["type"] == server_type for o in offers):
-            raise DevboxError(f"unknown server type '{server_type}'; see `devbox server-types`")
 
-    wanted = next((o for o in offers if o["type"] == server_type), None)
-    alternatives = filter_offers(
-        offers,
-        min_cores=wanted["cores"] if wanted else None,
-        min_memory=wanted["memory_gb"] if wanted else None,
-    )[:5]
-    lines = [f"{server_type} is not available in {location}. Cheapest available alternatives:"]
-    lines += [f"  {describe_offer(o)}" for o in alternatives] or ["  none found"]
+    def fits(o: dict) -> bool:
+        if snapshot is None:
+            return True
+        if snapshot["architecture"] and o["architecture"] != snapshot["architecture"]:
+            return False
+        return not (snapshot["disk_gb"] and (o["disk_gb"] or 0) < snapshot["disk_gb"])
+
+    offers = ctx.hcloud.offers()
+    if not any(o["type"] == server_type for o in offers):
+        raise DevboxError(f"unknown server type '{server_type}'; see `devbox server-types`")
+    match = next((o for o in offers if o["type"] == server_type and o["location"] == location), None)
+    if match and match["available"] is not False and fits(match):
+        return {**match, "choice": source}
+
+    if match is None:
+        reason = f"{server_type} is not offered in {location}"
+    elif not fits(match):
+        reason = (
+            f"{server_type} cannot hold the snapshot "
+            f"({snapshot['architecture']}, {snapshot['disk_gb']} GB disk)"
+        )
+    else:
+        reason = f"{server_type} is not available in {location}"
+    wanted = match or next(o for o in offers if o["type"] == server_type)
+    alternatives = [
+        o for o in filter_offers(offers, min_cores=wanted["cores"], min_memory=wanted["memory_gb"])
+        if fits(o)
+    ]
+    # Prefer the same region, then price.
+    alternatives.sort(key=lambda o: o["network_zone"] != wanted["network_zone"])
+    lines = [f"{reason} ({source}). Cheapest available alternatives:"]
+    lines += [f"  {describe_offer(o)}" for o in alternatives[:5]] or ["  none found"]
     raise DevboxError("\n".join(lines))
 
 
@@ -281,10 +345,47 @@ def cmd_server_types(ctx: Context) -> int:
     return 0
 
 
+# Budget
+
+
+def month_spend(ctx: Context, project: str | None = None, now: datetime | None = None) -> dict:
+    now = now or datetime.now(timezone.utc)
+    return costs.summarize(ctx.cost_items(project), since=costs.month_start(now), now=now)
+
+
+def budget_status(ctx: Context) -> dict | None:
+    budget = ctx.cfg.monthly_budget
+    if budget is None:
+        return None
+    spent = month_spend(ctx)["total"]
+    return {"budget": budget, "spent": spent, "left": round(budget - spent, 4), "action": ctx.cfg.budget_action}
+
+
+def check_budget(ctx: Context) -> list[str]:
+    """Warnings before creating a server; raises when the budget blocks it."""
+    status = budget_status(ctx)
+    if status is None:
+        return []
+    spent, budget = status["spent"], status["budget"]
+    if spent >= budget:
+        msg = f"this month's spending ({costs.money(spent)}) has reached the budget of {costs.money(budget)}"
+        if status["action"] == "block" and not ctx.args.over_budget:
+            raise DevboxError(f"{msg}; pass --over-budget to create a server anyway")
+        return [msg]
+    if spent >= 0.8 * budget:
+        return [f"{costs.money(spent)} of the {costs.money(budget)} monthly budget is used"]
+    return []
+
+
+# Server lifecycle
+
+
 def cmd_up(ctx: Context) -> int:
     name = ctx.args.name
     cfg = ctx.cfg
     offer = None
+    snapshot = None
+    warnings: list[str] = []
     with ctx.lock():
         project = db.require_project(ctx.conn, name)
         orphans = ctx.reconcile()
@@ -292,6 +393,9 @@ def cmd_up(ctx: Context) -> int:
         created = False
 
         if server is None:
+            snapshot = None if ctx.args.fresh else db.latest_snapshot(ctx.conn, name)
+            if ctx.args.require_snapshot and snapshot is None:
+                raise DevboxError(f"{name} has no snapshot to resume from; use `devbox up {name}`")
             others = [s["project"] for s in db.active_servers(ctx.conn)]
             others += [o["name"] for o in orphans]
             if others and not ctx.args.force:
@@ -299,38 +403,46 @@ def cmd_up(ctx: Context) -> int:
                     f"another devbox server is running ({', '.join(others)}); "
                     "stop it with `devbox down` or pass --force"
                 )
-            offer = choose_offer(ctx)
+            warnings += check_budget(ctx)
+            offer = choose_offer(ctx, name, snapshot)
             public_key = ensure_local_ssh_key(cfg.ssh_key)
             ssh_key_id = ctx.hcloud.ensure_ssh_key(public_key)
             firewall_id = ctx.hcloud.ensure_firewall(resolve_ssh_allow(cfg.ssh_allow))
 
-            print(f"creating {describe_offer(offer)} for {name}...", file=sys.stderr)
+            source = f" from snapshot {snapshot['hetzner_image_id']}" if snapshot else ""
+            print(f"creating {describe_offer(offer)} for {name}{source}...", file=sys.stderr)
             user_data = resources.files("devbox").joinpath("cloud-init.yaml").read_text()
             with tempfile.NamedTemporaryFile("w", suffix=".yaml") as f:
                 f.write(user_data)
                 f.flush()
                 info = ctx.hcloud.create_server(
-                    f"devbox-{name}", name, offer["type"], cfg.image, offer["location"], Path(f.name),
+                    f"devbox-{name}", name, offer["type"],
+                    str(snapshot["hetzner_image_id"]) if snapshot else cfg.image,
+                    offer["location"], Path(f.name),
                     ssh_key_id=ssh_key_id, firewall_id=firewall_id,
                 )
+            if snapshot is None:
+                # A clean server has none of the previously synced files.
+                ctx.manifest(name).unlink(missing_ok=True)
             db.insert_server(
                 ctx.conn, name, info["id"], "creating",
                 ip=info["ip"], server_type=info["server_type"] or offer["type"],
                 location=info["location"] or offer["location"], created_at=info.get("created"),
                 price_hourly=offer["price_hourly"], price_monthly=offer["price_monthly"],
+                snapshot_id=snapshot["id"] if snapshot else None,
             )
             server = db.active_server(ctx.conn, name)
             created = True
-            ctx.event(server, "create")
+            ctx.event(server, "restore" if snapshot else "create")
 
         remote = ctx.remote(server)
         if server["status"] != "running":
             print(f"waiting for {server['ip']} to finish setup...", file=sys.stderr)
-        warnings = remote.wait_ready()
+        warnings += remote.wait_ready()
         db.update_server(ctx.conn, server["id"], status="running")
 
         print("syncing code...", file=sys.stderr)
-        sync = remote.sync(project["path"], ctx.manifest(server))
+        sync = remote.sync(project["path"], ctx.manifest(name))
         if sync["warning"]:
             warnings.append(sync["warning"])
         ctx.event(server, "up")
@@ -340,26 +452,41 @@ def cmd_up(ctx: Context) -> int:
     data = {
         "project": name,
         "created": created,
+        "restored_from_snapshot": row(snapshot) if created and snapshot else None,
         "server": row(server),
         "has_notes": bool(project["notes"].strip()),
         "offer": offer,
         "warnings": warnings,
     }
+    verb = "reusing"
+    if created:
+        verb = "restored" if snapshot else "created"
     text = [
-        f"{name}: {'created' if created else 'reusing'} server {server['hetzner_id']} "
+        f"{name}: {verb} server {server['hetzner_id']} "
         f"({server['server_type']} in {server['location']}) at {server['ip']}, code synced",
-        *(f"warning: {w}" for w in warnings),
     ]
+    if offer:
+        text.append(f"  {offer['choice']}: {describe_offer(offer)}")
+    if created and snapshot:
+        text.append(
+            f"  from snapshot taken {snapshot['created_at'][:16].replace('T', ' ')}: installed tools, "
+            f"dependencies and data from then are back; background processes and the preview must be started again"
+        )
+    text += [f"warning: {w}" for w in warnings]
     if not data["has_notes"]:
         text.append(f"no notes for {name} yet; work out how to start it, then save them with `devbox project notes {name} --set ...`")
     emit(ctx.args, data, "\n".join(text))
     return 0
 
 
-def server_summary(ctx: Context, server) -> dict:
+def server_summary(ctx: Context, server, snapshot=None, pruned=None) -> dict:
     """Usage, cost and activity for one server over its whole lifetime."""
     usage = costs.server_usage(server)
-    project_total = costs.summarize(db.all_servers(ctx.conn, server["project"]))
+    project_total = costs.summarize(ctx.cost_items(server["project"]))
+    snap = None
+    if snapshot is not None:
+        item = costs.snapshot_item(snapshot)
+        snap = {**dict(snapshot), "monthly_cost": item["price_monthly"]}
     return {
         "server": row(server),
         "uptime_seconds": usage["seconds"],
@@ -367,6 +494,8 @@ def server_summary(ctx: Context, server) -> dict:
         "cost": usage["cost"],
         "currency": costs.CURRENCY,
         "activity": db.event_counts(ctx.conn, server["id"]),
+        "snapshot": snap,
+        "deleted_snapshots": pruned or [],
         "project_total": project_total["total"],
         "project_servers": project_total["servers"],
     }
@@ -374,7 +503,7 @@ def server_summary(ctx: Context, server) -> dict:
 
 ACTIVITY_LABELS = [
     ("sync", "sync"), ("exec", "exec"), ("exec_detach", "background start"),
-    ("expose", "expose"), ("up", "up"),
+    ("expose", "expose"), ("up", "up"), ("touch", "touch"),
 ]
 
 
@@ -390,15 +519,77 @@ def summary_lines(summary: dict) -> list[str]:
     parts = [f"{counts[k]} {label}{'s' if counts[k] != 1 else ''}" for k, label in ACTIVITY_LABELS if counts.get(k)]
     if parts:
         lines.append(f"  activity: {', '.join(parts)}")
+    snap = summary["snapshot"]
+    if snap:
+        size = f"{snap['size_gb']:.1f} GB" if snap["size_gb"] is not None else "size unknown"
+        lines.append(
+            f"  snapshot {snap['hetzner_image_id']}: {size}, ~{costs.money(snap['monthly_cost'])}/month "
+            f"while kept; `devbox up {s['project']}` restores it"
+        )
+    for image_id in summary["deleted_snapshots"]:
+        lines.append(f"  deleted older snapshot {image_id}")
     lines.append(
         f"  project total: {costs.money(summary['project_total'])} over {summary['project_servers']} "
-        f"server{'s' if summary['project_servers'] != 1 else ''}"
+        f"server{'s' if summary['project_servers'] != 1 else ''} (incl. snapshots)"
     )
     return lines
 
 
+def prune_snapshots(ctx: Context, project: str) -> list[int]:
+    """Delete snapshots beyond `keep_snapshots`, oldest first. Returns deleted image ids."""
+    deleted = []
+    for snap in db.snapshots(ctx.conn, project)[ctx.cfg.keep_snapshots:]:
+        try:
+            ctx.hcloud.delete_image(snap["hetzner_image_id"])
+        except DevboxError as e:
+            print(f"warning: could not delete old snapshot {snap['hetzner_image_id']}: {e}", file=sys.stderr)
+            continue
+        db.mark_snapshot_deleted(ctx.conn, snap["id"])
+        deleted.append(snap["hetzner_image_id"])
+    return deleted
+
+
+def take_down(ctx: Context, server, snapshot: bool, event: str) -> dict:
+    """Delete a project's server, optionally snapshotting it first. Caller holds the lock."""
+    name = server["project"]
+    snap = None
+    pruned: list[int] = []
+    if snapshot:
+        print(f"shutting down {name} for a snapshot...", file=sys.stderr)
+        ctx.hcloud.shutdown(server["hetzner_id"])
+        print("creating snapshot (this can take a few minutes)...", file=sys.stderr)
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        try:
+            info = ctx.hcloud.create_snapshot(server["hetzner_id"], name, f"devbox {name} {stamp}")
+        except DevboxError as e:
+            try:
+                ctx.hcloud.poweron(server["hetzner_id"])
+                kept = "the server was kept and powered on again"
+            except DevboxError:
+                kept = "the server was kept but is powered off; start it in the Hetzner console"
+            raise DevboxError(f"snapshot failed, {kept}: {e}")
+        snap_id = db.insert_snapshot(
+            ctx.conn, name, info["id"], server_id=server["id"],
+            server_type=server["server_type"], location=server["location"],
+            architecture=info["architecture"], size_gb=info["size_gb"], disk_gb=info["disk_gb"],
+            price_per_gb_month=ctx.snapshot_price(), created_at=info.get("created"),
+        )
+        snap = db.get_snapshot(ctx.conn, snap_id)
+
+    ctx.hcloud.delete_server(server["hetzner_id"])
+    ctx.event(server, event)
+    db.mark_deleted(ctx.conn, server["id"])
+    ctx.known_hosts(server).unlink(missing_ok=True)
+    if snapshot:
+        pruned = prune_snapshots(ctx, name)
+    else:
+        ctx.manifest(name).unlink(missing_ok=True)
+    return server_summary(ctx, db.get_server(ctx.conn, server["id"]), snap, pruned)
+
+
 def cmd_down(ctx: Context) -> int:
     name = ctx.args.name
+    snapshot = ctx.args.snapshot
     with ctx.lock():
         db.require_project(ctx.conn, name)
         ctx.reconcile()
@@ -406,17 +597,91 @@ def cmd_down(ctx: Context) -> int:
         if server is None:
             emit(ctx.args, {"project": name, "deleted": None}, f"{name} has no server")
             return 0
-        ctx.hcloud.delete_server(server["hetzner_id"])
-        ctx.event(server, "down")
-        db.mark_deleted(ctx.conn, server["id"])
-        ctx.known_hosts(server).unlink(missing_ok=True)
-        ctx.manifest(server).unlink(missing_ok=True)
-        summary = server_summary(ctx, db.get_server(ctx.conn, server["id"]))
-    emit(
-        ctx.args,
-        {"project": name, "deleted": server["hetzner_id"], **summary},
-        "\n".join([f"deleted server {server['hetzner_id']} for {name}", *summary_lines(summary)]),
+        summary = take_down(ctx, server, snapshot, "pause" if snapshot else "down")
+        remaining = db.latest_snapshot(ctx.conn, name)
+    lines = [f"{'paused' if snapshot else 'deleted'} server {server['hetzner_id']} for {name}", *summary_lines(summary)]
+    if not snapshot and remaining:
+        lines.append(
+            f"  note: snapshot {remaining['hetzner_image_id']} from {remaining['created_at'][:10]} is kept; "
+            f"the next `devbox up {name}` restores it (use --fresh for a clean server)"
+        )
+    emit(ctx.args, {"project": name, "deleted": server["hetzner_id"], **summary}, "\n".join(lines))
+    return 0
+
+
+def project_idle_timeout(ctx: Context, project) -> tuple[str, timedelta | None]:
+    value = project["idle_timeout"] or ctx.cfg.idle_timeout
+    return value, config.parse_duration(value)
+
+
+def idle_info(ctx: Context, server, now: datetime) -> dict:
+    project = db.get_project(ctx.conn, server["project"])
+    setting, timeout = project_idle_timeout(ctx, project)
+    last = db.last_activity(ctx.conn, server)
+    idle = now - last
+    return {
+        "last_activity": last.isoformat(timespec="seconds"),
+        "idle_seconds": int(idle.total_seconds()),
+        "idle_timeout": setting,
+        "remaining_seconds": None if timeout is None else int((timeout - idle).total_seconds()),
+    }
+
+
+def cmd_idle_check(ctx: Context) -> int:
+    now = datetime.now(timezone.utc)
+    action = ctx.cfg.idle_action
+    results = []
+    failed = False
+    with ctx.lock():
+        ctx.reconcile()
+        for server in db.active_servers(ctx.conn):
+            info = idle_info(ctx, server, now)
+            entry = {"project": server["project"], "server": server["hetzner_id"], **info, "action": None}
+            remaining = info["remaining_seconds"]
+            if remaining is None or remaining > 0:
+                results.append(entry)
+                continue
+            entry["action"] = action
+            if ctx.args.dry_run:
+                entry["dry_run"] = True
+            else:
+                try:
+                    entry["summary"] = take_down(ctx, server, action == "pause", f"idle_{action}")
+                except DevboxError as e:
+                    entry["error"] = str(e)
+                    failed = True
+            results.append(entry)
+
+    lines = []
+    for e in results:
+        idle = costs.duration(e["idle_seconds"])
+        if e["action"] is None:
+            if e["remaining_seconds"] is None:
+                lines.append(f"{e['project']}: idle {idle}, idle shutdown off")
+            else:
+                lines.append(f"{e['project']}: idle {idle}, "
+                             f"{costs.duration(e['remaining_seconds'])} left of {e['idle_timeout']}")
+        elif e.get("dry_run"):
+            lines.append(f"{e['project']}: idle {idle} (limit {e['idle_timeout']}), would {e['action']}")
+        elif "error" in e:
+            lines.append(f"{e['project']}: idle {idle}, {e['action']} FAILED: {e['error']}")
+        else:
+            verb = "paused" if e["action"] == "pause" else "deleted"
+            lines.append(f"{e['project']}: idle {idle} (limit {e['idle_timeout']}), {verb}")
+            lines += summary_lines(e["summary"])
+    emit(ctx.args, results, "\n".join(lines) or "no devbox servers")
+    return 1 if failed else 0
+
+
+def cmd_touch(ctx: Context) -> int:
+    server = ctx.running_server(ctx.args.name)
+    ctx.event(server, "touch")
+    info = idle_info(ctx, server, datetime.now(timezone.utc))
+    left = info["remaining_seconds"]
+    text = "activity recorded; " + (
+        "idle shutdown is off" if left is None else f"idle shutdown in {costs.duration(left)} without activity"
     )
+    emit(ctx.args, {"project": ctx.args.name, **info}, text)
     return 0
 
 
@@ -427,13 +692,21 @@ def cmd_status(ctx: Context) -> int:
     else:
         projects = db.list_projects(ctx.conn)
 
+    now = datetime.now(timezone.utc)
     result = []
     for p in projects:
         server = db.active_server(ctx.conn, p["name"])
-        entry = {"project": p["name"], "server": row(server), "processes": None}
+        snap = db.latest_snapshot(ctx.conn, p["name"])
+        entry = {
+            "project": p["name"],
+            "server": row(server),
+            "processes": None,
+            "snapshot": {**dict(snap), "monthly_cost": costs.snapshot_item(snap)["price_monthly"]} if snap else None,
+        }
         if server:
             entry["uptime"] = uptime(server["created_at"])
             entry["usage"] = costs.server_usage(server)
+            entry["idle"] = idle_info(ctx, server, now)
             if server["status"] == "running":
                 try:
                     entry["processes"] = ctx.remote(server).list_units()
@@ -441,17 +714,21 @@ def cmd_status(ctx: Context) -> int:
                     entry["processes_error"] = str(e)
         result.append(entry)
 
-    now = datetime.now(timezone.utc)
-    month_start = costs.month_start(now)
-    month = costs.summarize(
-        db.all_servers(ctx.conn, ctx.args.name), since=month_start, now=now
-    )
+    month = month_spend(ctx, ctx.args.name, now)
+    budget = budget_status(ctx)
 
     lines = []
     for e in result:
         s = e["server"]
+        snap = e["snapshot"]
         if not s:
-            if ctx.args.name:
+            if snap:
+                size = f"{snap['size_gb']:.1f} GB" if snap["size_gb"] is not None else "size unknown"
+                lines.append(
+                    f"{e['project']}: paused, snapshot {snap['hetzner_image_id']} from "
+                    f"{snap['created_at'][:16].replace('T', ' ')} ({size}, ~{costs.money(snap['monthly_cost'])}/month)"
+                )
+            elif ctx.args.name:
                 lines.append(f"{e['project']}: no server")
             continue
         lines.append(
@@ -459,21 +736,37 @@ def cmd_status(ctx: Context) -> int:
             f"(id {s['hetzner_id']}, up {e['uptime']})"
         )
         lines.append(f"  cost: {cost_line(e['usage'], s)}")
+        idle = e["idle"]
+        if idle["remaining_seconds"] is None:
+            lines.append(f"  idle {costs.duration(idle['idle_seconds'])} (idle shutdown off)")
+        else:
+            lines.append(
+                f"  idle {costs.duration(idle['idle_seconds'])}, {ctx.cfg.idle_action} after {idle['idle_timeout']} "
+                f"({costs.duration(max(0, idle['remaining_seconds']))} left)"
+            )
         if s["preview_url"]:
             lines.append(f"  preview: {s['preview_url']} -> port {s['preview_port']}")
         for proc in e["processes"] or []:
             lines.append(f"  {proc['name']}: {proc['active']} ({proc['sub']})")
         if "processes_error" in e:
             lines.append(f"  processes: {e['processes_error']}")
+        if snap:
+            lines.append(f"  snapshot {snap['hetzner_image_id']} kept (~{costs.money(snap['monthly_cost'])}/month)")
     for o in orphans:
         lines.append(f"unregistered devbox server {o['name']} (id {o['id']}, {o['ip']})")
+    for o in ctx.snapshot_orphans:
+        lines.append(f"unregistered devbox snapshot {o['id']} ({o['description']})")
     if not lines:
         lines.append("no devbox servers")
     scope = f" for {ctx.args.name}" if ctx.args.name else ""
-    lines.append(f"this month{scope}: {costs.money(month['total'])} (see `devbox costs`)")
+    month_line = f"this month{scope}: {costs.money(month['total'])}"
+    if budget and not ctx.args.name:
+        month_line += f" of {costs.money(budget['budget'])} budget ({costs.money(budget['left'])} left)"
+    lines.append(month_line + " (see `devbox costs`)")
     emit(
         ctx.args,
-        {"projects": result, "unregistered": orphans, "month": month},
+        {"projects": result, "unregistered": orphans, "unregistered_snapshots": ctx.snapshot_orphans,
+         "month": month, "budget": budget},
         "\n".join(lines),
     )
     return 0
@@ -494,35 +787,70 @@ def cmd_costs(ctx: Context) -> int:
     if a.project and not db.get_project(ctx.conn, a.project) and not db.all_servers(ctx.conn, a.project):
         raise DevboxError(f"unknown project '{a.project}'")
 
-    summary = costs.summarize(db.all_servers(ctx.conn, a.project), since, until, a.by, now)
+    summary = costs.summarize(ctx.cost_items(a.project), since, until, a.by, now)
     period = " to ".join(
         x for x in (
             since.date().isoformat() if since else "start",
             (until - timedelta(seconds=1)).date().isoformat() if until else "now",
         )
     )
-    lines = [f"{'KEY':<24} {'SERVERS':>7} {'TIME':>8} {'HOURS':>6} {'COST':>9}"]
+    lines = [f"{'KEY':<24} {'SERVERS':>7} {'SNAPS':>5} {'TIME':>8} {'HOURS':>6} {'COST':>9}"]
     for g in summary["groups"]:
         cost = costs.money(g["cost"]) + ("*" if g["unknown_price"] else "")
         lines.append(
-            f"{g['key']:<24} {g['servers']:>7} {costs.duration(g['seconds']):>8} "
+            f"{g['key']:<24} {g['servers']:>7} {g['snapshots']:>5} {costs.duration(g['seconds']):>8} "
             f"{g['billed_hours']:>6} {cost:>9}"
         )
     lines.append(
         f"total {period}: {costs.money(summary['total'])} over {summary['servers']} "
         f"server{'s' if summary['servers'] != 1 else ''}, {costs.duration(summary['seconds'])} running"
+        + (f", incl. {costs.money(summary['snapshot_total'])} for snapshots" if summary["snapshots"] else "")
     )
     if summary["unknown_price"]:
-        lines.append(f"* {summary['unknown_price']} server(s) without a known price are not counted")
-    lines.append("Estimates: server price only (incl. VAT), per started hour, capped monthly.")
+        lines.append(f"* {summary['unknown_price']} item(s) without a known price are not counted")
+    lines.append("Estimates incl. VAT: servers per started hour and snapshots per GB, both capped monthly. IPv4 and traffic not included.")
     emit(ctx.args, summary, "\n".join(lines))
+    return 0
+
+
+def cmd_snapshot_list(ctx: Context) -> int:
+    ctx.reconcile()
+    snaps = db.snapshots(ctx.conn, ctx.args.name)
+    data = []
+    for s in snaps:
+        item = costs.snapshot_item(s)
+        data.append({**dict(s), "monthly_cost": item["price_monthly"], "cost_so_far": costs.server_usage(item)["cost"]})
+    lines = [f"{'IMAGE':<10} {'PROJECT':<16} {'CREATED':<16} {'SIZE':>7} {'FROM':<12} {'€/MONTH':>8} {'SO FAR':>8}"]
+    for d in data:
+        size = f"{d['size_gb']:.1f}G" if d["size_gb"] is not None else "?"
+        lines.append(
+            f"{d['hetzner_image_id']:<10} {d['project']:<16} {d['created_at'][:16].replace('T', ' '):<16} "
+            f"{size:>7} {(d['server_type'] or '?'):<12} {costs.money(d['monthly_cost']):>8} {costs.money(d['cost_so_far']):>8}"
+        )
+    for o in ctx.snapshot_orphans:
+        lines.append(f"unregistered devbox snapshot {o['id']} ({o['description']})")
+    emit(ctx.args, {"snapshots": data, "unregistered": ctx.snapshot_orphans},
+         "\n".join(lines) if data or ctx.snapshot_orphans else "no snapshots")
+    return 0
+
+
+def cmd_snapshot_delete(ctx: Context) -> int:
+    image_id = ctx.args.image_id
+    with ctx.lock():
+        ctx.reconcile()
+        snap = db.get_snapshot_by_image(ctx.conn, image_id)
+        if snap is None or snap["status"] == "deleted":
+            raise DevboxError(f"no devbox snapshot {image_id}; see `devbox snapshot list`")
+        ctx.hcloud.delete_image(image_id)
+        db.mark_snapshot_deleted(ctx.conn, snap["id"])
+    emit(ctx.args, {"deleted": image_id, "project": snap["project"]}, f"deleted snapshot {image_id} of {snap['project']}")
     return 0
 
 
 def cmd_sync(ctx: Context) -> int:
     server = ctx.running_server(ctx.args.name)
     project = db.require_project(ctx.conn, ctx.args.name)
-    result = ctx.remote(server).sync(project["path"], ctx.manifest(server))
+    result = ctx.remote(server).sync(project["path"], ctx.manifest(ctx.args.name))
     ctx.event(server, "sync")
     text = (
         f"synced {result['files']} files, deleted {result['deleted']}"
@@ -653,7 +981,12 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--set-file", metavar="FILE", help="read notes from FILE ('-' for stdin)")
     p.set_defaults(func=cmd_project_notes)
 
-    p = proj_sub.add_parser("remove", help="forget a project", parents=[common])
+    p = proj_sub.add_parser("set", help="change project settings", parents=[common])
+    p.add_argument("name")
+    p.add_argument("--idle-timeout", metavar="DURATION", help="e.g. 2h, 1d, off, or 'default'")
+    p.set_defaults(func=cmd_project_set)
+
+    p = proj_sub.add_parser("remove", help="hide a project (cost history is kept)", parents=[common])
     p.add_argument("name")
     p.set_defaults(func=cmd_project_remove)
 
@@ -665,16 +998,44 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--zone", help="network zone, e.g. eu-central, us-east, us-west, ap-southeast")
     p.add_argument("--all", action="store_true", help="include types that are currently unavailable")
 
-    p = add("up", cmd_up, "create or reuse the server and sync code")
-    p.add_argument("name")
-    p.add_argument("--type", help="server type for a new server (see `devbox server-types`)")
-    p.add_argument("--location", help="location for a new server (see `devbox server-types`)")
-    p.add_argument("--force", action="store_true", help="allow a second devbox server")
+    for name, help, require_snapshot in [
+        ("up", "create (restoring the latest snapshot, if any) or reuse the server, and sync code", False),
+        ("resume", "like up, but only from a snapshot", True),
+    ]:
+        p = add(name, cmd_up, help)
+        p.add_argument("name")
+        p.add_argument("--type", help="server type for a new server (default: last used)")
+        p.add_argument("--location", help="location for a new server (default: last used)")
+        p.add_argument("--force", action="store_true", help="allow a second devbox server")
+        p.add_argument("--over-budget", action="store_true", help="create even if the monthly budget is used up")
+        p.set_defaults(require_snapshot=require_snapshot, fresh=False)
+        if not require_snapshot:
+            p.add_argument("--fresh", action="store_true", help="ignore snapshots and start from a clean image")
 
     p = add("down", cmd_down, "delete the server")
     p.add_argument("name")
+    p.add_argument("--snapshot", action="store_true", help="snapshot the server first (same as pause)")
 
-    p = add("costs", cmd_costs, "estimated server costs for a period, grouped")
+    p = add("pause", cmd_down, "snapshot the server, then delete it; `up` restores it")
+    p.add_argument("name")
+    p.set_defaults(snapshot=True)
+
+    p = add("touch", cmd_touch, "record activity so idle shutdown waits")
+    p.add_argument("name")
+
+    p = add("idle-check", cmd_idle_check, "pause or delete servers idle past their timeout (run from cron)")
+    p.add_argument("--dry-run", action="store_true", help="only report what would happen")
+
+    snap = sub.add_parser("snapshot", help="manage snapshots", parents=[common])
+    snap_sub = snap.add_subparsers(dest="snapshot_command", required=True)
+    p = snap_sub.add_parser("list", help="list snapshots and their cost", parents=[common])
+    p.add_argument("name", nargs="?")
+    p.set_defaults(func=cmd_snapshot_list)
+    p = snap_sub.add_parser("delete", help="delete a snapshot", parents=[common])
+    p.add_argument("image_id", type=int)
+    p.set_defaults(func=cmd_snapshot_delete)
+
+    p = add("costs", cmd_costs, "estimated server and snapshot costs for a period, grouped")
     p.add_argument("--project", help="only this project")
     period = p.add_mutually_exclusive_group()
     period.add_argument("--month", metavar="YYYY-MM", help="one calendar month (UTC)")

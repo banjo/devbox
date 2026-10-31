@@ -65,7 +65,16 @@ Background processes are not stored in the registry. They are systemd units on t
 
 Migration 2 adds cost tracking: `servers.price_hourly` and `servers.price_monthly` (stored by `up` from the offer it created), `projects.removed_at` (so `project remove` keeps cost history), and an `events` table (project, server, kind, time) counting `up`, `sync`, `exec`, `exec_detach`, `expose` and `down` for the per-server stats.
 
-Snapshots later: a `snapshots` table (project, hetzner_image_id, created_at, status) in migration 3. `up` then restores from the latest snapshot when one exists, and `down --snapshot` creates one first.
+Migration 3 adds snapshots (issue #5): a `snapshots` table (project, Hetzner image id, source server, type, location, architecture, size, disk size, price per GB per month, status, created/deleted time), `servers.snapshot_id` (which snapshot a server was restored from) and `projects.idle_timeout`. Snapshots carry the same ownership labels as servers and are reconciled the same way.
+
+### Faster and cheaper sessions (issue #5)
+
+- `pause` / `down --snapshot`: clean shutdown, snapshot, wait until available, then delete the server. On failure the server is kept and powered on again. Snapshots beyond `keep_snapshots` (default 1) are deleted afterwards.
+- `up` restores the latest snapshot unless `--fresh`; `resume` requires one. The server must match the snapshot's architecture and disk size.
+- `up` without `--type`/`--location` uses the config default or the project's last server choice; sold-out or incompatible choices list alternatives, same region first.
+- `idle-check` (cron/systemd timer) pauses or deletes servers whose last event is older than the idle timeout; `touch` records activity.
+- `monthly_budget` with `budget_action = warn|block` is checked before `up` creates a server; `status` shows what is left.
+- Snapshot storage is part of all cost reports.
 
 ### Project notes
 
@@ -101,7 +110,12 @@ Next time the agent reads the notes first and does not have to work it out again
 | `devbox ssh NAME` | Opens a shell on the server. |
 | `devbox status [NAME]` | Shows each project's server (or `none`), IP, type, uptime, cost so far, background processes and preview URL, plus this month's total. |
 | `devbox down NAME` | Deletes the server and marks it `deleted`, then prints its uptime, billed hours, estimated cost, activity counts and the project's total. Anything that exists only on the server (database contents, files not synced back) is lost. |
-| `devbox costs [--month M \| --days N \| --since D] [--until D] [--project P] [--by project\|month\|day\|type\|server]` | Estimated cost for any period, grouped. Per started hour, capped at the monthly price per calendar month, server price only. |
+| `devbox costs [--month M \| --days N \| --since D] [--until D] [--project P] [--by project\|month\|day\|type\|server]` | Estimated cost for any period, grouped, including snapshots. |
+| `devbox pause NAME` / `devbox down NAME --snapshot` | Snapshot, then delete the server. |
+| `devbox resume NAME` | `up`, but only from a snapshot. |
+| `devbox snapshot list [NAME]` / `devbox snapshot delete IMAGE_ID` | Manage snapshots. |
+| `devbox idle-check [--dry-run]` / `devbox touch NAME` | Idle shutdown and keep-alive. |
+| `devbox project set NAME --idle-timeout D` | Per-project idle timeout. |
 
 All commands accept `--json` for output the agent can parse.
 
@@ -173,9 +187,7 @@ The skill tells the agent:
 
 ## 9. Later, if the POC works
 
-- Snapshots (migration 3): `down --snapshot`, restore on `up`
 - Database backups to S3
 - Fixed preview hostname with a named Cloudflare tunnel (and optionally Access)
-- Automatic shutdown of idle servers and cost estimates
 - Pulling changes made on the server back to the local copy
 - Running as a non-root user and pinned host keys

@@ -203,3 +203,55 @@ def test_no_available_flag_anywhere_means_unknown():
 
     types = [server_type("cx23", 2, 4.0, "x86", [("fsn1", False, 4.0)])]
     assert build_offers(types, LOCATIONS)[0]["available"] is None
+
+
+IMAGE = {
+    "id": 900, "description": "devbox crm", "status": "available", "image_size": 2.4,
+    "disk_size": 40, "architecture": "x86", "created": "2026-10-31T10:00:00+00:00",
+    "labels": {**OWNED, "project": "crm"},
+}
+
+
+def test_create_snapshot_labels_and_finds_image(fake_hcloud):
+    hc, calls, respond = fake_hcloud
+    respond("image_list", [IMAGE])
+    info = hc.create_snapshot(42, "crm", "devbox crm")
+    assert info["id"] == 900 and info["size_gb"] == 2.4 and info["project"] == "crm"
+    create = calls()[0]["args"]
+    assert create[:4] == ["server", "create-image", "--type", "snapshot"]
+    assert "devbox-controller=abc123" in create and "project=crm" in create
+    op = next(a for a in create if a.startswith("devbox-op="))
+    assert calls()[1]["args"][:6] == ["image", "list", "-t", "snapshot", "-l", op]
+
+
+def test_list_snapshots_skips_other_controllers(fake_hcloud):
+    hc, _, respond = fake_hcloud
+    other = dict(IMAGE, id=901, labels={"managed-by": "devbox", "devbox-controller": "other"})
+    respond("image_list", [IMAGE, other])
+    assert [i["id"] for i in hc.list_snapshots()] == [900]
+
+
+def test_delete_image_requires_ownership(fake_hcloud):
+    hc, calls, respond = fake_hcloud
+    respond("image_describe", dict(IMAGE, labels={"owner": "someone"}))
+    with pytest.raises(DevboxError, match="refusing"):
+        hc.delete_image(900)
+    assert not any(c["args"][:2] == ["image", "delete"] for c in calls())
+
+    respond("image_describe", IMAGE)
+    hc.delete_image(900)
+    assert calls()[-1]["args"] == ["image", "delete", "900"]
+
+
+def test_shutdown_falls_back_to_poweroff(tmp_path):
+    hc = Hcloud(None, "abc123")
+    seen = []
+
+    def fake_run(*args, **kw):
+        seen.append(args[:2])
+        if args[1] == "shutdown":
+            raise DevboxError("timeout")
+
+    hc.run = fake_run
+    hc.shutdown(42)
+    assert seen == [("server", "shutdown"), ("server", "poweroff")]

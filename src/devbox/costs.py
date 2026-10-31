@@ -1,15 +1,39 @@
 """Cost estimates for devbox servers.
 
 Hetzner bills cloud servers per started hour, capped at the monthly price per
-calendar month. Prices are the gross prices from `hcloud server-type list` at
-the time the server was created. Only the server itself is counted: primary
-IPv4 addresses, traffic overage and snapshots are not included.
+calendar month. Server prices are the gross prices from `hcloud server-type
+list` at the time the server was created. Snapshots are priced per GB per
+month and counted the same way (monthly price / 730 per hour, capped monthly).
+Primary IPv4 addresses and traffic overage are not included.
 """
 
 import math
 from datetime import date, datetime, timedelta, timezone
 
 CURRENCY = "EUR"
+HOURS_PER_MONTH = 730
+
+
+def server_item(row) -> dict:
+    return {**dict(row), "kind": "server"}
+
+
+def snapshot_item(row) -> dict:
+    monthly = None
+    if row["size_gb"] is not None and row["price_per_gb_month"] is not None:
+        monthly = row["size_gb"] * row["price_per_gb_month"]
+    return {
+        "id": f"snapshot-{row['id']}",
+        "kind": "snapshot",
+        "project": row["project"],
+        "hetzner_id": row["hetzner_image_id"],
+        "server_type": "snapshot",
+        "location": "-",
+        "created_at": row["created_at"],
+        "deleted_at": row["deleted_at"],
+        "price_hourly": monthly / HOURS_PER_MONTH if monthly is not None else None,
+        "price_monthly": monthly,
+    }
 
 
 def parse_ts(value: str) -> datetime:
@@ -100,42 +124,53 @@ def summarize(servers, since=None, until=None, by: str = "project", now: datetim
     now = now or datetime.now(timezone.utc)
     groups: dict[str, dict] = {}
     total = 0.0
+    snapshot_total = 0.0
     unknown = 0
     total_seconds = 0
-    counted = set()
+    counted = {"server": set(), "snapshot": set()}
 
-    def add(key: str, usage: dict) -> None:
-        g = groups.setdefault(key, {"key": key, "cost": 0.0, "seconds": 0, "billed_hours": 0, "servers": 0, "unknown_price": 0})
-        g["seconds"] += usage["seconds"]
-        g["billed_hours"] += usage["billed_hours"]
-        g["servers"] += 1
+    def add(key: str, kind: str, usage: dict) -> None:
+        g = groups.setdefault(key, {
+            "key": key, "cost": 0.0, "seconds": 0, "billed_hours": 0,
+            "servers": 0, "snapshots": 0, "snapshot_cost": 0.0, "unknown_price": 0,
+        })
+        g["servers" if kind == "server" else "snapshots"] += 1
+        if kind == "server":
+            g["seconds"] += usage["seconds"]
+            g["billed_hours"] += usage["billed_hours"]
         if usage["cost"] is None:
             g["unknown_price"] += 1
         else:
             g["cost"] += usage["cost"]
+            if kind == "snapshot":
+                g["snapshot_cost"] += usage["cost"]
 
     for s in servers:
+        kind = s.get("kind", "server") if isinstance(s, dict) else "server"
         window = server_window(s, since, until, now)
         if window is None:
             continue
         usage = server_usage(s, since, until, now)
-        total_seconds += usage["seconds"]
+        if kind == "server":
+            total_seconds += usage["seconds"]
         if usage["cost"] is None:
             unknown += 1
         else:
             total += usage["cost"]
-        counted.add(s["id"])
+            if kind == "snapshot":
+                snapshot_total += usage["cost"]
+        counted[kind].add(s["id"])
 
         if by in ("month", "day"):
             start, end = window
             for key, b_start, b_end in buckets(start, end, by):
-                add(key, server_usage(s, max(b_start, start), min(b_end, end), now))
+                add(key, kind, server_usage(s, max(b_start, start), min(b_end, end), now))
         elif by == "project":
-            add(s["project"], usage)
+            add(s["project"], kind, usage)
         elif by == "type":
-            add(f"{s['server_type']} {s['location']}", usage)
+            add("snapshot" if kind == "snapshot" else f"{s['server_type']} {s['location']}", kind, usage)
         elif by == "server":
-            add(f"{s['project']}#{s['hetzner_id']}", usage)
+            add(f"{s['project']}#{'snapshot-' if kind == 'snapshot' else ''}{s['hetzner_id']}", kind, usage)
         else:
             raise ValueError(by)
 
@@ -145,11 +180,14 @@ def summarize(servers, since=None, until=None, by: str = "project", now: datetim
         "until": until.isoformat() if until else None,
         "by": by,
         "total": round(total, 4),
+        "snapshot_total": round(snapshot_total, 4),
         "seconds": total_seconds,
-        "servers": len(counted),
+        "servers": len(counted["server"]),
+        "snapshots": len(counted["snapshot"]),
         "unknown_price": unknown,
         "groups": [
-            {**g, "cost": round(g["cost"], 4)} for g in sorted(groups.values(), key=lambda g: g["key"])
+            {**g, "cost": round(g["cost"], 4), "snapshot_cost": round(g["snapshot_cost"], 4)}
+            for g in sorted(groups.values(), key=lambda g: g["key"])
         ],
     }
 

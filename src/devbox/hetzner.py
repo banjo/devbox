@@ -1,6 +1,9 @@
 import json
 import os
+import secrets
 import subprocess
+import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -108,6 +111,73 @@ class Hcloud:
 
     def delete_server(self, server_id: int) -> None:
         self.run("server", "delete", str(server_id), parse=False)
+
+    def shutdown(self, server_id: int) -> None:
+        """Graceful shutdown; hard power-off if the server does not stop in time."""
+        try:
+            self.run("server", "shutdown", "--wait", "--wait-timeout", "120s", str(server_id), parse=False)
+        except DevboxError:
+            self.run("server", "poweroff", str(server_id), parse=False)
+
+    def poweron(self, server_id: int) -> None:
+        self.run("server", "poweron", str(server_id), parse=False)
+
+    # Snapshots
+
+    def list_snapshots(self) -> list[dict]:
+        """Snapshots of this controller, plus snapshots without a controller label."""
+        data = self.run("image", "list", "-t", "snapshot", "-l", MANAGED_LABEL, "-o", "json") or []
+        result = []
+        for image in data:
+            owner = (image.get("labels") or {}).get(CONTROLLER_LABEL)
+            if owner in (None, self.controller_id):
+                result.append(image_info(image))
+        return result
+
+    def create_snapshot(self, server_id: int, project: str, description: str) -> dict:
+        """Create a snapshot and wait until it is available."""
+        op = secrets.token_hex(6)
+        self.run(
+            "server", "create-image", "--type", "snapshot",
+            "--description", description,
+            *self.label_args(project=project, **{"devbox-op": op}),
+            str(server_id),
+            parse=False,
+        )
+        # create-image has no JSON output; find the image by its unique label.
+        deadline = time.monotonic() + 1800
+        while True:
+            data = self.run(
+                "image", "list", "-t", "snapshot", "-l", f"devbox-op={op}", "-o", "json"
+            ) or []
+            info = image_info(data[0]) if data else None
+            if info and info["status"] == "available":
+                return info
+            if time.monotonic() > deadline:
+                state = info["status"] if info else "missing"
+                raise DevboxError(f"snapshot did not become available in time (status: {state})")
+            time.sleep(5)
+
+    def delete_image(self, image_id: int) -> None:
+        data = self.run("image", "describe", str(image_id), "-o", "json")
+        if not data or not self.owns(data):
+            raise DevboxError(f"image {image_id} is not owned by this devbox install; refusing to delete it")
+        self.run("image", "delete", str(image_id), parse=False)
+
+    def snapshot_price_per_gb_month(self) -> float | None:
+        """Gross snapshot price from Hetzner's pricing API, or None if it cannot be read."""
+        token = self.env.get("HCLOUD_TOKEN")
+        if not token:
+            return None
+        req = urllib.request.Request(
+            "https://api.hetzner.cloud/v1/pricing", headers={"Authorization": f"Bearer {token}"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                pricing = json.load(resp)["pricing"]
+            return _price(pricing["image"]["price_per_gb_month"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
 
     # Server types and locations
 
@@ -266,6 +336,19 @@ def _price(p: dict | None) -> float | None:
         return None
     value = p.get("gross") or p.get("net")
     return float(value) if value is not None else None
+
+
+def image_info(i: dict) -> dict:
+    return {
+        "id": i["id"],
+        "description": i.get("description"),
+        "status": i.get("status"),
+        "size_gb": i.get("image_size"),
+        "disk_gb": i.get("disk_size"),
+        "architecture": i.get("architecture"),
+        "project": (i.get("labels") or {}).get("project"),
+        "created": i.get("created"),
+    }
 
 
 def server_info(s: dict) -> dict:

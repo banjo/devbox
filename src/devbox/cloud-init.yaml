@@ -18,9 +18,13 @@ write_files:
       export MISE_TRUSTED_CONFIG_PATHS=/srv/app
 
 runcmd:
+  # Idempotent, because these run again when a server is restored from a snapshot.
   - mkdir -p /srv/app
-  - curl -fsSL https://get.docker.com | sh
-  - curl -fsSL https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh
-  - curl -fsSL -o /tmp/cloudflared.deb "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$(dpkg --print-architecture).deb"
-  - dpkg -i /tmp/cloudflared.deb
-  - rm -f /tmp/cloudflared.deb
+  - command -v docker >/dev/null || curl -fsSL https://get.docker.com | sh
+  - command -v mise >/dev/null || curl -fsSL https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh
+  - |
+    if ! command -v cloudflared >/dev/null; then
+      curl -fsSL -o /tmp/cloudflared.deb "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$(dpkg --print-architecture).deb"
+      dpkg -i /tmp/cloudflared.deb
+      rm -f /tmp/cloudflared.deb
+    fi

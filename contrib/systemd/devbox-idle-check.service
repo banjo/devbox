@@ -1,0 +1,7 @@
+[Unit]
+Description=Pause or delete idle devbox servers
+
+[Service]
+Type=oneshot
+# Adjust if devbox is installed elsewhere (`command -v devbox`).
+ExecStart=%h/.local/bin/devbox idle-check

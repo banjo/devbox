@@ -67,3 +67,24 @@ def test_matching_state_is_unchanged(conn):
     db.insert_server(conn, "crm", 10, "running", ip="1.2.3.4")
     assert db.reconcile(conn, [live(10, "crm")]) == []
     assert [s["hetzner_id"] for s in db.active_servers(conn)] == [10]
+
+
+def image(id, project="crm", status="available"):
+    return {"id": id, "description": "x", "status": status, "size_gb": 2.0, "disk_gb": 40,
+            "architecture": "x86", "project": project, "created": "2026-10-31T10:00:00+00:00"}
+
+
+def test_snapshot_gone_in_hetzner_is_marked_deleted(conn):
+    db.insert_snapshot(conn, "crm", 500, size_gb=2.0)
+    assert db.reconcile_snapshots(conn, []) == []
+    assert db.latest_snapshot(conn, "crm") is None
+
+
+def test_unrecorded_snapshot_is_adopted(conn):
+    # For example, a crash during `pause` after the snapshot was created.
+    assert db.reconcile_snapshots(conn, [image(501)]) == []
+    assert db.latest_snapshot(conn, "crm")["hetzner_image_id"] == 501
+
+
+def test_unknown_project_snapshot_is_reported(conn):
+    assert [i["id"] for i in db.reconcile_snapshots(conn, [image(502, project="nope")])] == [502]
