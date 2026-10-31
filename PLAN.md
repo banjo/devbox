@@ -83,6 +83,7 @@ Next time the agent reads the notes first and does not have to work it out again
 | `devbox project add NAME --path P` | Registers a project. |
 | `devbox project list` | Lists projects and whether each has a server. |
 | `devbox project notes NAME [--set TEXT \| --set-file F]` | Shows or replaces the project's notes. |
+| `devbox project remove NAME` | Forgets a project that has no server. |
 | `devbox up NAME` | Creates the server if none is running (waits for cloud-init), then syncs code. Runs no project commands. Running it again reuses the server and only syncs. |
 | `devbox sync NAME` | Copies local code to the server. |
 | `devbox exec NAME -- CMD...` | Runs a command in `/srv/app` on the server, waits for it, and returns its exit code. |
@@ -122,7 +123,9 @@ src/devbox/remote.py     # ssh, rsync, systemd units, tunnel URL
 src/devbox/cloud-init.yaml
 skills/hetzner-devbox/SKILL.md
 tests/test_db.py         # migrations, one-server-per-project rule, notes
-tests/test_reconcile.py  # registry vs fake hcloud output
+tests/test_reconcile.py  # registry vs Hetzner state
+tests/test_hetzner.py    # hcloud wrapper against a fake hcloud executable
+tests/test_cli.py        # project commands, exec argument handling, no local fallback
 ```
 
 ## 7. The skill

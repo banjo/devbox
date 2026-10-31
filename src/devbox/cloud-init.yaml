@@ -1,0 +1,26 @@
+#cloud-config
+package_update: true
+packages:
+  - build-essential
+  - ca-certificates
+  - curl
+  - git
+  - jq
+  - rsync
+  - unzip
+
+write_files:
+  - path: /etc/profile.d/devbox.sh
+    permissions: "0644"
+    content: |
+      export PATH="/root/.local/share/mise/shims:$PATH"
+      export MISE_YES=1
+      export MISE_TRUSTED_CONFIG_PATHS=/srv/app
+
+runcmd:
+  - mkdir -p /srv/app
+  - curl -fsSL https://get.docker.com | sh
+  - curl -fsSL https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh
+  - curl -fsSL -o /tmp/cloudflared.deb "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$(dpkg --print-architecture).deb"
+  - dpkg -i /tmp/cloudflared.deb
+  - rm -f /tmp/cloudflared.deb
