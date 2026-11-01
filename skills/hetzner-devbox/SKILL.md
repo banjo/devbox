@@ -108,7 +108,7 @@ Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/a
 
 ### Idle shutdown
 
-- Servers without devbox activity for the idle timeout (default 8h) are paused automatically by `devbox idle-check`, if the user has scheduled it. `devbox status` shows how long is left.
+- Servers without devbox activity for the idle timeout (default 8h) are paused automatically by `devbox idle-check`, if the user has scheduled it. `devbox status` shows how long is left. If `status` or `up` warns that idle shutdown is not enforced, tell the user: servers keep running (and costing money) until paused by hand.
 - Commands you run against the server (`exec`, `sync`, `ps`, `logs`, `ssh`, ...) count as activity; `status` does not. Viewing the preview in a browser does not count either. While the user is testing by hand for a long time, run `devbox touch NAME` now and then.
 - Running foreground `exec` commands are never interrupted. For long builds or test runs in the background, start them with `devbox exec NAME --detach --keep-alive --name build -- '...'` so idle shutdown waits for them. Don't use `--keep-alive` for dev servers; they would keep the server alive forever.
 - If `status` says the server is powered off (for example after a pause that couldn't delete it), tell the user it is still billed and either finish with `devbox pause NAME` or start it again with `devbox up NAME`.
@@ -128,7 +128,7 @@ Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/a
 | "Start the app so I can test it" | If no server is running, pick an available server type, ask, `up`; then follow or work out the notes, `expose`, give the URL |
 | "Change the dashboard layout" | Edit locally; `sync` if a server is running |
 | "Run the tests" | `devbox exec NAME -- 'npm test'` (or whatever the notes say) |
-| "Which servers are running?" | `devbox status` |
+| "Which servers are running?" | `devbox status`. It only covers this controller; also report servers it lists under other controllers, and never treat `no devbox servers for controller ...` alone as "nothing is running in Hetzner" |
 | "What have I spent this month?" | `devbox costs --month YYYY-MM` |
 | "What did we run on this project?" | `devbox history NAME` |
 | "Something's broken with devbox" | `devbox doctor` |

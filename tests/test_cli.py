@@ -147,7 +147,9 @@ class FakeCloud:
     """In-memory stand-in for Hcloud in end-to-end CLI tests."""
 
     def __init__(self, token=None, controller_id="test"):
+        self.controller_id = controller_id
         self.servers: dict[int, dict] = {}
+        self.foreign: list[dict] = []
         self.images: dict[int, dict] = {}
         self.calls: list[tuple] = []
         self.next_id = 100
@@ -168,6 +170,10 @@ class FakeCloud:
 
     def list_servers(self):
         return [dict(s) for s in self.servers.values()]
+
+    def list_all_servers(self):
+        mine = [{"controller": self.controller_id, **s} for s in self.servers.values()]
+        return mine + [dict(s) for s in self.foreign]
 
     def list_snapshots(self):
         return [dict(i) for i in self.images.values()]
@@ -280,6 +286,8 @@ def cloud(monkeypatch):
     )
     monkeypatch.setattr(cli.Remote, "list_units", lambda self: [])
     monkeypatch.setattr(cli.Remote, "running_work", lambda self: list(fake.running_work))
+    # Never read the real crontab/systemd; tests that care set this themselves.
+    monkeypatch.setattr(cli.admin, "_run", lambda cmd: None)
     return fake
 
 
@@ -695,7 +703,8 @@ def test_adopted_snapshot_is_priced_and_counts_for_budget(capsys, isolated, clou
     run(capsys, "project", "add", "crm", "--path", str(isolated / "crm"))
     start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     cloud.images[700] = {
-        "id": 700, "description": "old", "status": "available", "size_gb": 20.0, "disk_gb": 40,
+        # Large enough to pass the budget within seconds of the month starting.
+        "id": 700, "description": "old", "status": "available", "size_gb": 100_000.0, "disk_gb": 40,
         "architecture": "x86", "project": "crm", "created": start.isoformat(),
     }
     code, _, err = run(capsys, "up", "crm", "--fresh", "--type", "cx23", "--location", "fsn1")

@@ -30,6 +30,7 @@ class Context:
         self._hcloud = None
         self._snapshot_price = None
         self.snapshot_orphans: list[dict] = []
+        self.foreign_servers: list[dict] = []
 
     @property
     def cfg(self) -> config.Config:
@@ -81,7 +82,12 @@ class Context:
         return server
 
     def reconcile(self) -> list[dict]:
-        orphans = db.reconcile(self.conn, self.hcloud.list_servers())
+        # One provider listing: this controller's servers are reconciled; other
+        # controllers' servers are only kept for reporting, never adopted.
+        everything = self.hcloud.list_all_servers()
+        mine = [s for s in everything if s["controller"] in (None, self.hcloud.controller_id)]
+        self.foreign_servers = [s for s in everything if s["controller"] not in (None, self.hcloud.controller_id)]
+        orphans = db.reconcile(self.conn, mine)
         self.snapshot_orphans = db.reconcile_snapshots(self.conn, self.hcloud.list_snapshots())
         self.fill_missing_prices()
         return orphans
@@ -567,6 +573,10 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
 def report_up(ctx: Context, r: dict, deadline: "startup.Deadline") -> int:
     project, server, snapshot, offer = r["project"], r["server"], r["snapshot"], r["offer"]
     name = project["name"]
+    if project_idle_timeout(ctx, project)[1] is not None:
+        _, warning = idle_scheduler_warning()
+        if warning:
+            r["warnings"].append(warning)
     data = {
         "project": name,
         "created": r["created"],
@@ -894,6 +904,14 @@ def project_idle_timeout(ctx: Context, project) -> tuple[str, timedelta | None]:
     return value, config.parse_duration(value)
 
 
+def idle_scheduler_warning() -> tuple[dict, str | None]:
+    """The idle-check schedule, and a warning when timeouts are set but nothing enforces them."""
+    sched = admin.idle_scheduler()
+    if sched["status"] == admin.OK:
+        return sched, None
+    return sched, f"idle shutdown is not enforced: {sched['detail']} (see `devbox doctor`)"
+
+
 def idle_info(ctx: Context, server, now: datetime) -> dict:
     project = db.get_project(ctx.conn, server["project"])
     setting, timeout = project_idle_timeout(ctx, project)
@@ -1069,8 +1087,22 @@ def cmd_status(ctx: Context) -> int:
         lines.append(f"unregistered devbox server {o['name']} (id {o['id']}, {o['ip']})")
     for o in ctx.snapshot_orphans:
         lines.append(f"unregistered devbox snapshot {o['id']} ({o['description']})")
+    controller = ctx.hcloud.controller_id
+    foreign = ctx.foreign_servers
     if not lines:
-        lines.append("no devbox servers")
+        lines.append(f"no devbox servers for controller {controller}")
+    if foreign:
+        lines.append("other controllers' devbox servers in this Hetzner project (not managed from here):")
+        for s in foreign:
+            lines.append(f"  {s['name']} (id {s['id']}, {s['status']}, controller {s['controller']}, project {s['project'] or '?'})")
+    elif not ctx.args.name:
+        lines.append("no devbox servers from other controllers in this Hetzner project")
+
+    idle_enforcement = None
+    if any(e["server"] and e["idle"]["remaining_seconds"] is not None for e in result):
+        idle_enforcement, warning = idle_scheduler_warning()
+        if warning:
+            lines.append(f"warning: {warning}")
     scope = f" for {ctx.args.name}" if ctx.args.name else ""
     month_line = f"this month{scope}: {costs.money(month['total'])}"
     if budget and not ctx.args.name:
@@ -1080,8 +1112,9 @@ def cmd_status(ctx: Context) -> int:
     lines.append(month_line + " (see `devbox costs`)")
     emit(
         ctx.args,
-        {"projects": result, "unregistered": orphans, "unregistered_snapshots": ctx.snapshot_orphans,
-         "month": month, "budget": budget},
+        {"controller": controller, "scope": "controller", "projects": result, "unregistered": orphans,
+         "unregistered_snapshots": ctx.snapshot_orphans, "other_controllers": foreign,
+         "idle_enforcement": idle_enforcement, "month": month, "budget": budget},
         "\n".join(lines),
     )
     return 0
@@ -1487,9 +1520,21 @@ def dump_database(ctx: Context, server, project: str, database: dict, output: Pa
             os.chmod(folder, 0o700)
     else:
         dest.parent.mkdir(parents=True, exist_ok=True)
-    size = ctx.remote(server).stream_out(engine.dump_command(database["settings"]), dest)
+    with explain_db_failure(database):
+        size = ctx.remote(server).stream_out(engine.dump_command(database["settings"]), dest)
     ctx.event(server, "db_dump")
     return {"database": database["name"], "engine": engine.name, "path": str(dest), "bytes": size}
+
+
+@contextlib.contextmanager
+def explain_db_failure(database: dict):
+    try:
+        yield
+    except DevboxError as e:
+        hint = databases.failure_hint(database["settings"], str(e))
+        if hint is None:
+            raise
+        raise DevboxError(f"{e}; {hint}", code=e.code, exit_code=e.exit_code, details=e.details) from e
 
 
 def human_size(n: int) -> str:
@@ -1581,7 +1626,8 @@ def cmd_db_restore(ctx: Context) -> int:
             "pass --yes to confirm"
         )
     engine = databases.get_engine(database["engine"])
-    ctx.remote(server).stream_in(engine.restore_command(database["settings"]), src)
+    with explain_db_failure(database):
+        ctx.remote(server).stream_in(engine.restore_command(database["settings"]), src)
     ctx.event(server, "db_restore")
     emit(ctx.args, {"database": database["name"], "restored_from": str(src)}, f"restored {database['name']} from {src}")
     return 0
@@ -1682,14 +1728,24 @@ def cmd_ssh(ctx: Context) -> int:
     os.execvp(cmd[0], cmd)
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
+    class Parser(argparse.ArgumentParser):
+        # Subparsers are created with the same class, so usage errors are JSON at every level.
+        def error(self, message):
+            if not json_errors:
+                super().error(message)
+            print(json.dumps({"error": message, "code": "usage"}))
+            sys.exit(2)
+
+    # `--json` is accepted before or after any (sub)command. Its default must stay
+    # SUPPRESS: the action is shared by every parser, and a real default would let
+    # each subparser reset a `--json` given earlier. `main` fills in False.
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
 
-    parser = argparse.ArgumentParser(
+    parser = Parser(
         prog="devbox", description="Temporary Hetzner development servers.", parents=[common]
     )
-    parser.set_defaults(json=False)
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add(name, func, help, **kw):
@@ -1908,7 +1964,8 @@ def main(argv: list[str] | None = None) -> int:
     if "--" in argv:
         i = argv.index("--")
         argv, cmd = argv[:i], argv[i + 1:]
-    args = build_parser().parse_args(argv)
+    args = build_parser(json_errors="--json" in argv).parse_args(argv)
+    args.json = getattr(args, "json", False)
     args.cmd = cmd
     ctx = Context(args)
     try:

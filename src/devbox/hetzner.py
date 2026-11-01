@@ -125,13 +125,16 @@ class Hcloud:
 
     def list_servers(self) -> list[dict]:
         """Servers of this controller, plus servers from before controller labels existed."""
+        return [s for s in self.list_all_servers() if s["controller"] in (None, self.controller_id)]
+
+    def list_all_servers(self) -> list[dict]:
+        """Every devbox server in the Hetzner project, including other controllers' (read only).
+
+        `controller` is the owning controller id, None for servers from before
+        controller labels existed.
+        """
         data = self.run("server", "list", "-l", MANAGED_LABEL, "-o", "json") or []
-        result = []
-        for s in data:
-            owner = (s.get("labels") or {}).get(CONTROLLER_LABEL)
-            if owner in (None, self.controller_id):
-                result.append(server_info(s))
-        return result
+        return [server_info(s) for s in data]
 
     def create_server(
         self,
@@ -458,6 +461,7 @@ def server_info(s: dict) -> dict:
         "server_type": (s.get("server_type") or {}).get("name"),
         "location": location.get("name"),
         "project": (s.get("labels") or {}).get("project"),
+        "controller": (s.get("labels") or {}).get(CONTROLLER_LABEL),
         "created": s.get("created"),
     }
 

@@ -172,16 +172,25 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess | None:
 def schedule_check(ctx) -> dict:
     if config.parse_duration(ctx.cfg.idle_timeout) is None:
         return check("idle shutdown", OK, "idle_timeout is off")
+    return idle_scheduler(ctx.cfg.idle_timeout)
+
+
+def idle_scheduler(timeout: str | None = None) -> dict:
+    """Whether `devbox idle-check` is scheduled on this machine (cron or the systemd user timer).
+
+    Only detects the schedule; it can't tell which config/controller the job uses.
+    """
+    suffix = f", timeout {timeout}" if timeout else ""
     cron = _run(["crontab", "-l"])
     if cron and cron.returncode == 0 and cron_has_idle_check(cron.stdout):
-        return check("idle shutdown", OK, f"scheduled (cron), timeout {ctx.cfg.idle_timeout}")
+        return check("idle shutdown", OK, f"scheduled (cron){suffix}")
     timer = "devbox-idle-check.timer"
     enabled = _run(["systemctl", "--user", "is-enabled", timer])
     active = _run(["systemctl", "--user", "is-active", timer])
     is_enabled = bool(enabled and enabled.returncode == 0 and enabled.stdout.strip() == "enabled")
     is_active = bool(active and active.returncode == 0 and active.stdout.strip() == "active")
     if is_enabled and is_active:
-        return check("idle shutdown", OK, f"scheduled (systemd timer), timeout {ctx.cfg.idle_timeout}")
+        return check("idle shutdown", OK, f"scheduled (systemd timer){suffix}")
     if is_enabled:
         return check("idle shutdown", WARN, f"{timer} is enabled but not active, so idle servers keep running",
                      f"systemctl --user start {timer}")

@@ -98,11 +98,12 @@ devbox costs [--month M | --days N | --since D] [--until D] [--project P] [--by 
                                           estimated server + snapshot cost for a period
 ```
 
-All commands accept `--json`. `exec` runs a single argument as a shell script (`devbox exec myapp -- 'npm ci && npm test'`) and quotes several arguments as one command.
+All commands accept `--json`, before or after the command (`devbox --json status`, `devbox project list --json`). With `--json`, errors are a JSON object on stdout (`error`, plus `code` where known; usage errors have `code: "usage"` and exit 2) and the exit code is nonzero. `exec` runs a single argument as a shell script (`devbox exec myapp -- 'npm ci && npm test'`) and quotes several arguments as one command.
 
 ## How it works
 
 - State lives in SQLite at `~/.local/state/devbox/devbox.db`. Hetzner is the source of truth for which servers exist; `up`, `status` and `down` reconcile against servers labeled `managed-by=devbox` and this install's `devbox-controller` label.
+- `status` is scoped to this controller and says so (`no devbox servers for controller ID`). Other controllers' devbox servers in the same Hetzner project are listed separately, read-only (`other_controllers` in `--json`); they are never adopted, cleaned up or changed.
 - Every resource devbox creates (servers, SSH key, firewall) carries those labels. A resource with the expected name but without both labels is never modified; devbox stops with an error instead.
 - Hetzner often sells out of server types in some locations, so the server is chosen per `up` rather than fixed in config. `devbox server-types` lists what is available now (filters: `--min-cores`, `--min-memory`, `--arch`, `--location`, `--zone`, `--all`). Without `--type`/`--location`, `up` uses the config defaults, or else the type and location of the project's last server. If that choice is sold out (or can't hold the snapshot being restored), `up` stops and suggests the cheapest comparable alternatives, same region first. Availability is Hetzner's indicator, not a guarantee.
 - One server at a time. `up --force` allows a second one.
@@ -134,7 +135,7 @@ All commands accept `--json`. `exec` runs a single argument as a shell script (`
 ### Databases
 
 - Databases are described per project with an engine and options; `devbox db engines` lists them:
-  - `postgres`: `database` (required), `service` (Docker Compose service; omit to use `pg_dump` on the server), `user` (default `postgres`), `host`, `port`. Dumps use `pg_dump -Fc`; restores use `pg_restore --clean --if-exists --single-transaction`.
+  - `postgres`: `database` (required), `service` (Docker Compose service; omit to use `pg_dump` on the server), `compose_file` (Compose file relative to the project when it isn't in the root, e.g. `docker/docker-compose.yml`; passed as `docker compose -f`), `user` (default `postgres`), `host`, `port`. Dumps use `pg_dump -Fc`; restores use `pg_restore --clean --if-exists --single-transaction`.
   - `sqlite`: `path` (relative to the project). Uses the server's `python3` and SQLite's backup API, so no `sqlite3` CLI is needed and the copy is consistent while the app runs. Dumping a database file that doesn't exist fails instead of creating an empty one. A restore creates missing folders, rejects empty, truncated or corrupt input (header size check and `PRAGMA integrity_check`) before it replaces anything, and removes its temporary file either way.
 - Dumps are streamed to `~/.local/state/devbox/dumps/NAME/DB-<time>.<ext>` (files 0600, folders 0700, regardless of umask); `restore` uses the latest one unless `--file` is given, and always needs `--yes`.
 - More engines are a small class in `src/devbox/databases.py`: options, a dump command that writes to stdout and a restore command that reads stdin.
@@ -165,6 +166,8 @@ All commands accept `--json`. `exec` runs a single argument as a shell script (`
   cp contrib/systemd/devbox-idle-check.* ~/.config/systemd/user/
   systemctl --user enable --now devbox-idle-check.timer
   ```
+
+- When a server has an idle timeout but neither is found, `status` and `up` print a warning (`idle_enforcement` in `status --json`). Like `doctor`, this only detects the schedule on this machine; it can't tell which config or controller the job uses.
 
 ### Housekeeping
 

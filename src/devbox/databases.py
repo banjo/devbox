@@ -60,14 +60,40 @@ class Engine:
 
 
 IDENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+COMPOSE_FILE_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
 
 
 def _in_service(settings: dict[str, str], command: list[str]) -> str:
     """Run a command inside a Docker Compose service, or directly on the server."""
     service = settings.get("service")
     if service:
-        return shlex.join(["docker", "compose", "exec", "-T", service, *command])
+        compose = ["docker", "compose"]
+        if settings.get("compose_file"):
+            compose += ["-f", settings["compose_file"]]
+        return shlex.join([*compose, "exec", "-T", service, *command])
     return shlex.join(command)
+
+
+def _check_compose_file(settings: dict[str, str]) -> None:
+    path = settings.get("compose_file")
+    if path is None:
+        return
+    if not settings.get("service"):
+        raise DevboxError("compose_file only applies together with --option service=...")
+    if path.startswith("/") or ".." in path.split("/") or not COMPOSE_FILE_RE.match(path):
+        raise DevboxError(f"invalid compose_file '{path}': use a path inside the project folder")
+
+
+def failure_hint(settings: dict[str, str], message: str) -> str | None:
+    """A next step for a failed dump/restore whose cause devbox can recognise."""
+    if settings.get("service") and "no configuration file provided" in message:
+        if settings.get("compose_file"):
+            return f"the Compose file '{settings['compose_file']}' was not found in the project folder on the server"
+        return (
+            "Docker Compose found no compose file in the project root; if it lives in a subfolder, "
+            "set it with `devbox db add ... --option compose_file=PATH` (e.g. docker/docker-compose.yml)"
+        )
+    return None
 
 
 class Postgres(Engine):
@@ -77,6 +103,8 @@ class Postgres(Engine):
     options = (
         Option("database", "database name", required=True),
         Option("service", "Docker Compose service running Postgres (omit to use client tools on the server)"),
+        Option("compose_file", "Compose file relative to the project folder, when not in the root "
+                               "(e.g. docker/docker-compose.yml)"),
         Option("user", "database user", default="postgres"),
         Option("host", "host when not using a service, e.g. localhost"),
         Option("port", "port when not using a service"),
@@ -88,6 +116,7 @@ class Postgres(Engine):
                 raise DevboxError(f"invalid postgres {key} '{settings[key]}'")
         if "port" in settings and not settings["port"].isdigit():
             raise DevboxError(f"invalid postgres port '{settings['port']}'")
+        _check_compose_file(settings)
 
     def _conn(self, settings) -> list[str]:
         args = ["-U", settings["user"]]
