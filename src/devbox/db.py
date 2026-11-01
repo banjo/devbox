@@ -91,6 +91,25 @@ MIGRATIONS = [
     ALTER TABLE servers ADD COLUMN stop_action TEXT;
     ALTER TABLE servers ADD COLUMN stop_requested_at TEXT;
     """,
+    """
+    CREATE TABLE previews (
+      server_id   INTEGER NOT NULL REFERENCES servers(id),
+      name        TEXT NOT NULL,
+      port        INTEGER NOT NULL,
+      kind        TEXT NOT NULL CHECK (kind IN ('quick', 'named')),
+      url         TEXT NOT NULL,
+      hostname    TEXT,
+      unit        TEXT,
+      protected   INTEGER NOT NULL DEFAULT 0,
+      proxy_port  INTEGER,
+      created_at  TEXT NOT NULL,
+      PRIMARY KEY (server_id, name)
+    );
+
+    INSERT INTO previews (server_id, name, port, kind, url, unit, created_at)
+      SELECT id, 'default', preview_port, 'quick', preview_url, 'tunnel', created_at FROM servers
+      WHERE preview_url IS NOT NULL AND preview_port IS NOT NULL AND status != 'deleted';
+    """,
 ]
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
@@ -429,10 +448,45 @@ def cancel_stop(conn: sqlite3.Connection, server_id: int) -> bool:
     ).rowcount > 0
 
 
+# Previews
+
+
+def previews(conn: sqlite3.Connection, server_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM previews WHERE server_id = ? ORDER BY name = 'default' DESC, name", (server_id,)
+    ).fetchall()
+
+
+def set_preview(conn: sqlite3.Connection, server_id: int, name: str, **fields) -> None:
+    conn.execute("DELETE FROM previews WHERE server_id = ? AND name = ?", (server_id, name))
+    columns = ["server_id", "name", "created_at", *fields]
+    conn.execute(
+        f"INSERT INTO previews ({', '.join(columns)}) VALUES ({', '.join('?' * len(columns))})",
+        (server_id, name, now(), *fields.values()),
+    )
+    _sync_preview_columns(conn, server_id)
+
+
+def remove_previews(conn: sqlite3.Connection, server_id: int, names: list[str]) -> None:
+    for name in names:
+        conn.execute("DELETE FROM previews WHERE server_id = ? AND name = ?", (server_id, name))
+    _sync_preview_columns(conn, server_id)
+
+
+def _sync_preview_columns(conn: sqlite3.Connection, server_id: int) -> None:
+    """servers.preview_url/preview_port mirror the first preview (for older JSON readers)."""
+    first = next(iter(previews(conn, server_id)), None)
+    conn.execute(
+        "UPDATE servers SET preview_url = ?, preview_port = ? WHERE id = ?",
+        (first["url"] if first else None, first["port"] if first else None, server_id),
+    )
+
+
 def mark_deleted(conn: sqlite3.Connection, server_id: int) -> None:
     conn.execute(
         "UPDATE servers SET status = 'deleted', deleted_at = ? WHERE id = ?", (now(), server_id)
     )
+    conn.execute("DELETE FROM previews WHERE server_id = ?", (server_id,))
 
 
 def reconcile(conn: sqlite3.Connection, hetzner_servers: list[dict]) -> list[dict]:

@@ -13,9 +13,9 @@ from datetime import datetime, timedelta, timezone
 from importlib import resources
 from pathlib import Path
 
-from devbox import DevboxError, admin, autostop, billing, config, costs, databases, db, envsecrets, startup, watch
+from devbox import DevboxError, admin, autostop, billing, config, costs, databases, db, envsecrets, previews, startup, watch
 from devbox.hetzner import Hcloud, filter_offers
-from devbox.remote import PULL_PRUNE, TUNNEL, Remote, git_files, git_ignored, to_script, validate_proc
+from devbox.remote import PULL_PRUNE, Remote, git_files, git_ignored, to_script, validate_proc
 
 
 EXIT_TIMEOUT = 124
@@ -23,6 +23,7 @@ EXIT_TIMEOUT = 124
 POWERED_DOWN = ("off", "stopping")
 # Using the server again cancels a `pause/down --at-hour-end`; looking at it doesn't.
 CANCELS_STOP = {"up", "sync", "exec", "exec_detach", "touch", "expose", "forward", "db_restore", "ssh"}
+DEFAULT_WAIT_TIMEOUT = "2m"
 
 
 class Context:
@@ -283,6 +284,7 @@ def cmd_project_set(ctx: Context) -> int:
 def cmd_project_remove(ctx: Context) -> int:
     db.remove_project(ctx.conn, ctx.args.name)
     envsecrets.SecretStore(config.config_dir(), ctx.args.name).delete_all()
+    previews.forget_credentials(ctx.cfg.state_dir, ctx.args.name)
     emit(ctx.args, {"name": ctx.args.name, "removed": True}, f"removed {ctx.args.name}")
     return 0
 
@@ -1302,6 +1304,7 @@ def cmd_status(ctx: Context) -> int:
             entry["usage"] = costs.server_usage(server)
             entry["idle"] = idle_info(ctx, server, now)
             entry["monthly_cap_hint"] = costs.monthly_cap_hint(db.all_servers(ctx.conn, p["name"]), now)
+            entry["previews"] = [preview_dict(r) for r in db.previews(ctx.conn, server["id"])]
             if server["status"] == "running" and server["power"] not in POWERED_DOWN:
                 try:
                     entry["processes"] = ctx.remote(server).list_units()
@@ -1365,8 +1368,16 @@ def cmd_status(ctx: Context) -> int:
                 f"running all month costs ~{costs.money(h['always_on'])} (`devbox project set {e['project']} "
                 f"--idle-timeout off`)"
             )
-        if s["preview_url"]:
-            lines.append(f"  preview: {s['preview_url']} -> port {s['preview_port']}")
+        units = {u["name"]: u["active"] for u in e["processes"] or []}
+        for pv in e.get("previews") or []:
+            label = "preview" if pv["name"] == previews.DEFAULT else f"preview {pv['name']}"
+            extra = []
+            if pv["protected"]:
+                extra.append(f"password in {ctx.cfg.state_dir / 'preview-auth' / (e['project'] + '.json')}")
+            if e["processes"] is not None and units.get(pv["unit"]) != "active":
+                extra.append(f"not running: `devbox expose {e['project']} {pv['port']}"
+                             f"{'' if pv['name'] == previews.DEFAULT else ' --name ' + pv['name']}` restarts it")
+            lines.append(f"  {label}: {pv['url']} -> port {pv['port']}" + (f" ({'; '.join(extra)})" if extra else ""))
         for proc in e["processes"] or []:
             lines.append(f"  {proc['name']}: {proc['active']} ({proc['sub']})")
         if "processes_error" in e:
@@ -1936,8 +1947,8 @@ def cmd_exec(ctx: Context) -> int:
         if ctx.args.timeout is not None:
             raise DevboxError("--timeout only applies to foreground commands")
         validate_proc(ctx.args.proc)
-        if ctx.args.proc == TUNNEL:
-            raise DevboxError(f"'{TUNNEL}' is reserved for the preview tunnel; use `devbox expose`")
+        if previews.is_reserved(ctx.args.proc):
+            raise DevboxError(f"'{ctx.args.proc}' is reserved for previews; use `devbox expose`")
         remote.start_unit(ctx.args.proc, script, keep_alive=ctx.args.keep_alive)
         ctx.event(server, "exec_detach")
         emit(
@@ -1979,10 +1990,13 @@ def cmd_ps(ctx: Context) -> int:
 def cmd_stop(ctx: Context) -> int:
     server = ctx.running_server(ctx.args.name)
     validate_proc(ctx.args.proc)
-    stopped = ctx.remote(server).stop_unit(ctx.args.proc)
+    owned = previews_of_unit(ctx, server, ctx.args.proc)
+    if owned:
+        close_previews(ctx, server, owned)
+        stopped = True
+    else:
+        stopped = ctx.remote(server).stop_unit(ctx.args.proc)
     ctx.event(server, "stop")
-    if ctx.args.proc == TUNNEL and stopped:
-        db.update_server(ctx.conn, server["id"], preview_port=None, preview_url=None)
     emit(
         ctx.args,
         {"process": ctx.args.proc, "stopped": stopped},
@@ -1998,15 +2012,147 @@ def cmd_logs(ctx: Context) -> int:
     return ctx.remote(server).logs(ctx.args.proc, ctx.args.lines, ctx.args.follow)
 
 
+def previews_of_unit(ctx: Context, server, unit: str) -> list:
+    """Previews served by a background process (tunnel or password proxy)."""
+    return [r for r in db.previews(ctx.conn, server["id"])
+            if r["unit"] == unit or (r["protected"] and previews.auth_unit(r["name"]) == unit)]
+
+
+class NamedTunnel:
+    """The project's Cloudflare tunnel and the zone of its hostnames."""
+
+    def __init__(self, ctx: Context, project: str, hostname: str):
+        self.cf = previews.Cloudflare(ctx.cfg.cloudflare_token())
+        self.zone = self.cf.zone(hostname)
+        self.account = self.zone["account"]
+        self.id = self.cf.ensure_tunnel(self.account, previews.tunnel_name(ctx.cfg.get_controller_id(), project))
+
+    def update(self, rows) -> None:
+        self.cf.set_ingress(self.account, self.id, previews.ingress(rows))
+
+
+def preview_dict(r) -> dict:
+    return {k: r[k] for k in ("name", "port", "kind", "url", "hostname", "unit", "proxy_port", "created_at")} \
+        | {"protected": bool(r["protected"])}
+
+
+def close_previews(ctx: Context, server, rows) -> None:
+    remote = ctx.remote(server)
+    for r in rows:
+        if r["kind"] == "quick":
+            remote.stop_unit(r["unit"])
+        if r["protected"]:
+            remote.stop_unit(previews.auth_unit(r["name"]))
+    db.remove_previews(ctx.conn, server["id"], [r["name"] for r in rows])
+    named = [r for r in rows if r["kind"] == "named"]
+    if named:
+        remaining = [r for r in db.previews(ctx.conn, server["id"]) if r["kind"] == "named"]
+        if not remaining:
+            remote.stop_unit(previews.NAMED_UNIT)
+        try:
+            NamedTunnel(ctx, server["project"], named[0]["hostname"]).update(remaining)
+        except DevboxError as e:
+            # The hostname is already unserved: nothing on the server listens for it.
+            print(f"warning: could not update the Cloudflare tunnel's routes: {e}", file=sys.stderr)
+
+
 def cmd_expose(ctx: Context) -> int:
-    server = ctx.running_server(ctx.args.name)
+    name = ctx.args.name
     port = ctx.args.port
+    preview = ctx.args.preview or previews.DEFAULT
+    previews.validate_name(preview)
     if not 1 <= port <= 65535:
         raise DevboxError(f"invalid port {port}")
-    url = ctx.remote(server).start_tunnel(port)
+    path = ctx.args.wait_for
+    if path is not None and not path.startswith("/"):
+        raise DevboxError(f"--wait-for takes a path on the app, like /health (got '{path}')")
+    wait = config.parse_duration(ctx.args.wait_timeout)
+    if wait is None:
+        raise DevboxError("--wait-timeout can't be off")
+    domain = None if ctx.args.quick else ctx.cfg.preview_domain
+    server = ctx.running_server(name)
+    remote = ctx.remote(server)
     ctx.event(server, "expose")
-    db.update_server(ctx.conn, server["id"], preview_port=port, preview_url=url)
-    emit(ctx.args, {"project": ctx.args.name, "port": port, "url": url}, url)
+
+    health = None
+    if path is not None:
+        ok, code = remote.wait_http(port, path, wait.total_seconds())
+        if not ok:
+            raise DevboxError(
+                f"http://localhost:{port}{path} on the server did not answer with 2xx/3xx within "
+                f"{ctx.args.wait_timeout} (last status: {code}); the preview was not opened. "
+                f"Check the app with `devbox ps {name}` and `devbox logs {name} PROC`"
+            )
+        health = {"path": path, "status": int(code)}
+
+    old = next((r for r in db.previews(ctx.conn, server["id"]) if r["name"] == preview), None)
+    auth = None
+    proxy_port = None
+    if ctx.args.protect:
+        auth = previews.credentials(ctx.cfg.state_dir, name)
+        proxy_port = remote.start_auth_proxy(previews.auth_unit(preview), port, auth["password"])
+    elif old and old["protected"]:
+        remote.stop_unit(previews.auth_unit(preview))
+    target = proxy_port or port
+
+    warnings = []
+    fields = {"port": port, "protected": int(bool(auth)), "proxy_port": proxy_port}
+    if domain:
+        host = previews.hostname(name, preview, domain)
+        tunnel = NamedTunnel(ctx, name, host)
+        if host.count(".") - tunnel.zone["name"].count(".") > 1:
+            warnings.append(f"{host} is more than one level below {tunnel.zone['name']}; Cloudflare's free "
+                            f"certificate doesn't cover it, so HTTPS fails without an Advanced Certificate")
+        tunnel.cf.route_dns(tunnel.zone["id"], host, tunnel.id)
+        if old and old["kind"] == "quick":
+            remote.stop_unit(old["unit"])
+        others = [dict(r) for r in db.previews(ctx.conn, server["id"]) if r["name"] != preview]
+        new = {"name": preview, "kind": "named", "hostname": host, **fields}
+        tunnel.update(others + [new])
+        remote.start_named_tunnel(previews.NAMED_UNIT, tunnel.cf.tunnel_token(tunnel.account, tunnel.id))
+        url = f"https://{host}"
+        db.set_preview(ctx.conn, server["id"], preview, kind="named", url=url, hostname=host,
+                       unit=previews.NAMED_UNIT, **fields)
+    else:
+        unit = previews.quick_unit(preview)
+        url = remote.start_tunnel(target, unit)
+        was_named = old is not None and old["kind"] == "named"
+        db.set_preview(ctx.conn, server["id"], preview, kind="quick", url=url, unit=unit, **fields)
+        if was_named:
+            remaining = [r for r in db.previews(ctx.conn, server["id"]) if r["kind"] == "named"]
+            if not remaining:
+                remote.stop_unit(previews.NAMED_UNIT)
+            NamedTunnel(ctx, name, old["hostname"]).update(remaining)
+
+    data = {"project": name, "name": preview, "port": port, "url": url, "kind": "named" if domain else "quick",
+            "protected": bool(auth), "auth": auth, "health": health, "warnings": warnings}
+    text = [url]
+    if auth:
+        text.append(f"  password protected: user {auth['user']}, password {auth['password']}")
+    if health:
+        text.append(f"  {path} answered {code}")
+    if not domain:
+        text.append("  this URL changes whenever the tunnel restarts" + (
+            "; set preview_domain in config for stable URLs" if not ctx.cfg.preview_domain else ""))
+    text += [f"warning: {w}" for w in warnings]
+    emit(ctx.args, data, "\n".join(text))
+    return 0
+
+
+def cmd_unexpose(ctx: Context) -> int:
+    name = ctx.args.name
+    server = ctx.running_server(name)
+    rows = db.previews(ctx.conn, server["id"])
+    if ctx.args.preview:
+        unknown = set(ctx.args.preview) - {r["name"] for r in rows}
+        if unknown:
+            raise DevboxError(f"no preview named {', '.join(sorted(unknown))} (see `devbox status {name}`)")
+        rows = [r for r in rows if r["name"] in ctx.args.preview]
+    close_previews(ctx, server, rows)
+    ctx.event(server, "stop")
+    closed = [r["name"] for r in rows]
+    emit(ctx.args, {"project": name, "closed": closed},
+         f"closed {', '.join(closed)}" if closed else f"{name} has no previews")
     return 0
 
 
@@ -2256,6 +2402,18 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
     p = add("expose", cmd_expose, "open a public preview URL to a port on the server")
     p.add_argument("name")
     p.add_argument("port", type=int)
+    p.add_argument("--name", dest="preview", metavar="PREVIEW",
+                   help="name of this preview, for several side by side (default: 'default')")
+    p.add_argument("--wait-for", metavar="PATH", help="only open the preview once PATH answers 2xx/3xx")
+    p.add_argument("--wait-timeout", metavar="DURATION", default=DEFAULT_WAIT_TIMEOUT,
+                   help=f"how long --wait-for waits (default {DEFAULT_WAIT_TIMEOUT})")
+    p.add_argument("--protect", action="store_true", help="require a password (HTTP basic auth)")
+    p.add_argument("--quick", action="store_true",
+                   help="random trycloudflare.com URL even when preview_domain is set")
+
+    p = add("unexpose", cmd_unexpose, "close previews (all, or the ones named)")
+    p.add_argument("name")
+    p.add_argument("preview", nargs="*")
 
     p = add("ssh", cmd_ssh, "open a shell on the server")
     p.add_argument("name")

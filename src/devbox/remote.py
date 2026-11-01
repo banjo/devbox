@@ -24,6 +24,10 @@ TUNNEL = "tunnel"
 PULL_PRUNE = (".git", "node_modules", ".venv", "venv", "__pycache__", ".cache", ".next", ".turbo")
 PROC_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
 TUNNEL_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+TUNNEL_REGISTERED_RE = re.compile(r"Registered tunnel connection")
+# devbox's own files on the server, outside the project folder.
+DEVBOX_DIR = "/root/.devbox"
+TUNNEL_TOKEN_FILE = f"{DEVBOX_DIR}/tunnel-token"
 
 
 def validate_proc(name: str) -> None:
@@ -530,23 +534,90 @@ class Remote:
         except KeyboardInterrupt:
             return 0
 
-    def start_tunnel(self, port: int, timeout: float = 60) -> str:
-        self.start_unit(
-            TUNNEL, f"exec cloudflared tunnel --no-autoupdate --url http://localhost:{port}"
-        )
-        unit = UNIT_PREFIX + TUNNEL
+    def _wait_journal(self, name: str, pattern: re.Pattern, timeout: float) -> re.Match | None:
+        """Wait for `pattern` in the output of the current run of a background process."""
+        unit = UNIT_PREFIX + name
         script = (
             f"id=$(systemctl show -p InvocationID --value {unit}); "
             f"journalctl _SYSTEMD_INVOCATION_ID=$id -o cat --no-pager"
         )
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            out = self.run(script, check=False, cwd=None).stdout
-            match = TUNNEL_URL_RE.search(out)
+            match = pattern.search(self.run(script, check=False, cwd=None).stdout)
             if match:
-                return match.group(0)
+                return match
             time.sleep(2)
-        raise DevboxError(f"no tunnel URL after {int(timeout)}s; see `devbox logs <project> {TUNNEL}`")
+        return None
+
+    def start_tunnel(self, port: int, unit: str = TUNNEL, timeout: float = 60) -> str:
+        """Cloudflare quick tunnel to a local port; returns its random trycloudflare.com URL."""
+        self.start_unit(unit, f"exec cloudflared tunnel --no-autoupdate --url http://localhost:{port}")
+        match = self._wait_journal(unit, TUNNEL_URL_RE, timeout)
+        if match:
+            return match.group(0)
+        raise DevboxError(f"no tunnel URL after {int(timeout)}s; see `devbox logs <project> {unit}`")
+
+    def unit_active(self, name: str) -> bool:
+        return self.run(f"systemctl is-active --quiet {UNIT_PREFIX + name}", check=False, cwd=None).returncode == 0
+
+    def start_named_tunnel(self, unit: str, token: str, timeout: float = 60) -> None:
+        """Run the connector of a remotely configured Cloudflare tunnel (once per server)."""
+        if self.unit_active(unit):
+            return
+        self.write_file(TUNNEL_TOKEN_FILE, token)
+        self.start_unit(unit, f"TUNNEL_TOKEN=$(cat {TUNNEL_TOKEN_FILE}) exec cloudflared tunnel --no-autoupdate run")
+        if not self._wait_journal(unit, TUNNEL_REGISTERED_RE, timeout):
+            raise DevboxError(f"the tunnel did not connect within {int(timeout)}s; see `devbox logs <project> {unit}`")
+
+    def wait_http(self, port: int, path: str, timeout: float, accept: str = "2|3") -> tuple[bool, str]:
+        """Poll http://localhost:PORT/PATH on the server until the status code starts with one of
+        `accept` (e.g. "2|3"). Returns (ok, last status code or "none" when nothing answered)."""
+        url = shlex.quote(f"http://localhost:{port}{path}")
+        prefixes = "|".join(f"{a}*" for a in accept.split("|"))
+        script = (
+            f"end=$((SECONDS+{int(timeout)})); while :; do "
+            f"code=$(curl -s -o /dev/null -w '%{{http_code}}' --max-time 5 {url}); "
+            f"case $code in {prefixes}) echo \"ok $code\"; exit 0;; esac; "
+            f"[ $SECONDS -ge $end ] && {{ echo \"fail $code\"; exit 1; }}; sleep 2; done"
+        )
+        proc = self.run(script, check=False, cwd=None, timeout=timeout + 30)
+        words = (proc.stdout or "").split()
+        code = words[1] if len(words) > 1 and words[1] != "000" else "none"
+        return proc.returncode == 0, code
+
+    def free_port(self) -> int:
+        proc = self.run(
+            "python3 -c 'import socket; s = socket.socket(); s.bind((\"127.0.0.1\", 0)); print(s.getsockname()[1])'",
+            cwd=None,
+        )
+        return int(proc.stdout.strip())
+
+    def start_auth_proxy(self, unit: str, port: int, password: str, timeout: float = 120) -> int:
+        """Caddy with basic auth in front of a local port; returns the port it listens on."""
+        from devbox import previews
+
+        pulled = self.run(f"docker pull -q {previews.CADDY_IMAGE}", check=False, cwd=None, timeout=timeout)
+        if pulled.returncode != 0:
+            raise DevboxError(f"cannot pull {previews.CADDY_IMAGE} for the password proxy: {(pulled.stderr or '').strip()}")
+        hashed = self.run(
+            f"docker run --rm {previews.CADDY_IMAGE} caddy hash-password --plaintext \"$(cat)\"",
+            input=password, cwd=None, timeout=60,
+        ).stdout.strip().splitlines()
+        hashed = hashed[-1] if hashed else ""
+        if not hashed.startswith("$2"):
+            raise DevboxError(f"could not hash the preview password with caddy (got '{hashed[:40]}')")
+        listen = self.free_port()
+        config = f"{DEVBOX_DIR}/{unit}.Caddyfile"
+        self.write_file(config, previews.caddyfile(listen, port, hashed), mode="644")
+        container = UNIT_PREFIX + unit
+        self.start_unit(unit, (
+            f"docker rm -f {container} >/dev/null 2>&1; exec docker run --rm --name {container} "
+            f"--network host -v {config}:/etc/caddy/Caddyfile:ro {previews.CADDY_IMAGE}"
+        ))
+        ok, code = self.wait_http(listen, "/", 30, accept="401")
+        if not ok:
+            raise DevboxError(f"the password proxy did not start (got {code}); see `devbox logs <project> {unit}`")
+        return listen
 
 
 def parse_units(output: str) -> list[dict]:

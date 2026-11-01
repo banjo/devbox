@@ -77,6 +77,10 @@ class Config:
     # Monthly spending limit in EUR, and what `up` does when it is reached.
     monthly_budget: float | None = None
     budget_action: str = "warn"
+    # Stable preview URLs: a named Cloudflare tunnel per project on this domain
+    # (a zone in the Cloudflare account of the token). Unset: random quick-tunnel URLs.
+    preview_domain: str | None = None
+    cloudflare_token_file: Path | None = None
     state_dir: Path = field(default_factory=state_dir)
 
     @property
@@ -98,6 +102,18 @@ class Config:
         self.controller_id = value
         return value
 
+    def cloudflare_token(self) -> str:
+        if self.cloudflare_token_file is None:
+            token = os.environ.get("CLOUDFLARE_API_TOKEN")
+            if not token:
+                raise DevboxError("preview_domain needs a Cloudflare API token: set cloudflare_token_file "
+                                  "in config or CLOUDFLARE_API_TOKEN")
+            return token
+        try:
+            return self.cloudflare_token_file.read_text().strip()
+        except OSError as e:
+            raise DevboxError(f"cannot read Cloudflare token file {self.cloudflare_token_file}: {e}")
+
     def hcloud_token(self) -> str | None:
         if self.hcloud_token_file is None:
             return os.environ.get("HCLOUD_TOKEN")
@@ -107,13 +123,14 @@ class Config:
             raise DevboxError(f"cannot read hcloud token file {self.hcloud_token_file}: {e}")
 
 
-_PATH_KEYS = {"hcloud_token_file", "ssh_key"}
+_PATH_KEYS = {"hcloud_token_file", "ssh_key", "cloudflare_token_file"}
 _STR_KEYS = {
     "server_type", "location", "image", "controller_id", "idle_timeout", "idle_action", "budget_action",
-    "startup_timeout", "min_idle", "billing_margin",
+    "startup_timeout", "min_idle", "billing_margin", "preview_domain",
 }
 _FLOAT_KEYS = {"snapshot_price_per_gb_month", "monthly_budget"}
 CONTROLLER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+DOMAIN_RE = re.compile(r"^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 
 
 def load(path: Path | None = None) -> Config:
@@ -167,4 +184,8 @@ def load(path: Path | None = None) -> Config:
         raise DevboxError(f"{path}: idle_action must be 'pause' or 'down'")
     if cfg.budget_action not in ("warn", "block"):
         raise DevboxError(f"{path}: budget_action must be 'warn' or 'block'")
+    if cfg.preview_domain is not None:
+        cfg.preview_domain = cfg.preview_domain.strip().lower().strip(".")
+        if not DOMAIN_RE.match(cfg.preview_domain):
+            raise DevboxError(f"{path}: preview_domain must be a domain name like dev.example.com")
     return cfg

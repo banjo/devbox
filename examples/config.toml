@@ -39,3 +39,10 @@ startup_timeout = "5m"
 # Monthly spending limit in EUR. "warn" or "block" when `up` would exceed it.
 # monthly_budget = 20
 # budget_action = "warn"
+
+# Stable preview URLs (`devbox expose`): one Cloudflare tunnel per project and
+# <project>.<domain> / <project>-<preview>.<domain>. The domain must be a zone in
+# the token's Cloudflare account. Token permissions: Account > Cloudflare Tunnel >
+# Edit, Zone > DNS > Edit. Without preview_domain, URLs are random trycloudflare.com.
+# preview_domain = "example.com"
+# cloudflare_token_file = "~/.config/devbox/cloudflare-token"

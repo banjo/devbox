@@ -83,6 +83,8 @@ devbox ps NAME                            list background processes
 devbox logs NAME P [-f] [-n LINES]        output from process P
 devbox stop NAME P                        stop process P
 devbox expose NAME PORT                   public preview URL for PORT
+    expose options: --name PREVIEW (several side by side), --protect (password), --wait-for /health, --quick
+devbox unexpose NAME [PREVIEW...]         close previews (all of them without names)
 devbox ssh NAME                           shell on the server
 devbox status [NAME]                      servers, processes, preview URLs, cost so far
 devbox pause NAME                         snapshot the server, then delete it (= down --snapshot)
@@ -114,7 +116,11 @@ All commands accept `--json`, before or after the command (`devbox --json status
 - Sync sends exactly the files Git sees in the working tree: tracked files plus untracked files that are not ignored, using Git's own ignore rules (so `!.env.example` style exceptions work). Ignored files on the server, such as `node_modules` and `.env`, are left alone. A file that was synced before and has since been deleted locally is deleted on the server too. Outside a Git repo, everything except `.git` is copied and nothing is deleted. Submodule contents are not synced.
 - Background processes are systemd units named `devbox-<name>`. They survive SSH disconnects; logs are in the journal.
 - `exec --timeout S` is enforced on the server: the command runs in its own systemd scope with `RuntimeMaxSec`, so after S seconds systemd sends SIGTERM to every process in it and SIGKILL 10 seconds later, even if the SSH connection is gone. `exec` checks the scope's result on the server and then exits with 124 (`timed_out: true` with `--json`); a real SSH failure is still reported as one. Containers started in the background (`docker compose up -d`, `docker run -d`) belong to Docker, not the scope, and keep running. Without `--timeout`, a foreground command keeps running on the server if the connection drops.
-- Previews use a Cloudflare quick tunnel: a public, random `*.trycloudflare.com` URL that changes whenever the tunnel restarts. No Cloudflare account and no open ports.
+- Previews use a Cloudflare tunnel, so no ports are opened. Without further config each preview gets a public, random `*.trycloudflare.com` URL that changes whenever the tunnel restarts; no Cloudflare account is needed.
+- Several previews can run side by side: `expose NAME 5173 --name web` and `expose NAME 3000 --name api`. Without `--name` the preview is called `default`. `unexpose NAME [PREVIEW...]` closes them (all without names). `status` lists them and flags previews whose tunnel no longer runs (after a restore or power-on); run `expose` again.
+- Stable URLs: set `preview_domain = "example.com"` (a zone in your Cloudflare account) and a Cloudflare API token with Account › Cloudflare Tunnel › Edit and Zone › DNS › Edit (`cloudflare_token_file`, or `CLOUDFLARE_API_TOKEN`). devbox then creates one named tunnel per project (`devbox-<controller>-<project>`), reused by every server of that project, and a proxied CNAME per preview: `<project>.example.com` for the default preview, `<project>-<name>.example.com` for named ones. It never replaces a DNS record it didn't create. Cloudflare's free certificate covers one level of subdomain, so use the zone itself as `preview_domain`. `--quick` gives a random URL anyway. The tunnel and DNS records stay when the server goes; delete them in the Cloudflare dashboard if you drop the project.
+- `--protect` asks for a password (HTTP basic auth, user `devbox`): a Caddy proxy in Docker sits between the tunnel and the app. The password is per project, kept in `preview-auth/<project>.json` in the state folder and printed by `expose`. For sign-in with Cloudflare Access instead, add an Access application for the stable hostname in the Cloudflare dashboard; the hostname doesn't change, so it keeps working.
+- `--wait-for /health` polls the app on the server until the path answers 2xx or 3xx (`--wait-timeout`, default 2m) and only then opens the preview. Otherwise `expose` fails with the last status and opens nothing.
 - `down` deletes the server. Anything that exists only there (database contents, unsynced files) is gone.
 
 ### Startup
@@ -147,7 +153,7 @@ All commands accept `--json`, before or after the command (`devbox --json status
 
 - `pause` (or `down --snapshot`) shuts the server down cleanly, saves its disk as a Hetzner snapshot, then deletes the server. If the snapshot fails, the server is kept and powered on again. If the snapshot succeeds but deleting the server fails, the server stays shut down (and billed), `status` shows it as powered off, and running `pause` again finishes the job with the same snapshot; `up` powers it back on instead.
 - devbox records each server's power state from Hetzner. Commands that need a running server refuse with a clear message when it is powered off.
-- The next `up` creates the server from the latest snapshot, so installed runtimes, `node_modules`, Docker images and database data are already there. Background processes and the preview are not running after a restore; start them again. `up --fresh` ignores snapshots; `resume` refuses to start without one.
+- The next `up` creates the server from the latest snapshot, so installed runtimes, `node_modules`, Docker images and database data are already there. Background processes and previews are not running after a restore; start them again. `up --fresh` ignores snapshots; `resume` refuses to start without one.
 - The restored server must have the snapshot's architecture and at least its disk size; `up` checks this.
 - `keep_snapshots` (default 1) snapshots are kept per project. Older ones are deleted after a new snapshot is available, never before.
 - Snapshots cost money while they exist (per GB per month; the price comes from Hetzner's pricing API). `status`, `snapshot list` and `costs` show it. `down` without `--snapshot` keeps existing snapshots; delete them with `snapshot delete`. A project with snapshots can't be removed until they are deleted.

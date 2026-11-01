@@ -30,7 +30,7 @@ Do **not** use it for reading or editing code, Git, or small checks such as lint
 - **Only one server at a time.** If `up` says another server is running, ask the user whether to `devbox down` that one. Never pass `--force` without their approval.
 - **Prefer `devbox pause` over `devbox down`** when the user is done. Pause keeps everything in a snapshot (a few cents a month) and the next `up` restores it. Ask before `devbox down`: it deletes the server and everything that exists only there, such as database contents.
 - **Mind the budget.** If `up` warns about the monthly budget, tell the user. If it refuses, only pass `--over-budget` when the user says so.
-- **Previews are public.** Anyone with the URL can open it. Do not expose admin tools or real data.
+- **Previews are public** unless you pass `--protect`. Anyone with the URL can open it. Do not expose admin tools or real data; when the app holds anything private, use `--protect` and give the user the password `expose` prints.
 - **Do not commit or push** unless the user asks.
 - Add `--json` when you need to parse output.
 
@@ -76,7 +76,7 @@ Without `--type`/`--location`, `up` uses the config default, or else the project
    - `devbox exec NAME -- 'docker compose up -d'` (returns when containers have started)
    - `devbox exec NAME --detach --name web -- 'npm run dev -- --host 0.0.0.0'`
 6. Check that it works: `devbox ps NAME`, `devbox logs NAME web`, and `devbox exec NAME -- 'curl -sf localhost:3000 >/dev/null && echo ok'`.
-7. `devbox expose NAME PORT` and give the user the URL.
+7. `devbox expose NAME PORT --wait-for /` (or a health path such as `/health`) and give the user the URL. `--wait-for` only returns once the app answers, so the URL works when you hand it over. For several apps (web and API) give each a name: `expose NAME 5173 --name web`, `expose NAME 3000 --name api`.
 8. If you cannot get it running, tell the user what you tried and ask how the project is normally started.
 9. **Save what worked** with `devbox project notes NAME --set-file -` (heredoc on stdin). Keep it short and concrete: runtime versions, commands in order, which steps are only needed on a new server (installs, seeding), env values that are safe to store, ports, and gotchas. Never store secrets in notes. Update the notes whenever you learn something new.
 
@@ -86,7 +86,7 @@ Example notes:
 Runtime: `mise use -g node@22`.
 New server: `npm ci`, `cp .env.example .env`, `docker compose up -d db`, `npm run db:migrate && npm run db:seed`.
 Every start: `docker compose up -d db`, then `exec --detach --name web -- 'npm run dev -- --host 0.0.0.0'`.
-Preview: `expose 5173`. Ready when the log says "Local: http://...".
+Preview: `expose 5173 --wait-for /`. Ready when the log says "Local: http://...".
 Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/app in .env.
 ```
 
@@ -96,7 +96,7 @@ Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/a
 2. `devbox sync NAME`. Dev servers in watch mode pick up the change. For long editing sessions you can run `devbox sync NAME --watch` in the background instead, which syncs on every save.
 3. If dependencies changed: `devbox exec NAME -- 'npm ci'`, then restart the process with the same `exec --detach --name web ...` command (it replaces the old one).
 4. Run tests with foreground `exec`: `devbox exec NAME -- 'npm test'`. Add `--timeout SECONDS` for anything that might hang; the server stops the command when time is up and `exec` exits with 124.
-5. Debug with `devbox logs NAME PROC` and `devbox exec`. For a broken preview, check `devbox logs NAME tunnel`.
+5. Debug with `devbox logs NAME PROC` and `devbox exec`. For a broken preview, check `devbox logs NAME tunnel` (`tunnel-PREVIEW` for named previews, `named-tunnel` with a stable domain, `preview-auth-PREVIEW` for the password proxy).
 6. When commands on the server change files (lockfiles after `npm install`, generated migrations, formatter output), bring them back with `devbox pull NAME`. It only stages them; review with the printed `diff` command and copy what belongs in the repo. Never pull over local changes without checking.
 7. If the user wants to inspect the database or debug with a local tool, `devbox forward NAME 5432` (runs until stopped).
 
@@ -148,7 +148,8 @@ Hetzner bills every started hour from when a server is created. A new server per
 
 ## Pitfalls
 
-- The preview URL changes every time the tunnel restarts, and after `down`/`up`. Always give the user the current URL from `devbox status NAME`.
+- Without `preview_domain` in config, the preview URL changes every time the tunnel restarts, and after `down`/`up`. Always give the user the current URL from `devbox status NAME`. With `preview_domain` the URL stays the same, but the preview still has to be started again after a restore (`status` says "not running").
+- Vite and similar dev servers may reject the preview's host name; allow it in their config (for Vite, `server.allowedHosts`).
 - Foreground `exec` blocks until the command exits. Never use it for dev servers or `compose up` without `-d`; use `--detach`.
 - A single argument after `--` is run as a shell script, so quote it: `-- 'npm ci && npm test'`. Several arguments are quoted individually, so `&&` between them is passed literally.
 - Processes do not restart on their own. After a crash, check `logs` and run the same `exec --detach` again.
