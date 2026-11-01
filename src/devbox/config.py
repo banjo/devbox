@@ -35,6 +35,19 @@ def parse_duration(value: str) -> timedelta | None:
     return timedelta(**{_UNITS[unit]: float(amount)})
 
 
+HOUR_END = "hour-end"
+
+
+def parse_idle_timeout(value: str) -> timedelta | str | None:
+    """A duration, None for off, or HOUR_END (stop before the next billing hour)."""
+    if value.strip().lower() == HOUR_END:
+        return HOUR_END
+    try:
+        return parse_duration(value)
+    except DevboxError:
+        raise DevboxError(f"invalid idle timeout '{value}': use e.g. 30m, 4h, 2d, {HOUR_END} or off")
+
+
 @dataclass
 class Config:
     hcloud_token_file: Path | None = None
@@ -55,6 +68,10 @@ class Config:
     # `devbox idle-check` pauses (or deletes) servers without activity for this long.
     idle_timeout: str = "8h"
     idle_action: str = "pause"
+    # With idle_timeout = "hour-end": how long a server must be idle before it
+    # is stopped, and the safety margin before the next billing hour.
+    min_idle: str = "5m"
+    billing_margin: str = "5m"
     # Deadline for `up`: creating the server, first-boot setup and the first sync.
     startup_timeout: str = "5m"
     # Monthly spending limit in EUR, and what `up` does when it is reached.
@@ -93,7 +110,7 @@ class Config:
 _PATH_KEYS = {"hcloud_token_file", "ssh_key"}
 _STR_KEYS = {
     "server_type", "location", "image", "controller_id", "idle_timeout", "idle_action", "budget_action",
-    "startup_timeout",
+    "startup_timeout", "min_idle", "billing_margin",
 }
 _FLOAT_KEYS = {"snapshot_price_per_gb_month", "monthly_budget"}
 CONTROLLER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
@@ -132,9 +149,15 @@ def load(path: Path | None = None) -> Config:
     if cfg.controller_id and not CONTROLLER_RE.match(cfg.controller_id):
         raise DevboxError(f"{path}: controller_id must be lowercase letters, digits and dashes")
     try:
-        parse_duration(cfg.idle_timeout)
+        parse_idle_timeout(cfg.idle_timeout)
     except DevboxError as e:
         raise DevboxError(f"{path}: idle_timeout: {e}")
+    for key in ("min_idle", "billing_margin"):
+        try:
+            if parse_duration(getattr(cfg, key)) is None:
+                raise DevboxError("can't be off; use 0m")
+        except DevboxError as e:
+            raise DevboxError(f"{path}: {key}: {e}")
     try:
         if parse_duration(cfg.startup_timeout) is None:
             raise DevboxError("startup_timeout can't be off")

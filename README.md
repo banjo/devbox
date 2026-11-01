@@ -87,6 +87,7 @@ devbox ssh NAME                           shell on the server
 devbox status [NAME]                      servers, processes, preview URLs, cost so far
 devbox pause NAME                         snapshot the server, then delete it (= down --snapshot)
 devbox down NAME [--snapshot] [--dump]    delete the server (dumping databases first with --dump); prints cost and activity
+    pause/down --at-hour-end                 keep the server until just before its next billing hour, then pause/delete it
 devbox touch NAME                         record activity so idle shutdown waits
 devbox idle-check [--dry-run]             pause/delete servers idle past their timeout (for cron)
 devbox autostop enable|disable [--yes]    install/remove the cron entry for idle-check (shows the plan without --yes)
@@ -165,12 +166,12 @@ All commands accept `--json`, before or after the command (`devbox --json status
   devbox autostop disable --yes
   ```
 
-  - The entry runs `idle-check` every 15 minutes with this install's `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and a `PATH` that finds `hcloud`, `ssh` and `rsync`, so it covers exactly this config, whichever folder you run it from. Output goes to `idle-check.log` in the state folder. A marker comment above the entry lets devbox find, replace and remove only its own line; other crontab lines are never touched. Several config homes (controllers) each get their own entry.
+  - The entry runs `idle-check` every 5 minutes with this install's `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and a `PATH` that finds `hcloud`, `ssh` and `rsync`, so it covers exactly this config, whichever folder you run it from. Output goes to `idle-check.log` in the state folder. A marker comment above the entry lets devbox find, replace and remove only its own line; other crontab lines are never touched. Several config homes (controllers) each get their own entry.
   - Cron doesn't see your shell's `HCLOUD_TOKEN`, so `enable` requires `hcloud_token_file` in the config (a file with only the token, `chmod 600`) and refuses otherwise. The token never appears in the crontab or the log.
   - Before installing, `enable --yes` runs `idle-check --dry-run` with a cron-like environment and installs nothing if that fails. It warns when `idle_action = "down"` (servers are deleted, not paused) and when another idle-check schedule is already installed.
   - Runs never overlap: a run that starts while another is still going is skipped. Every run (not `--dry-run`) is recorded in `idle-check.json` in the state folder.
   - `autostop status` (exit 1 unless healthy) reports the schedule, the credentials, the last run, success and failure, and for each server the idle timeout (including per-project overrides and `off`), when it becomes eligible and the first check after that. A running foreground `exec` or `--keep-alive` job postpones the action. It lists which config homes and controllers have entries on this machine, and warns about other controllers that have servers in the Hetzner project but no entry here. Those servers are only reported, never changed.
-  - It is healthy only when the entry exists, the token file works, the last run succeeded and a check succeeded in the last 35 minutes (or the entry is newer than that). A failed or overdue check, or a missing token file, counts as not enforced.
+  - It is healthy only when the entry exists, the token file works, the last run succeeded and a check succeeded within two intervals plus 5 minutes (15 minutes for the 5-minute entry; entries from older versions run every 15 minutes and get 35), or the entry is newer than that. A failed or overdue check, or a missing token file, counts as not enforced.
 
   A hand-made schedule still works: a cron entry such as
 
@@ -188,6 +189,25 @@ All commands accept `--json`, before or after the command (`devbox --json status
   For these, devbox can only see that a schedule exists (and whether the last recorded run failed), not which config it covers.
 
 - When a server has an idle timeout but idle shutdown is not enforced (no schedule, or an autostop entry that is failing or overdue), `status` and `up` print a warning (`idle_enforcement` in `status --json`), and `doctor` reports it.
+
+### Using the paid hour
+
+Hetzner bills every started hour from when a server is created until it is deleted (stopped servers are billed too). A server deleted after 5 minutes costs a full hour; six 5-minute jobs on six new servers cost six hours. Once an hour has started it is paid, so devbox can keep an idle server until just before the next hour starts and reuse it for the next job.
+
+- `idle_timeout = "hour-end"` (or `devbox project set NAME --idle-timeout hour-end`): a server that has been idle for at least `min_idle` (default `5m`, so it isn't stopped between two jobs) is paused or deleted in a window just before its next billing hour. If the window passes (work was running, or no check ran in time), the new hour is already paid, so it waits for the window before the following hour.
+- `devbox pause NAME --at-hour-end` / `devbox down NAME --at-hour-end`: for workflows that stop the server after each job. The server stays usable and is paused or deleted in the window before its next billing hour. Using it again (`up`, `exec`, `sync`, `touch`, `ssh`, `expose`, `forward`, `db restore`) cancels the stop; `ps`, `logs`, `pull` and `db dump` don't. `--dump` can't be combined with it.
+- The window is one check interval long and ends `billing_margin` (default `5m`) plus the expected action time before the boundary, so exactly one scheduled check falls inside it. The action time is the longest of the last five pauses (snapshot and delete) or deletes devbox timed on this machine (`action-times.json` in the state folder), 5 minutes for pause and 1 minute for down until it has measured one. With the 5-minute autostop entry a pause starts 15 minutes before the boundary at the earliest; with a hand-made schedule devbox assumes 15 minutes between checks and starts earlier.
+- Hours count from the creation time Hetzner reports, which `status`, `up` and `idle-check` copy into the registry.
+- A running foreground `exec` or `--keep-alive` job postpones the stop to the next hour, as for ordinary timeouts. `up` waits for a stop that is in progress, then restores from the new snapshot.
+- `status` shows `paid until HH:MM, pause at about HH:MM`; `status --json` and `idle-check --json` have `policy` (`timeout`, `hour-end`, `requested` or `off`), `paid_until`, `planned_at`, `planned_action` and `missed_boundary`. `autostop status` also says when a billing hour passed without the stop.
+- Both need a working schedule (`devbox autostop enable`); `--at-hour-end` warns when nothing would carry it out.
+
+Other ways to spend less:
+
+- When a project's servers this month are on track to cost at least as much as one server kept running all month (each new server pays its own started hours, and its own monthly cap), `status` says so and suggests `project set NAME --idle-timeout off` (`monthly_cap_hint` in `status --json`).
+- Run parallel jobs on one server (`exec --detach`) instead of starting a second one; each server pays its own hours.
+- Use `down` instead of `pause` when nothing on the server needs to survive: no snapshot storage and no restore time.
+- `server-types` lists the cheapest first. Since June 2026 the `cpx` and `ccx` families cost 2–3 times more than `cx` for the same cores and memory.
 
 ### Housekeeping
 

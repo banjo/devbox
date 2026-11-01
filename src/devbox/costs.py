@@ -158,6 +158,34 @@ def server_usage(item, since=None, until=None, now: datetime | None = None) -> d
     }
 
 
+def monthly_cap_hint(servers, now: datetime) -> dict | None:
+    """When a project's separate servers this month are on track to cost at least as much
+    as one server kept running all month (each new server pays its own started hours)."""
+    since = month_start(now)
+    used = []
+    for row in servers:
+        item = server_item(row)
+        if server_window(item, since, now, now):
+            used.append((row, server_usage(item, since, now, now)))
+    if len(used) < 2 or any(u["cost"] is None for _, u in used):
+        return None
+    latest = max(used, key=lambda x: x[0]["created_at"])[0]
+    if latest["price_monthly"] is None:
+        return None
+    month_hours = (next_month(now) - since) / timedelta(hours=1)
+    always_on = min(month_hours * latest["price_hourly"], latest["price_monthly"])
+    spent = sum(u["cost"] for _, u in used)
+    elapsed = (now - since) / (next_month(now) - since)
+    projected = spent / elapsed if elapsed > 0 else spent
+    # Early in the month a few hours project to a lot; wait for a real share of it.
+    if spent < always_on / 4 or projected < always_on:
+        return None
+    return {
+        "servers": len(used), "billed_hours": sum(u["billed_hours"] for _, u in used),
+        "spent": spent, "projected": projected, "always_on": always_on,
+    }
+
+
 def buckets(start: datetime, end: datetime, by: str):
     """Yield (key, bucket_start, bucket_end) covering [start, end) for day/month grouping."""
     if by == "month":

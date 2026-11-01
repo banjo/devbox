@@ -12,6 +12,7 @@ tells a working schedule from a stale or failing one.
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -21,11 +22,13 @@ from pathlib import Path
 
 from devbox import DevboxError, admin, config, costs
 
-INTERVAL_MINUTES = 15
+# Short enough for `hour-end` stops to land just before a billing boundary.
+INTERVAL_MINUTES = 5
+# Assumed for schedules not made by `autostop enable`, whose interval is unknown.
+MANUAL_INTERVAL_MINUTES = 15
 SCHEDULE = f"*/{INTERVAL_MINUTES} * * * *"
 MARKER = "# devbox-autostop"
-# A check is overdue when two scheduled runs in a row are missing.
-STALE_AFTER = timedelta(minutes=2 * INTERVAL_MINUTES + 5)
+INTERVAL_RE = re.compile(r"^\*/(\d+)\s")
 RUNS_FILE = "idle-check.json"
 INSTALL_FILE = "autostop.json"
 LOG_FILE = "idle-check.log"
@@ -120,6 +123,29 @@ def manual_schedule(crontab: str | None) -> bool:
 
 
 # This config
+
+
+def entry_interval(line: str | None) -> int:
+    """Minutes between runs of an autostop cron line (`*/N * * * *`)."""
+    match = INTERVAL_RE.match(line or "")
+    return int(match.group(1)) if match and int(match.group(1)) > 0 else MANUAL_INTERVAL_MINUTES
+
+
+def stale_after(interval: int) -> timedelta:
+    """A check is overdue when two scheduled runs in a row are missing."""
+    return timedelta(minutes=2 * interval + 5)
+
+
+def this_entry(crontab: str | None) -> dict | None:
+    config_dir, state_dir = homes()
+    return next((e for e in parse_entries(crontab or "")
+                 if e["config_dir"] == config_dir and e["state_dir"] == state_dir and e["line"]), None)
+
+
+def check_interval(crontab: str | None = None) -> int:
+    """Minutes between idle-checks for this config: from its autostop entry, else a cautious guess."""
+    entry = this_entry(read_crontab() if crontab is None else crontab)
+    return entry_interval(entry["line"]) if entry else MANUAL_INTERVAL_MINUTES
 
 
 def homes() -> tuple[str, str]:
@@ -239,8 +265,7 @@ def enforcement(cfg, now: datetime | None = None) -> dict:
     crontab = read_crontab()
     config_dir, state_dir = homes()
     runs = read_json(Path(state_dir) / RUNS_FILE)
-    entry = next((e for e in parse_entries(crontab or "")
-                  if e["config_dir"] == config_dir and e["state_dir"] == state_dir and e["line"]), None)
+    entry = this_entry(crontab)
 
     if entry is None:
         manual = admin.idle_scheduler(unmanaged(crontab))
@@ -265,11 +290,12 @@ def enforcement(cfg, now: datetime | None = None) -> dict:
             f"{runs.get('last_error')}",
             f"see {Path(state_dir) / LOG_FILE}",
         )
+    stale = stale_after(entry_interval(entry["line"]))
     success = parse_iso(runs.get("last_success"))
-    if success and now - success <= STALE_AFTER:
+    if success and now - success <= stale:
         return admin.check("idle shutdown", admin.OK, f"scheduled (autostop), last check {ago(success, now)}")
     installed = parse_iso(read_json(Path(state_dir) / INSTALL_FILE).get("installed_at"))
-    if success is None and installed and now - installed <= STALE_AFTER:
+    if success is None and installed and now - installed <= stale:
         return admin.check("idle shutdown", admin.OK, f"scheduled (autostop) {ago(installed, now)}, first check pending")
     since = f"since {ago(success, now)}" if success else "yet"
     return admin.check(
@@ -279,9 +305,12 @@ def enforcement(cfg, now: datetime | None = None) -> dict:
     )
 
 
-def next_check(after: datetime) -> datetime:
-    t = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    while t.minute % INTERVAL_MINUTES:
+def next_check(after: datetime, interval: int = INTERVAL_MINUTES) -> datetime:
+    """The first `*/interval` cron run at or after `after`."""
+    t = after.replace(second=0, microsecond=0)
+    if t < after:
+        t += timedelta(minutes=1)
+    while t.minute % interval:
         t += timedelta(minutes=1)
     return t
 
@@ -338,7 +367,7 @@ def enable(cfg, yes: bool) -> dict:
     if cfg.idle_action == "down":
         warnings.append("idle_action is 'down': idle servers are deleted with their data, not paused. "
                         "Set idle_action = \"pause\" in the config to keep a snapshot instead")
-    if config.parse_duration(cfg.idle_timeout) is None:
+    if config.parse_idle_timeout(cfg.idle_timeout) is None:
         warnings.append("idle_timeout is off; only projects with their own --idle-timeout are checked")
     if manual_schedule(crontab):
         warnings.append("another idle-check schedule (not managed by autostop) is installed; runs never "

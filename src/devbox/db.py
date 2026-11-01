@@ -87,6 +87,10 @@ MIGRATIONS = [
     ALTER TABLE servers ADD COLUMN diagnostics TEXT;
     ALTER TABLE projects ADD COLUMN startup_timeout TEXT;
     """,
+    """
+    ALTER TABLE servers ADD COLUMN stop_action TEXT;
+    ALTER TABLE servers ADD COLUMN stop_requested_at TEXT;
+    """,
 ]
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
@@ -397,6 +401,7 @@ def event_counts(conn: sqlite3.Connection, server_id: int) -> dict[str, int]:
 _SERVER_FIELDS = {
     "ip", "server_type", "location", "status", "preview_port", "preview_url",
     "price_hourly", "price_monthly", "power", "setup_stage", "setup_error", "diagnostics",
+    "stop_action", "stop_requested_at", "created_at",
 }
 
 
@@ -408,6 +413,20 @@ def update_server(conn: sqlite3.Connection, server_id: int, **fields) -> None:
         return
     sets = ", ".join(f"{k} = ?" for k in fields)
     conn.execute(f"UPDATE servers SET {sets} WHERE id = ?", (*fields.values(), server_id))
+
+
+def request_stop(conn: sqlite3.Connection, server_id: int, action: str) -> None:
+    """Stop the server at the end of its billing hour (`pause/down --at-hour-end`)."""
+    conn.execute(
+        "UPDATE servers SET stop_action = ?, stop_requested_at = ? WHERE id = ?", (action, now(), server_id)
+    )
+
+
+def cancel_stop(conn: sqlite3.Connection, server_id: int) -> bool:
+    return conn.execute(
+        "UPDATE servers SET stop_action = NULL, stop_requested_at = NULL WHERE id = ? AND stop_action IS NOT NULL",
+        (server_id,),
+    ).rowcount > 0
 
 
 def mark_deleted(conn: sqlite3.Connection, server_id: int) -> None:
@@ -434,6 +453,9 @@ def reconcile(conn: sqlite3.Connection, hetzner_servers: list[dict]) -> list[dic
             changes["ip"] = live["ip"]
         if live.get("status") and live["status"] != row["power"]:
             changes["power"] = live["status"]
+        # Hetzner's creation time is what billing hours count from.
+        if live.get("created") and _parse(live["created"]) != _parse(row["created_at"]):
+            changes["created_at"] = _parse(live["created"]).isoformat(timespec="seconds")
         update_server(conn, row["id"], **changes)
 
     known_ids = {row["hetzner_id"] for row in active_servers(conn)}

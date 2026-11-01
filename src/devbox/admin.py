@@ -172,7 +172,7 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess | None:
 def schedule_check(ctx) -> dict:
     from devbox import autostop
 
-    if config.parse_duration(ctx.cfg.idle_timeout) is None:
+    if config.parse_idle_timeout(ctx.cfg.idle_timeout) is None:
         return check("idle shutdown", OK, "idle_timeout is off")
     return autostop.enforcement(ctx.cfg)
 

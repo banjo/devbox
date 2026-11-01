@@ -114,6 +114,15 @@ Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/a
 - If `status` says the server is powered off (for example after a pause that couldn't delete it), tell the user it is still billed and either finish with `devbox pause NAME` or start it again with `devbox up NAME`.
 - For projects that need longer: `devbox project set NAME --idle-timeout 1d` (or `off`).
 
+### Short jobs and the paid hour
+
+Hetzner bills every started hour from when a server is created. A new server per 5-minute job pays a full hour each time; reusing the server within the hour costs nothing extra.
+
+- When you finish a short job and more may follow, use `devbox pause NAME --at-hour-end` (or `down --at-hour-end` if nothing needs to be kept) instead of `pause`. The server stays usable until just before its next billing hour; the next `up`/`exec` reuses it and cancels the stop. Tell the user when it will be paused (the command prints it). If it warns that nothing will carry it out, autostop isn't working: tell the user and suggest `devbox autostop enable`, or pause right away instead.
+- For projects with many short jobs, suggest `devbox project set NAME --idle-timeout hour-end` to the user.
+- Run parallel work on the one server with `exec --detach` rather than asking for a second server.
+- If `status` says the project's servers are on track to cost more than one server kept running all month, pass that on and let the user decide.
+
 ### Costs
 
 - `devbox status` shows each running server's cost so far, kept snapshots and their monthly cost, the total for this month and the budget left.
@@ -133,6 +142,7 @@ Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/a
 | "What did we run on this project?" | `devbox history NAME` |
 | "Something's broken with devbox" | `devbox doctor` |
 | "We're done for today" | `devbox pause NAME`, report the cost summary |
+| "Done with this job" (more jobs likely this hour) | `devbox pause NAME --at-hour-end`, say when it will be paused |
 | "Delete everything for this project" | Confirm, `devbox down NAME`, `devbox snapshot delete` for its snapshots |
 | "Continue where we left off" | `devbox up NAME` (restores the snapshot), then the notes' every-start steps |
 

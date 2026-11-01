@@ -27,6 +27,11 @@ keep_snapshots = 1
 # without devbox activity for this long: "pause" (snapshot + delete) or "down".
 idle_timeout = "8h"
 idle_action = "pause"
+# idle_timeout = "hour-end" instead stops idle servers just before their next
+# billing hour starts (Hetzner bills per started hour). A server must be idle
+# for min_idle first; billing_margin is the safety margin before the boundary.
+# min_idle = "5m"
+# billing_margin = "5m"
 
 # Deadline for `up`: create/power on, SSH, cloud-init, tool check and first sync.
 startup_timeout = "5m"

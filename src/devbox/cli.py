@@ -7,12 +7,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from importlib import resources
 from pathlib import Path
 
-from devbox import DevboxError, admin, autostop, config, costs, databases, db, envsecrets, startup, watch
+from devbox import DevboxError, admin, autostop, billing, config, costs, databases, db, envsecrets, startup, watch
 from devbox.hetzner import Hcloud, filter_offers
 from devbox.remote import PULL_PRUNE, TUNNEL, Remote, git_files, git_ignored, to_script, validate_proc
 
@@ -20,6 +21,8 @@ from devbox.remote import PULL_PRUNE, TUNNEL, Remote, git_files, git_ignored, to
 EXIT_TIMEOUT = 124
 # Hetzner server statuses in which nothing runs on the server.
 POWERED_DOWN = ("off", "stopping")
+# Using the server again cancels a `pause/down --at-hour-end`; looking at it doesn't.
+CANCELS_STOP = {"up", "sync", "exec", "exec_detach", "touch", "expose", "forward", "db_restore", "ssh"}
 
 
 class Context:
@@ -31,6 +34,7 @@ class Context:
         self._snapshot_price = None
         self.snapshot_orphans: list[dict] = []
         self.foreign_servers: list[dict] = []
+        self._check_interval = None
 
     @property
     def cfg(self) -> config.Config:
@@ -133,6 +137,14 @@ class Context:
 
     def event(self, server, kind: str) -> None:
         db.add_event(self.conn, server["project"], server["id"], kind)
+        if kind in CANCELS_STOP:
+            db.cancel_stop(self.conn, server["id"])
+
+    def check_interval(self) -> int:
+        """Minutes between scheduled idle-checks for this config."""
+        if self._check_interval is None:
+            self._check_interval = autostop.check_interval()
+        return self._check_interval
 
     @contextlib.contextmanager
     def lock(self):
@@ -155,6 +167,14 @@ def emit(args, data, text: str | None = None) -> None:
 
 def row(r) -> dict | None:
     return dict(r) if r is not None else None
+
+
+def local_time(ts: str) -> str:
+    return datetime.fromisoformat(ts).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def clock(ts: str) -> str:
+    return datetime.fromisoformat(ts).astimezone().strftime("%H:%M")
 
 
 def uptime(created_at: str | None) -> str | None:
@@ -237,8 +257,10 @@ def cmd_project_set(ctx: Context) -> int:
     if value is not None:
         if value == "default":
             value = None
+        elif config.parse_idle_timeout(value) == config.HOUR_END:
+            value = config.HOUR_END
         else:
-            config.parse_duration(value)
+            config.parse_idle_timeout(value)
         db.set_idle_timeout(ctx.conn, name, value)
     value = ctx.args.startup_timeout
     if value is not None:
@@ -552,6 +574,7 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
     sync = remote.sync(project["path"], ctx.manifest(name), timeout=deadline.bound("sync", deadline.remaining()))
     if sync["warning"]:
         warnings.append(sync["warning"])
+    cancelled_stop = db.get_server(ctx.conn, server["id"])["stop_action"]
     ctx.event(server, "up")
     ctx.event(server, "sync")
     progress.step("secrets", "Writing secrets...") if secret_store(ctx, name).load() else None
@@ -567,6 +590,7 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
         "offer": offer,
         "warnings": warnings,
         "secrets_written": secrets_written,
+        "cancelled_stop": cancelled_stop,
     }
 
 
@@ -587,6 +611,7 @@ def report_up(ctx: Context, r: dict, deadline: "startup.Deadline") -> int:
         "offer": offer,
         "warnings": r["warnings"],
         "startup_seconds": round(deadline.elapsed(), 1),
+        "cancelled_stop": r["cancelled_stop"],
     }
     verb = "powered on" if r["powered_on"] else "reusing"
     if r["created"]:
@@ -603,6 +628,8 @@ def report_up(ctx: Context, r: dict, deadline: "startup.Deadline") -> int:
             f"  from snapshot taken {snapshot['created_at'][:16].replace('T', ' ')}: installed tools, "
             f"dependencies and data from then are back; background processes and the preview must be started again"
         )
+    if r["cancelled_stop"]:
+        text.append(f"  cancelled the {r['cancelled_stop']} planned for the end of the billing hour")
     if r["secrets_written"]:
         text.append("  secrets written to " + ", ".join(f"{f} ({n} keys)" for f, n in r["secrets_written"].items()))
     text += [f"warning: {w}" for w in r["warnings"]]
@@ -835,6 +862,7 @@ def take_down(ctx: Context, server, snapshot: bool, event: str) -> dict:
     name = server["project"]
     snap = None
     pruned: list[int] = []
+    started = time.monotonic()
     if snapshot:
         latest = db.latest_snapshot(ctx.conn, name)
         if server["power"] in POWERED_DOWN and latest and latest["server_id"] == server["id"]:
@@ -855,6 +883,7 @@ def take_down(ctx: Context, server, snapshot: bool, event: str) -> dict:
             f"The server is shut down and still billed. Run `devbox pause {name}` again to finish "
             f"(it reuses this snapshot), or `devbox up {name}` to power the server back on."
         )
+    billing.record_action_time(ctx.cfg.state_dir, "pause" if snapshot else "down", time.monotonic() - started)
     ctx.event(server, event)
     db.mark_deleted(ctx.conn, server["id"])
     ctx.known_hosts(server).unlink(missing_ok=True)
@@ -868,6 +897,10 @@ def take_down(ctx: Context, server, snapshot: bool, event: str) -> dict:
 def cmd_down(ctx: Context) -> int:
     name = ctx.args.name
     snapshot = ctx.args.snapshot
+    if ctx.args.at_hour_end:
+        if getattr(ctx.args, "dump", False):
+            raise DevboxError("--dump can't be combined with --at-hour-end; dump now with `devbox db dump`")
+        return request_stop_at_hour_end(ctx, name, "pause" if snapshot else "down")
     with ctx.lock():
         db.require_project(ctx.conn, name)
         ctx.reconcile()
@@ -899,9 +932,39 @@ def cmd_down(ctx: Context) -> int:
     return 0
 
 
-def project_idle_timeout(ctx: Context, project) -> tuple[str, timedelta | None]:
+def request_stop_at_hour_end(ctx: Context, name: str, action: str) -> int:
+    with ctx.lock():
+        db.require_project(ctx.conn, name)
+        ctx.reconcile()
+        server = db.active_server(ctx.conn, name)
+        if server is None:
+            emit(ctx.args, {"project": name, "stop_action": None}, f"{name} has no server")
+            return 0
+        db.request_stop(ctx.conn, server["id"], action)
+        server = db.get_server(ctx.conn, server["id"])
+    info = idle_info(ctx, server, datetime.now(timezone.utc))
+    enforcement = autostop.enforcement(ctx.cfg)
+    warning = None
+    if enforcement["status"] != admin.OK:
+        warning = (f"nothing will carry this out: idle shutdown is not enforced ({enforcement['detail']}; "
+                   f"fix: {enforcement['fix']}). The server keeps running and costing money")
+    data = {"project": name, "server": server["hetzner_id"], "stop_action": action,
+            "paid_until": info["paid_until"], "planned_at": info["planned_at"], "warning": warning}
+    lines = [
+        f"{name}: will {action} server {server['hetzner_id']} at about {clock(info['planned_at'])}, before the "
+        f"next billing hour starts at {clock(info['paid_until'])}; until then the server stays usable",
+        f"  using it (`up`, `exec`, `sync`, `touch`, ...) cancels this; a running foreground exec or "
+        f"--keep-alive job postpones it to the next hour",
+    ]
+    if warning:
+        lines.append(f"warning: {warning}")
+    emit(ctx.args, data, "\n".join(lines))
+    return 0
+
+
+def project_idle_timeout(ctx: Context, project) -> tuple[str, timedelta | str | None]:
     value = project["idle_timeout"] or ctx.cfg.idle_timeout
-    return value, config.parse_duration(value)
+    return value, config.parse_idle_timeout(value)
 
 
 def idle_scheduler_warning(ctx: Context) -> tuple[dict, str | None]:
@@ -913,16 +976,60 @@ def idle_scheduler_warning(ctx: Context) -> tuple[dict, str | None]:
 
 
 def idle_info(ctx: Context, server, now: datetime) -> dict:
+    """When (and how) the server will be stopped, as far as idle-check is concerned.
+
+    `policy` is "timeout" (idle for a fixed time), "hour-end" (idle, then just
+    before the next billing hour), "requested" (`pause/down --at-hour-end`) or
+    "off". `remaining_seconds` is the time until the stop is due (<= 0: due
+    now), or None when nothing will stop the server.
+    """
     project = db.get_project(ctx.conn, server["project"])
     setting, timeout = project_idle_timeout(ctx, project)
     last = db.last_activity(ctx.conn, server)
     idle = now - last
-    return {
+    created = costs.parse_ts(server["created_at"])
+    info = {
         "last_activity": last.isoformat(timespec="seconds"),
         "idle_seconds": int(idle.total_seconds()),
         "idle_timeout": setting,
-        "remaining_seconds": None if timeout is None else int((timeout - idle).total_seconds()),
+        "policy": "off",
+        "planned_action": ctx.cfg.idle_action,
+        "paid_until": billing.next_boundary(created, now).isoformat(timespec="seconds"),
+        "planned_at": None,
+        "remaining_seconds": None,
+        "missed_boundary": None,
     }
+    if server["stop_action"]:
+        info.update(policy="requested", planned_action=server["stop_action"])
+        ready = costs.parse_ts(server["stop_requested_at"])
+    elif timeout == config.HOUR_END:
+        info["policy"] = "hour-end"
+        ready = last + config.parse_duration(ctx.cfg.min_idle)
+    elif timeout is None:
+        return info
+    else:
+        info.update(policy="timeout", planned_at=(last + timeout).isoformat(timespec="seconds"),
+                    remaining_seconds=int((timeout - idle).total_seconds()))
+        return info
+    action_time = billing.action_time(ctx.cfg.state_dir, info["planned_action"])
+    margin = config.parse_duration(ctx.cfg.billing_margin)
+    interval = timedelta(minutes=ctx.check_interval())
+    planned = billing.planned_stop(created, ready, now, interval, action_time, margin)
+    missed = billing.missed_boundary(created, ready, now, action_time, margin)
+    info.update(
+        planned_at=planned.isoformat(timespec="seconds"),
+        remaining_seconds=int((planned - now).total_seconds()),
+        missed_boundary=missed.isoformat(timespec="seconds") if missed else None,
+    )
+    return info
+
+
+def idle_limit(e: dict) -> str:
+    if e["policy"] == "requested":
+        return f"{e['planned_action']} requested at hour end"
+    if e["policy"] == "hour-end":
+        return f"hour-end, paid until {clock(e['paid_until'])}"
+    return e["idle_timeout"]
 
 
 def cmd_idle_check(ctx: Context) -> int:
@@ -948,12 +1055,12 @@ def cmd_idle_check(ctx: Context) -> int:
 
 def idle_check(ctx: Context) -> list[dict]:
     now = datetime.now(timezone.utc)
-    action = ctx.cfg.idle_action
     results = []
     with ctx.lock():
         ctx.reconcile()
         for server in db.active_servers(ctx.conn):
             info = idle_info(ctx, server, now)
+            action = info["planned_action"]
             entry = {"project": server["project"], "server": server["hetzner_id"], **info, "action": None}
             remaining = info["remaining_seconds"]
             if remaining is None or remaining > 0:
@@ -974,8 +1081,8 @@ def idle_check(ctx: Context) -> list[dict]:
                     continue
             # Recheck activity right before acting; a command may have just started.
             latest = idle_info(ctx, db.get_server(ctx.conn, server["id"]), datetime.now(timezone.utc))
-            if latest["remaining_seconds"] is not None and latest["remaining_seconds"] > 0:
-                entry.update(latest)
+            if latest["remaining_seconds"] is None or latest["remaining_seconds"] > 0 or latest["planned_action"] != action:
+                entry.update({**latest, "action": None})
                 results.append(entry)
                 continue
             entry["action"] = action
@@ -983,7 +1090,8 @@ def idle_check(ctx: Context) -> list[dict]:
                 entry["dry_run"] = True
             else:
                 try:
-                    entry["summary"] = take_down(ctx, server, action == "pause", f"idle_{action}")
+                    event = f"hour_end_{action}" if info["policy"] == "requested" else f"idle_{action}"
+                    entry["summary"] = take_down(ctx, server, action == "pause", event)
                 except DevboxError as e:
                     entry["error"] = str(e)
             results.append(entry)
@@ -994,25 +1102,31 @@ def print_idle_check(ctx: Context, results: list[dict]) -> None:
     lines = []
     for e in results:
         idle = costs.duration(e["idle_seconds"])
+        limit = idle_limit(e)
+        hourly = e["policy"] in ("hour-end", "requested")
         if e.get("busy"):
             kinds = ", ".join(sorted({b["kind"] for b in e["busy"]}))
-            lines.append(f"{e['project']}: idle {idle} (limit {e['idle_timeout']}), but {len(e['busy'])} "
-                         f"{kinds}(s) still running; left alone")
+            later = "; tried again before the next billing hour" if hourly else ""
+            lines.append(f"{e['project']}: idle {idle} ({limit}), but {len(e['busy'])} "
+                         f"{kinds}(s) still running; left alone{later}")
         elif e.get("skipped"):
-            lines.append(f"{e['project']}: idle {idle} (limit {e['idle_timeout']}), {e['skipped']}; left alone")
+            lines.append(f"{e['project']}: idle {idle} ({limit}), {e['skipped']}; left alone")
         elif e["action"] is None:
             if e["remaining_seconds"] is None:
                 lines.append(f"{e['project']}: idle {idle}, idle shutdown off")
+            elif hourly:
+                lines.append(f"{e['project']}: idle {idle} ({limit}), "
+                             f"{e['planned_action']} at about {clock(e['planned_at'])}")
             else:
                 lines.append(f"{e['project']}: idle {idle}, "
                              f"{costs.duration(e['remaining_seconds'])} left of {e['idle_timeout']}")
         elif e.get("dry_run"):
-            lines.append(f"{e['project']}: idle {idle} (limit {e['idle_timeout']}), would {e['action']}")
+            lines.append(f"{e['project']}: idle {idle} ({limit}), would {e['action']}")
         elif "error" in e:
             lines.append(f"{e['project']}: idle {idle}, {e['action']} FAILED: {e['error']}")
         else:
             verb = "paused" if e["action"] == "pause" else "deleted"
-            lines.append(f"{e['project']}: idle {idle} (limit {e['idle_timeout']}), {verb}")
+            lines.append(f"{e['project']}: idle {idle} ({limit}), {verb}")
             lines += summary_lines(e["summary"])
     emit(ctx.args, results, "\n".join(lines) or "no devbox servers")
 
@@ -1070,6 +1184,8 @@ def cmd_autostop_status(ctx: Context) -> int:
     mine = next((c for c in covered if c["this_config"]), None)
     runs = autostop.read_json(Path(state_dir) / autostop.RUNS_FILE)
 
+    own_entry = autostop.this_entry(crontab)
+    interval = autostop.entry_interval(own_entry["line"]) if own_entry else autostop.MANUAL_INTERVAL_MINUTES
     servers = []
     for server in db.active_servers(ctx.conn):
         info = idle_info(ctx, server, now)
@@ -1079,8 +1195,10 @@ def cmd_autostop_status(ctx: Context) -> int:
             eligible = now + timedelta(seconds=info["remaining_seconds"])
             entry["eligible_at"] = eligible.isoformat(timespec="seconds")
             if enforcement["status"] == admin.OK:
-                entry["first_check"] = autostop.next_check(max(now, eligible)).isoformat(timespec="seconds")
+                entry["first_check"] = autostop.next_check(max(now, eligible), interval).isoformat(timespec="seconds")
         servers.append(entry)
+    hourly = any(s["policy"] in ("hour-end", "requested") for s in servers) or \
+        config.parse_idle_timeout(ctx.cfg.idle_timeout) == config.HOUR_END
 
     covered_ids = {c["controller"] for c in covered if c["controller"]}
     uncovered: dict[str, list[str]] = {}
@@ -1093,15 +1211,13 @@ def cmd_autostop_status(ctx: Context) -> int:
         "healthy": enforcement["status"] == admin.OK and creds["status"] != admin.FAIL,
         "enforcement": enforcement, "credentials": creds,
         "config_dir": config_dir, "state_dir": state_dir, "controller": ctx.hcloud.controller_id,
-        "entry": mine, "interval_minutes": autostop.INTERVAL_MINUTES,
+        "entry": mine, "interval_minutes": interval if mine else None,
         "idle_timeout": ctx.cfg.idle_timeout, "idle_action": ctx.cfg.idle_action,
         "runs": runs, "servers": servers, "coverage": covered,
         "uncovered_controllers": uncovered_list, "hetzner_error": hetzner_error,
     }
 
-    def local(ts: str) -> str:
-        return datetime.fromisoformat(ts).astimezone().strftime("%Y-%m-%d %H:%M")
-
+    local = local_time
     lines = [f"[{STATUS_MARK[enforcement['status']]}] idle shutdown: {enforcement['detail']}"]
     if enforcement["status"] != admin.OK and enforcement["fix"]:
         lines.append(f"       fix: {enforcement['fix']}")
@@ -1117,10 +1233,21 @@ def cmd_autostop_status(ctx: Context) -> int:
             lines.append(f"{s['project']}: idle {costs.duration(s['idle_seconds'])}, idle shutdown off")
             continue
         when = f"first check {local(s['first_check'])}" if s["first_check"] else "but nothing will act on it"
-        lines.append(f"{s['project']}: idle {costs.duration(s['idle_seconds'])} of {s['idle_timeout']}, "
-                     f"eligible {local(s['eligible_at'])}, {when}")
+        if s["policy"] == "timeout":
+            lines.append(f"{s['project']}: idle {costs.duration(s['idle_seconds'])} of {s['idle_timeout']}, "
+                         f"eligible {local(s['eligible_at'])}, {when}")
+        else:
+            lines.append(f"{s['project']}: idle {costs.duration(s['idle_seconds'])} ({idle_limit(s)}), "
+                         f"{s['planned_action']} from {local(s['eligible_at'])}, {when}")
+        if s["missed_boundary"]:
+            lines.append(f"  the billing hour that ended {clock(s['missed_boundary'])} was not used to stop it "
+                         f"(work was running, or no check ran in time); the next hour is already paid")
     if servers:
         lines.append("  a running foreground exec or --keep-alive job postpones the action until it ends")
+    if mine and hourly and interval > autostop.INTERVAL_MINUTES:
+        lines.append(f"note: idle-check runs every {interval} min, so hour-end stops start up to {interval} min "
+                     f"earlier than needed; `devbox autostop enable --yes` updates it to every "
+                     f"{autostop.INTERVAL_MINUTES} min")
     if covered:
         lines.append("cron entries on this machine:")
         for c in covered:
@@ -1140,9 +1267,14 @@ def cmd_touch(ctx: Context) -> int:
     ctx.event(server, "touch")
     info = idle_info(ctx, server, datetime.now(timezone.utc))
     left = info["remaining_seconds"]
-    text = "activity recorded; " + (
-        "idle shutdown is off" if left is None else f"idle shutdown in {costs.duration(left)} without activity"
-    )
+    if left is None:
+        when = "idle shutdown is off"
+    elif info["policy"] == "hour-end":
+        verb = "paused" if info["planned_action"] == "pause" else "deleted"
+        when = f"without more activity the server is {verb} at about {clock(info['planned_at'])}"
+    else:
+        when = f"idle shutdown in {costs.duration(left)} without activity"
+    text = "activity recorded; " + when
     emit(ctx.args, {"project": ctx.args.name, **info}, text)
     return 0
 
@@ -1169,6 +1301,7 @@ def cmd_status(ctx: Context) -> int:
             entry["uptime"] = uptime(server["created_at"])
             entry["usage"] = costs.server_usage(server)
             entry["idle"] = idle_info(ctx, server, now)
+            entry["monthly_cap_hint"] = costs.monthly_cap_hint(db.all_servers(ctx.conn, p["name"]), now)
             if server["status"] == "running" and server["power"] not in POWERED_DOWN:
                 try:
                     entry["processes"] = ctx.remote(server).list_units()
@@ -1207,12 +1340,30 @@ def cmd_status(ctx: Context) -> int:
             lines.append(f"  still billed: `devbox up {e['project']}` retries setup, `devbox down {e['project']}` deletes it")
         lines.append(f"  cost: {cost_line(e['usage'], s)}")
         idle = e["idle"]
-        if idle["remaining_seconds"] is None:
-            lines.append(f"  idle {costs.duration(idle['idle_seconds'])} (idle shutdown off)")
-        else:
+        idle_for = costs.duration(idle["idle_seconds"])
+        if idle["policy"] == "off":
+            lines.append(f"  idle {idle_for} (idle shutdown off)")
+        elif idle["policy"] == "timeout":
             lines.append(
-                f"  idle {costs.duration(idle['idle_seconds'])}, {ctx.cfg.idle_action} after {idle['idle_timeout']} "
+                f"  idle {idle_for}, {idle['planned_action']} after {idle['idle_timeout']} "
                 f"({costs.duration(max(0, idle['remaining_seconds']))} left)"
+            )
+        else:
+            why = (f"{idle['planned_action']} requested" if idle["policy"] == "requested"
+                   else f"idle {idle_for}, hour-end")
+            lines.append(
+                f"  {why}: paid until {clock(idle['paid_until'])}, {idle['planned_action']} at about "
+                f"{clock(idle['planned_at'])}"
+            )
+            if idle["policy"] == "requested":
+                lines.append(f"  using the server (`up`, `exec`, `sync`, `touch`, ...) cancels the {idle['planned_action']}")
+        if e.get("monthly_cap_hint"):
+            h = e["monthly_cap_hint"]
+            lines.append(
+                f"  this month: {h['servers']} servers, {costs.hours(h['billed_hours'])} billed h, "
+                f"{costs.money(h['spent'])}, on track for ~{costs.money(h['projected'])}; one server kept "
+                f"running all month costs ~{costs.money(h['always_on'])} (`devbox project set {e['project']} "
+                f"--idle-timeout off`)"
             )
         if s["preview_url"]:
             lines.append(f"  preview: {s['preview_url']} -> port {s['preview_port']}")
@@ -1912,7 +2063,8 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
 
     p = proj_sub.add_parser("set", help="change project settings", parents=[common])
     p.add_argument("name")
-    p.add_argument("--idle-timeout", metavar="DURATION", help="e.g. 2h, 1d, off, or 'default'")
+    p.add_argument("--idle-timeout", metavar="DURATION",
+                   help="e.g. 2h, 1d, off, hour-end (stop before the next billing hour), or 'default'")
     p.add_argument("--startup-timeout", metavar="DURATION", help="deadline for `up`, e.g. 10m, or 'default'")
     p.set_defaults(func=cmd_project_set)
 
@@ -1949,10 +2101,14 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
     p.add_argument("name")
     p.add_argument("--snapshot", action="store_true", help="snapshot the server first (same as pause)")
     p.add_argument("--dump", action="store_true", help="dump all project databases locally first")
+    p.add_argument("--at-hour-end", action="store_true",
+                   help="keep the server until just before its next billing hour, then delete it (needs autostop)")
 
     p = add("pause", cmd_down, "snapshot the server, then delete it; `up` restores it")
     p.add_argument("name")
     p.add_argument("--dump", action="store_true", help="also dump all project databases locally first")
+    p.add_argument("--at-hour-end", action="store_true",
+                   help="keep the server until just before its next billing hour, then pause it (needs autostop)")
     p.set_defaults(snapshot=True)
 
     p = add("touch", cmd_touch, "record activity so idle shutdown waits")

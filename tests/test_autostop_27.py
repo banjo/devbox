@@ -69,7 +69,7 @@ def test_enable_without_yes_only_shows_the_plan(capsys, isolated, cron):
     assert plan["installed"] is False and plan["verified"] is None
     assert cron["text"] == UNRELATED
     entry = plan["entry"]
-    assert entry.startswith("*/15 * * * * XDG_CONFIG_HOME=")
+    assert entry.startswith("*/5 * * * * XDG_CONFIG_HOME=")
     assert str(isolated / "config") in entry and str(isolated / "state") in entry
     assert "-m devbox idle-check >> " in entry and "PATH=/opt/tools:" in entry
     assert "file-token" not in entry and "%" not in entry
@@ -180,7 +180,7 @@ def test_recent_success_is_healthy_and_shows_when_servers_are_checked(capsys, is
     server = data["servers"][0]
     assert server["idle_timeout"] == "8h" and server["eligible_at"] and server["first_check"]
     first = datetime.fromisoformat(server["first_check"])
-    assert first.minute % 15 == 0 and first >= datetime.fromisoformat(server["eligible_at"])
+    assert first.minute % 5 == 0 and first >= datetime.fromisoformat(server["eligible_at"])
 
     code, out, _ = run(capsys, "status")
     assert "not enforced" not in out
