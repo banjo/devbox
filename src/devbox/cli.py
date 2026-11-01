@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from importlib import resources
 from pathlib import Path
 
-from devbox import DevboxError, admin, config, costs, databases, db, envsecrets, startup, watch
+from devbox import DevboxError, admin, autostop, config, costs, databases, db, envsecrets, startup, watch
 from devbox.hetzner import Hcloud, filter_offers
 from devbox.remote import PULL_PRUNE, TUNNEL, Remote, git_files, git_ignored, to_script, validate_proc
 
@@ -574,7 +574,7 @@ def report_up(ctx: Context, r: dict, deadline: "startup.Deadline") -> int:
     project, server, snapshot, offer = r["project"], r["server"], r["snapshot"], r["offer"]
     name = project["name"]
     if project_idle_timeout(ctx, project)[1] is not None:
-        _, warning = idle_scheduler_warning()
+        _, warning = idle_scheduler_warning(ctx)
         if warning:
             r["warnings"].append(warning)
     data = {
@@ -904,12 +904,12 @@ def project_idle_timeout(ctx: Context, project) -> tuple[str, timedelta | None]:
     return value, config.parse_duration(value)
 
 
-def idle_scheduler_warning() -> tuple[dict, str | None]:
-    """The idle-check schedule, and a warning when timeouts are set but nothing enforces them."""
-    sched = admin.idle_scheduler()
+def idle_scheduler_warning(ctx: Context) -> tuple[dict, str | None]:
+    """Idle-check enforcement, and a warning when timeouts are set but nothing (healthy) enforces them."""
+    sched = autostop.enforcement(ctx.cfg)
     if sched["status"] == admin.OK:
         return sched, None
-    return sched, f"idle shutdown is not enforced: {sched['detail']} (see `devbox doctor`)"
+    return sched, f"idle shutdown is not enforced: {sched['detail']} (fix: {sched['fix']})"
 
 
 def idle_info(ctx: Context, server, now: datetime) -> dict:
@@ -926,10 +926,30 @@ def idle_info(ctx: Context, server, now: datetime) -> dict:
 
 
 def cmd_idle_check(ctx: Context) -> int:
+    ctx.cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    with open(ctx.cfg.state_dir / "idle-check.lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            emit(ctx.args, [], "another idle-check is still running; skipped")
+            return 0
+        try:
+            results = idle_check(ctx)
+        except DevboxError as e:
+            if not ctx.args.dry_run:
+                autostop.record_run(ctx.cfg.state_dir, str(e))
+            raise
+        errors = [f"{e['project']}: {e['action']} failed: {e['error']}" for e in results if "error" in e]
+        if not ctx.args.dry_run:
+            autostop.record_run(ctx.cfg.state_dir, "; ".join(errors) or None)
+    print_idle_check(ctx, results)
+    return 1 if errors else 0
+
+
+def idle_check(ctx: Context) -> list[dict]:
     now = datetime.now(timezone.utc)
     action = ctx.cfg.idle_action
     results = []
-    failed = False
     with ctx.lock():
         ctx.reconcile()
         for server in db.active_servers(ctx.conn):
@@ -966,9 +986,11 @@ def cmd_idle_check(ctx: Context) -> int:
                     entry["summary"] = take_down(ctx, server, action == "pause", f"idle_{action}")
                 except DevboxError as e:
                     entry["error"] = str(e)
-                    failed = True
             results.append(entry)
+    return results
 
+
+def print_idle_check(ctx: Context, results: list[dict]) -> None:
     lines = []
     for e in results:
         idle = costs.duration(e["idle_seconds"])
@@ -993,7 +1015,124 @@ def cmd_idle_check(ctx: Context) -> int:
             lines.append(f"{e['project']}: idle {idle} (limit {e['idle_timeout']}), {verb}")
             lines += summary_lines(e["summary"])
     emit(ctx.args, results, "\n".join(lines) or "no devbox servers")
-    return 1 if failed else 0
+
+
+def cmd_autostop_enable(ctx: Context) -> int:
+    plan = autostop.enable(ctx.cfg, ctx.args.yes)
+    lines = []
+    if plan["installed"]:
+        verb = "already enabled; verified" if plan["already_enabled"] else "enabled"
+        lines.append(f"idle shutdown {verb} for {plan['config_dir']} (controller {plan['controller']}): "
+                     f"idle-check every {autostop.INTERVAL_MINUTES} min, test run passed")
+    elif plan["already_enabled"]:
+        lines.append(f"already enabled for {plan['config_dir']}; `devbox autostop enable --yes` re-verifies it")
+    else:
+        lines.append(f"would {'replace' if plan['replaces'] else 'add'} this cron entry "
+                     f"(controller {plan['controller']}, every {autostop.INTERVAL_MINUTES} min):")
+    lines += [f"  {plan['marker']}", f"  {plan['entry']}"]
+    if plan["replaces"] and not plan["installed"]:
+        lines.append(f"replacing: {plan['replaces']}")
+    lines.append(f"servers idle longer than their timeout ({plan['idle_timeout']} by default) are "
+                 f"{'paused (snapshot kept)' if plan['idle_action'] == 'pause' else 'DELETED'}; output goes to {plan['log']}")
+    lines += [f"warning: {w}" for w in plan["warnings"]]
+    if not plan["installed"] and not plan["already_enabled"]:
+        lines.append("nothing changed; run `devbox autostop enable --yes` to test-run the command and install it")
+    emit(ctx.args, plan, "\n".join(lines))
+    return 0
+
+
+def cmd_autostop_disable(ctx: Context) -> int:
+    result = autostop.disable(ctx.cfg, ctx.args.yes)
+    if result["entry"] is None:
+        text = f"autostop is not enabled for {result['config_dir']}"
+    elif result["removed"]:
+        text = f"removed the autostop cron entry for {result['config_dir']}; idle servers are no longer paused automatically"
+    else:
+        text = f"would remove:\n  {result['entry']}\nnothing changed; run `devbox autostop disable --yes`"
+    if result["manual_schedule"]:
+        text += "\nnote: another idle-check schedule (not managed by autostop) is still installed"
+    emit(ctx.args, result, text)
+    return 0
+
+
+def cmd_autostop_status(ctx: Context) -> int:
+    now = datetime.now(timezone.utc)
+    crontab = autostop.read_crontab()
+    config_dir, state_dir = autostop.homes()
+    hetzner_error = None
+    try:
+        ctx.reconcile()
+    except DevboxError as e:
+        hetzner_error = str(e)
+    enforcement = autostop.enforcement(ctx.cfg, now)
+    creds = autostop.credentials(ctx.cfg)
+    covered = autostop.coverage(crontab)
+    mine = next((c for c in covered if c["this_config"]), None)
+    runs = autostop.read_json(Path(state_dir) / autostop.RUNS_FILE)
+
+    servers = []
+    for server in db.active_servers(ctx.conn):
+        info = idle_info(ctx, server, now)
+        entry = {"project": server["project"], "server": server["hetzner_id"], **info,
+                 "eligible_at": None, "first_check": None}
+        if info["remaining_seconds"] is not None:
+            eligible = now + timedelta(seconds=info["remaining_seconds"])
+            entry["eligible_at"] = eligible.isoformat(timespec="seconds")
+            if enforcement["status"] == admin.OK:
+                entry["first_check"] = autostop.next_check(max(now, eligible)).isoformat(timespec="seconds")
+        servers.append(entry)
+
+    covered_ids = {c["controller"] for c in covered if c["controller"]}
+    uncovered: dict[str, list[str]] = {}
+    for s in ctx.foreign_servers:
+        if s["controller"] not in covered_ids:
+            uncovered.setdefault(s["controller"], []).append(s["name"])
+    uncovered_list = [{"controller": c, "servers": names} for c, names in sorted(uncovered.items())]
+
+    data = {
+        "healthy": enforcement["status"] == admin.OK and creds["status"] != admin.FAIL,
+        "enforcement": enforcement, "credentials": creds,
+        "config_dir": config_dir, "state_dir": state_dir, "controller": ctx.hcloud.controller_id,
+        "entry": mine, "interval_minutes": autostop.INTERVAL_MINUTES,
+        "idle_timeout": ctx.cfg.idle_timeout, "idle_action": ctx.cfg.idle_action,
+        "runs": runs, "servers": servers, "coverage": covered,
+        "uncovered_controllers": uncovered_list, "hetzner_error": hetzner_error,
+    }
+
+    def local(ts: str) -> str:
+        return datetime.fromisoformat(ts).astimezone().strftime("%Y-%m-%d %H:%M")
+
+    lines = [f"[{STATUS_MARK[enforcement['status']]}] idle shutdown: {enforcement['detail']}"]
+    if enforcement["status"] != admin.OK and enforcement["fix"]:
+        lines.append(f"       fix: {enforcement['fix']}")
+    lines.append(f"[{STATUS_MARK[creds['status']]}] credentials: {creds['detail']}")
+    lines.append(f"config {config_dir}, state {state_dir}, controller {ctx.hcloud.controller_id}")
+    lines.append(f"default timeout {ctx.cfg.idle_timeout}, then {ctx.cfg.idle_action}; per-project timeouts apply")
+    if runs:
+        parts = [f"last {k.removeprefix('last_')} {local(runs[k])}"
+                 for k in ("last_run", "last_success", "last_failure") if runs.get(k)]
+        lines.append("runs: " + ", ".join(parts))
+    for s in servers:
+        if s["eligible_at"] is None:
+            lines.append(f"{s['project']}: idle {costs.duration(s['idle_seconds'])}, idle shutdown off")
+            continue
+        when = f"first check {local(s['first_check'])}" if s["first_check"] else "but nothing will act on it"
+        lines.append(f"{s['project']}: idle {costs.duration(s['idle_seconds'])} of {s['idle_timeout']}, "
+                     f"eligible {local(s['eligible_at'])}, {when}")
+    if servers:
+        lines.append("  a running foreground exec or --keep-alive job postpones the action until it ends")
+    if covered:
+        lines.append("cron entries on this machine:")
+        for c in covered:
+            this = " (this config)" if c["this_config"] else ""
+            lines.append(f"  {c['config_dir']}: controller {c['controller'] or 'unknown'}{this}")
+    for u in uncovered_list:
+        lines.append(f"warning: controller {u['controller'] or '?'} has server(s) in this Hetzner project that no "
+                     f"autostop entry on this machine covers: {', '.join(u['servers'])}")
+    if hetzner_error:
+        lines.append(f"note: Hetzner not checked ({hetzner_error}); servers and other controllers may be out of date")
+    emit(ctx.args, data, "\n".join(lines))
+    return 0 if data["healthy"] else 1
 
 
 def cmd_touch(ctx: Context) -> int:
@@ -1100,7 +1239,7 @@ def cmd_status(ctx: Context) -> int:
 
     idle_enforcement = None
     if any(e["server"] and e["idle"]["remaining_seconds"] is not None for e in result):
-        idle_enforcement, warning = idle_scheduler_warning()
+        idle_enforcement, warning = idle_scheduler_warning(ctx)
         if warning:
             lines.append(f"warning: {warning}")
     scope = f" for {ctx.args.name}" if ctx.args.name else ""
@@ -1821,6 +1960,17 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
 
     p = add("idle-check", cmd_idle_check, "pause or delete servers idle past their timeout (run from cron)")
     p.add_argument("--dry-run", action="store_true", help="only report what would happen")
+
+    auto = sub.add_parser("autostop", help="schedule idle-check with cron and check that it runs", parents=[common])
+    auto_sub = auto.add_subparsers(dest="autostop_command", required=True)
+    p = auto_sub.add_parser("enable", help="show, then with --yes test and install, the cron entry", parents=[common])
+    p.add_argument("--yes", action="store_true", help="test-run the scheduled command and install it")
+    p.set_defaults(func=cmd_autostop_enable)
+    p = auto_sub.add_parser("status", help="schedule health, coverage and when servers will be checked", parents=[common])
+    p.set_defaults(func=cmd_autostop_status)
+    p = auto_sub.add_parser("disable", help="show, then with --yes remove, this config's cron entry", parents=[common])
+    p.add_argument("--yes", action="store_true", help="really remove the cron entry")
+    p.set_defaults(func=cmd_autostop_disable)
 
     snap = sub.add_parser("snapshot", help="manage snapshots", parents=[common])
     snap_sub = snap.add_subparsers(dest="snapshot_command", required=True)
