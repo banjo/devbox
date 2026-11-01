@@ -65,7 +65,10 @@ class Context:
         return self.cfg.state_dir / "manifests" / f"{project}.json"
 
     def remote(self, server) -> Remote:
-        return Remote(server["ip"], self.cfg.ssh_key, self.known_hosts(server))
+        known_hosts = self.known_hosts(server)
+        if server["host_key"]:
+            known_hosts.write_text(f"{server['ip']} {server['host_key']}\n")
+        return Remote(server["ip"], self.cfg.ssh_key, known_hosts, pinned=bool(server["host_key"]))
 
     def running_server(self, project: str):
         db.require_project(self.conn, project)
@@ -137,9 +140,23 @@ class Context:
                     db.update_snapshot(self.conn, snap["id"], price_per_gb_month=price)
 
     def event(self, server, kind: str) -> None:
+        reused = kind in CANCELS_STOP and self.reuses_paid_hour(server)
         db.add_event(self.conn, server["project"], server["id"], kind)
-        if kind in CANCELS_STOP:
-            db.cancel_stop(self.conn, server["id"])
+        if kind in CANCELS_STOP and db.cancel_stop(self.conn, server["id"]):
+            reused = True
+        if reused:
+            db.add_event(self.conn, server["project"], server["id"], "reuse")
+
+    def reuses_paid_hour(self, server) -> bool:
+        """Is this use of an `hour-end` server one that, without hour-end, would have
+        needed a new server: used before, then idle for at least min_idle?"""
+        project = db.get_project(self.conn, server["project"])
+        if project is None or project_idle_timeout(self, project)[1] != config.HOUR_END:
+            return False
+        if not db.has_events(self.conn, server["id"], CANCELS_STOP):
+            return False
+        idle = datetime.now(timezone.utc) - db.last_activity(self.conn, server)
+        return idle >= config.parse_duration(self.cfg.min_idle)
 
     def check_interval(self) -> int:
         """Minutes between scheduled idle-checks for this config."""
@@ -285,11 +302,34 @@ def cmd_project_remove(ctx: Context) -> int:
     db.remove_project(ctx.conn, ctx.args.name)
     envsecrets.SecretStore(config.config_dir(), ctx.args.name).delete_all()
     previews.forget_credentials(ctx.cfg.state_dir, ctx.args.name)
-    emit(ctx.args, {"name": ctx.args.name, "removed": True}, f"removed {ctx.args.name}")
+    text = f"removed {ctx.args.name}"
+    if ctx.cfg.preview_domain:
+        text += "; `devbox cleanup` lists its Cloudflare preview tunnel and DNS records, if it had any"
+    emit(ctx.args, {"name": ctx.args.name, "removed": True}, text)
     return 0
 
 
 # Servers
+
+
+def generate_host_key() -> tuple[str, str]:
+    """A fresh ed25519 host key for a new server: (private key, public key without comment)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "host"
+        proc = subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "devbox-host", "-f", str(path)],
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise DevboxError(f"ssh-keygen failed: {proc.stderr.strip()}")
+        public = " ".join(path.with_suffix(".pub").read_text().split()[:2])
+        return path.read_text(), public
+
+
+def with_host_key(user_data: str, private: str, public: str) -> str:
+    """cloud-init installs this host key (on fresh and restored servers), so devbox
+    knows it before the first connection instead of trusting whatever answers."""
+    indented = "".join(f"    {line}\n" for line in private.strip().splitlines())
+    return (user_data.rstrip("\n") + "\n\nssh_deletekeys: true\nssh_keys:\n  ed25519_private: |\n"
+            + indented + f"  ed25519_public: {public}\n")
 
 
 def ensure_local_ssh_key(key: Path) -> str:
@@ -524,7 +564,8 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
         source = f" from snapshot {snapshot['hetzner_image_id']}" if snapshot else ""
         hc.stage = "create"
         progress.step("create", f"Creating server: {describe_offer(offer)}{source}")
-        user_data = resources.files("devbox").joinpath("cloud-init.yaml").read_text()
+        host_private, host_key = generate_host_key()
+        user_data = with_host_key(resources.files("devbox").joinpath("cloud-init.yaml").read_text(), host_private, host_key)
         with tempfile.NamedTemporaryFile("w", suffix=".yaml") as f:
             f.write(user_data)
             f.flush()
@@ -544,6 +585,7 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
             price_hourly=offer["price_hourly"], price_monthly=offer["price_monthly"],
             snapshot_id=snapshot["id"] if snapshot else None,
         )
+        db.update_server(ctx.conn, server_id, host_key=host_key)
         state.update(server_id=server_id, created=True, snapshot=snapshot)
         server = db.get_server(ctx.conn, server_id)
         created = True
@@ -783,7 +825,7 @@ ACTIVITY_LABELS = [
     ("sync", "sync"), ("exec", "exec"), ("exec_detach", "background start"),
     ("expose", "expose"), ("up", "up"), ("touch", "touch"), ("pull", "pull"),
     ("forward", "port forward"), ("db_dump", "database dump"), ("db_restore", "database restore"),
-    ("ps", "ps"), ("logs", "logs"), ("stop", "stop"), ("ssh", "ssh"),
+    ("ps", "ps"), ("logs", "logs"), ("stop", "stop"), ("ssh", "ssh"), ("reuse", "reuse of a paid hour"),
 ]
 
 
@@ -1429,6 +1471,8 @@ def cmd_costs(ctx: Context) -> int:
         raise DevboxError(f"unknown project '{a.project}'")
 
     summary = costs.summarize(ctx.cost_items(a.project), since, until, a.by, now)
+    reuses = db.reuses(ctx.conn, a.project, since, until)
+    summary["reuse"] = {"count": len(reuses), "saved": sum(r["price_hourly"] or 0 for r in reuses)}
     period = " to ".join(
         x for x in (
             since.date().isoformat() if since else "start",
@@ -1451,6 +1495,13 @@ def cmd_costs(ctx: Context) -> int:
     )
     if summary["unknown_price"]:
         lines.append(f"* {summary['unknown_price']} item(s) without a known price are not counted")
+    if reuses:
+        n = len(reuses)
+        lines.append(
+            f"reused a paid hour {n} time{'s' if n != 1 else ''} instead of starting a new server "
+            f"(hour-end, --at-hour-end): ~{costs.money(summary['reuse']['saved'])} saved, counting one billed "
+            f"hour each; restore time not included"
+        )
     lines.append(
         "Estimates incl. VAT: servers per started hour and snapshots per GB, both capped per calendar month, "
         "with each month's cost spread over the time running in it. IPv4 and traffic not included."

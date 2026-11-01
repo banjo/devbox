@@ -14,8 +14,8 @@
   CNAME per preview: `<project>.example.com` for the default preview, `<project>-<name>.example.com`
   for named ones. It never replaces a DNS record it didn't create. Cloudflare's free certificate
   covers one level of subdomain, so use the zone itself as `preview_domain`. `--quick` gives a
-  random URL anyway. The tunnel and DNS records stay when the server goes; delete them in the
-  Cloudflare dashboard if you drop the project.
+  random URL anyway. The tunnel and DNS records stay when the server goes; after `project remove`,
+  `devbox cleanup` deletes them.
 - `--protect` asks for a password (HTTP basic auth, user `devbox`): a Caddy proxy in Docker sits
   between the tunnel and the app. The password is per project, kept in `preview-auth/<project>.json`
   in the state folder and printed by `expose`. For sign-in with Cloudflare Access instead, add an

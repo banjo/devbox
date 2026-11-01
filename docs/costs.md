@@ -58,6 +58,11 @@ just before the next hour starts and reuse it for the next job.
   without the stop.
 - Both need a working schedule (`devbox autostop enable`); `--at-hour-end` warns when nothing would
   carry it out.
+- `devbox costs` shows how often a paid hour was reused instead of starting a new server, and an
+  estimate of what that saved (one billed hour at the server's price each; restore time not counted;
+  `reuse` in `--json`). A reuse is using a server again (`up`, `exec`, `sync`, `touch`, ...) that
+  cancels a `--at-hour-end` stop, or that comes after an `hour-end` server was idle for at least
+  `min_idle`. Looking at it (`ps`, `logs`) doesn't count.
 
 ## Other ways to spend less
 

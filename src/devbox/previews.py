@@ -128,9 +128,9 @@ class Cloudflare:
         return payload.get("result")
 
     def zone(self, hostname: str) -> dict:
-        """The zone a hostname belongs to (the longest matching parent domain)."""
+        """The zone a hostname belongs to (itself or the longest matching parent domain)."""
         labels = hostname.split(".")
-        for i in range(1, len(labels) - 1):
+        for i in range(0, len(labels) - 1):
             name = ".".join(labels[i:])
             found = self._request("GET", "/zones", query={"name": name})
             if found:
@@ -144,6 +144,36 @@ class Cloudflare:
         created = self._request("POST", f"/accounts/{account}/cfd_tunnel",
                                 {"name": name, "config_src": "cloudflare"})
         return created["id"]
+
+    def tunnels(self, account: str, prefix: str) -> list[dict]:
+        """Live tunnels whose name starts with `prefix`."""
+        found, page = [], 1
+        while True:
+            batch = self._request("GET", f"/accounts/{account}/cfd_tunnel", query={
+                "is_deleted": "false", "include_prefix": prefix, "per_page": 100, "page": page,
+            }) or []
+            found += [t for t in batch if t.get("name", "").startswith(prefix)]
+            if len(batch) < 100:
+                return found
+            page += 1
+
+    def delete_tunnel(self, account: str, tunnel_id: str) -> None:
+        # Connected replicas would block the delete; drop them first.
+        self._request("DELETE", f"/accounts/{account}/cfd_tunnel/{tunnel_id}/connections")
+        self._request("DELETE", f"/accounts/{account}/cfd_tunnel/{tunnel_id}")
+
+    def tunnel_records(self, zone: str, tunnel_id: str) -> list[dict]:
+        """DNS records in the zone that point at the tunnel."""
+        target = tunnel_id + TUNNEL_TARGET
+        records = self._request("GET", f"/zones/{zone}/dns_records",
+                                query={"type": "CNAME", "content": target, "per_page": 100}) or []
+        return [r for r in records if r.get("content") == target]
+
+    def delete_record(self, zone: str, record_id: str) -> None:
+        self._request("DELETE", f"/zones/{zone}/dns_records/{record_id}")
+
+    def verify_token(self) -> str:
+        return (self._request("GET", "/user/tokens/verify") or {}).get("status", "unknown")
 
     def tunnel_token(self, account: str, tunnel_id: str) -> str:
         return self._request("GET", f"/accounts/{account}/cfd_tunnel/{tunnel_id}/token")

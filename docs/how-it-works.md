@@ -16,6 +16,12 @@
   cheapest comparable alternatives, same region first. Availability is Hetzner's indicator, not a
   guarantee.
 - One server at a time. `up --force` allows a second one.
+- SSH host keys are pinned. For every new server (fresh or restored from a snapshot) devbox
+  generates an ed25519 host key locally and hands it to cloud-init, so it knows the server's key
+  before the first connection and only ever accepts that one (`StrictHostKeyChecking=yes`). Until
+  cloud-init has installed it, `up` keeps waiting rather than trust another key. The private host
+  key passes through Hetzner's user data. Servers created by older versions keep trust-on-first-use
+  until they are replaced.
 - Servers run Ubuntu with Docker + Compose, `mise`, `cloudflared`, `git` and build tools. Everything
   runs as root in `/srv/app`.
 - Sync sends exactly the files Git sees in the working tree: tracked files plus untracked files that

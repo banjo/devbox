@@ -110,6 +110,9 @@ MIGRATIONS = [
       SELECT id, 'default', preview_port, 'quick', preview_url, 'tunnel', created_at FROM servers
       WHERE preview_url IS NOT NULL AND preview_port IS NOT NULL AND status != 'deleted';
     """,
+    """
+    ALTER TABLE servers ADD COLUMN host_key TEXT;
+    """,
 ]
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
@@ -410,6 +413,27 @@ def add_event(conn: sqlite3.Connection, project: str, server_id: int | None, kin
     )
 
 
+def has_events(conn: sqlite3.Connection, server_id: int, kinds) -> bool:
+    kinds = sorted(kinds)
+    return conn.execute(
+        f"SELECT 1 FROM events WHERE server_id = ? AND kind IN ({', '.join('?' * len(kinds))}) LIMIT 1",
+        (server_id, *kinds),
+    ).fetchone() is not None
+
+
+def reuses(conn: sqlite3.Connection, project: str | None, since: datetime | None,
+           until: datetime | None) -> list[sqlite3.Row]:
+    """`reuse` events (a paid hour used instead of a new server), with the server's hourly price."""
+    sql = ("SELECT e.project, e.at, s.price_hourly FROM events e JOIN servers s ON s.id = e.server_id "
+           "WHERE e.kind = 'reuse'")
+    args: list = []
+    if project:
+        sql += " AND e.project = ?"
+        args.append(project)
+    rows = conn.execute(sql, args).fetchall()
+    return [r for r in rows if (since is None or _parse(r["at"]) >= since) and (until is None or _parse(r["at"]) < until)]
+
+
 def event_counts(conn: sqlite3.Connection, server_id: int) -> dict[str, int]:
     rows = conn.execute(
         "SELECT kind, COUNT(*) AS n FROM events WHERE server_id = ? GROUP BY kind", (server_id,)
@@ -420,7 +444,7 @@ def event_counts(conn: sqlite3.Connection, server_id: int) -> dict[str, int]:
 _SERVER_FIELDS = {
     "ip", "server_type", "location", "status", "preview_port", "preview_url",
     "price_hourly", "price_monthly", "power", "setup_stage", "setup_error", "diagnostics",
-    "stop_action", "stop_requested_at", "created_at",
+    "stop_action", "stop_requested_at", "created_at", "host_key",
 }
 
 

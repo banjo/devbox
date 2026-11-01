@@ -36,6 +36,8 @@ def doctor(ctx, resolve_ssh_allow) -> list[dict]:
         add(check("local tools", FAIL, f"missing: {', '.join(missing)}", "install them with your package manager"))
     else:
         add(check("local tools", OK, "ssh, ssh-keygen, rsync and git found"))
+    if cfg.preview_domain:
+        add(cloudflare_check(cfg))
 
     if shutil.which("hcloud") is None:
         add(check("hcloud", FAIL, "hcloud CLI not found", "install it from https://github.com/hetznercloud/cli"))
@@ -118,7 +120,7 @@ def doctor(ctx, resolve_ssh_allow) -> list[dict]:
     else:
         cloud = [c for c in plan if c["kind"] != "local file"]
         if cloud:
-            add(check("leftovers", WARN, f"{len(cloud)} unused devbox resource(s) in Hetzner",
+            add(check("leftovers", WARN, f"{len(cloud)} unused devbox resource(s) in Hetzner or Cloudflare",
                       "see `devbox cleanup`"))
         else:
             add(check("leftovers", OK, "no unused devbox resources"))
@@ -129,6 +131,29 @@ def doctor(ctx, resolve_ssh_allow) -> list[dict]:
     budget = cfg.monthly_budget
     add(check("budget", OK, f"{costs.money(budget)} per month ({cfg.budget_action})" if budget else "no monthly budget set"))
     return checks
+
+
+def cloudflare_check(cfg) -> dict:
+    """Can stable previews be set up: token, zone, and access to Cloudflare Tunnel?"""
+    from devbox import previews
+
+    fix = ("create a token with Account > Cloudflare Tunnel > Edit and Zone > DNS > Edit for the zone, "
+           "and put it in cloudflare_token_file")
+    try:
+        cf = previews.Cloudflare(cfg.cloudflare_token())
+        status = cf.verify_token()
+        if status != "active":
+            return check("cloudflare", FAIL, f"the Cloudflare token is {status}", fix)
+        zone = cf.zone(cfg.preview_domain)
+        cf.tunnels(zone["account"], previews.tunnel_name(cfg.get_controller_id(), ""))
+    except DevboxError as e:
+        return check("cloudflare", FAIL, str(e), fix)
+    detail = f"token active, zone {zone['name']}, tunnels readable"
+    if cfg.preview_domain != zone["name"]:
+        return check("cloudflare", WARN, f"{detail}; previews like x.{cfg.preview_domain} are more than one level "
+                     f"below {zone['name']}, which Cloudflare's free certificate doesn't cover",
+                     f"set preview_domain = \"{zone['name']}\" or order an Advanced Certificate")
+    return check("cloudflare", OK, detail + " (DNS edit rights are only tested by the first `expose`)")
 
 
 def registry_checks(ctx) -> list[dict]:
@@ -258,6 +283,7 @@ def cleanup_plan(ctx, notes: list[str] | None = None) -> list[dict]:
                 plan.append({"kind": "local file", "id": str(f), "name": f.name,
                              "reason": "SSH host keys of a server that no longer exists"})
     projects = {p["name"] for p in db.list_projects(ctx.conn)}
+    plan += cloudflare_leftovers(ctx, projects, notes)
     manifests = ctx.cfg.state_dir / "manifests"
     if manifests.is_dir():
         for f in sorted(manifests.glob("*.json")):
@@ -265,6 +291,32 @@ def cleanup_plan(ctx, notes: list[str] | None = None) -> list[dict]:
                 plan.append({"kind": "local file", "id": str(f), "name": f.name,
                              "reason": "sync manifest of a removed project"})
     return plan
+
+
+def cloudflare_leftovers(ctx, projects: set[str], notes: list[str]) -> list[dict]:
+    """Preview tunnels (and their DNS records) of projects that were removed."""
+    from devbox import previews
+
+    if not ctx.cfg.preview_domain:
+        return []
+    try:
+        cf = previews.Cloudflare(ctx.cfg.cloudflare_token())
+        zone = cf.zone(ctx.cfg.preview_domain)
+        prefix = previews.tunnel_name(ctx.cfg.get_controller_id(), "")
+        plan = []
+        for t in cf.tunnels(zone["account"], prefix):
+            project = t["name"][len(prefix):]
+            if project in projects:
+                continue
+            for r in cf.tunnel_records(zone["id"], t["id"]):
+                plan.append({"kind": "dns record", "id": r["id"], "name": r["name"], "zone": zone["id"],
+                             "reason": f"preview hostname of removed project {project}"})
+            plan.append({"kind": "cloudflare tunnel", "id": t["id"], "name": t["name"], "account": zone["account"],
+                         "reason": f"preview tunnel of removed project {project}"})
+        return plan
+    except DevboxError as e:
+        notes.append(f"Cloudflare preview tunnels not checked: {e}")
+        return []
 
 
 def run_cleanup(ctx, plan: list[dict]) -> list[dict]:
@@ -281,10 +333,20 @@ def run_cleanup(ctx, plan: list[dict]) -> list[dict]:
                 ctx.hcloud.delete_ssh_key(item["id"])
             elif item["kind"] == "local file":
                 Path(item["id"]).unlink(missing_ok=True)
+            elif item["kind"] == "dns record":
+                cloudflare(ctx).delete_record(item["zone"], item["id"])
+            elif item["kind"] == "cloudflare tunnel":
+                cloudflare(ctx).delete_tunnel(item["account"], item["id"])
             results.append({**item, "deleted": True})
         except DevboxError as e:
             results.append({**item, "deleted": False, "error": str(e)})
     return results
+
+
+def cloudflare(ctx):
+    from devbox import previews
+
+    return previews.Cloudflare(ctx.cfg.cloudflare_token())
 
 
 # History

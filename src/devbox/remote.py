@@ -24,6 +24,8 @@ TUNNEL = "tunnel"
 PULL_PRUNE = (".git", "node_modules", ".venv", "venv", "__pycache__", ".cache", ".next", ".turbo")
 PROC_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
 TUNNEL_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+HOST_KEY_MISMATCH_RE = re.compile(r"Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED|"
+                                  r"no matching host key type")
 TUNNEL_REGISTERED_RE = re.compile(r"Registered tunnel connection")
 # devbox's own files on the server, outside the project folder.
 DEVBOX_DIR = "/root/.devbox"
@@ -141,19 +143,22 @@ def read_manifest(path: Path) -> set[str]:
 
 
 class Remote:
-    def __init__(self, ip: str, key: Path, known_hosts: Path):
+    def __init__(self, ip: str, key: Path, known_hosts: Path, pinned: bool = False):
         if not ip:
             raise DevboxError("server has no IPv4 address")
         self.ip = ip
         self.key = key
         self.known_hosts = known_hosts
+        # Pinned: known_hosts holds the host key devbox gave the server, and nothing else is trusted.
+        self.pinned = pinned
 
     def ssh_opts(self, connect_timeout: int = 10) -> list[str]:
         return [
             "-i", str(self.key),
             "-o", "IdentitiesOnly=yes",
             "-o", "BatchMode=yes",
-            "-o", "StrictHostKeyChecking=accept-new",
+            *(("-o", "StrictHostKeyChecking=yes", "-o", "HostKeyAlgorithms=ssh-ed25519") if self.pinned
+              else ("-o", "StrictHostKeyChecking=accept-new")),
             "-o", f"UserKnownHostsFile={self.known_hosts}",
             "-o", f"ConnectTimeout={connect_timeout}",
             "-o", "ServerAliveInterval=30",
@@ -302,6 +307,13 @@ class Remote:
                 if proc.returncode == 0:
                     progress.say("SSH connected")
                     return
+                if self.pinned and HOST_KEY_MISMATCH_RE.search(proc.stderr or ""):
+                    # Before cloud-init installs devbox's host key, sshd may still use the
+                    # image's or snapshot's key. Never accept it; wait for the right one.
+                    progress.waiting(f"Waiting for SSH on {self.ip}; the server doesn't present devbox's host key yet")
+                    sleep(max(0.0, min(5.0, deadline.remaining())))
+                    deadline.check("ssh")
+                    continue
             except subprocess.TimeoutExpired:
                 pass
             progress.waiting(f"Waiting for SSH on {self.ip}; not reachable yet")

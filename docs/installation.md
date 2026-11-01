@@ -40,8 +40,8 @@ On the machine where the agent runs:
    ```
 
 6. Check it works: `devbox doctor` checks the config, local tools, `hcloud`, the token, the SSH key
-   and firewall, leftover resources and whether `idle-check` is scheduled, and says how to fix
-   what's wrong.
+   and firewall, leftover resources, whether `idle-check` is scheduled and, with `preview_domain`,
+   the Cloudflare token, and says how to fix what's wrong.
 
 The first `devbox up` creates an SSH key at `~/.ssh/devbox` (if missing), uploads it to Hetzner, and
 creates a firewall that allows SSH only from this machine's public IP. Both are named
