@@ -2070,13 +2070,21 @@ def previews_of_unit(ctx: Context, server, unit: str) -> list:
 
 
 class NamedTunnel:
-    """The project's Cloudflare tunnel and the zone of its hostnames."""
+    """The project's Cloudflare tunnel and the zone of its hostnames. With `create=False` the tunnel is
+    only looked up (`id` is None if it doesn't exist) until `ensure()` is called."""
 
-    def __init__(self, ctx: Context, project: str, hostname: str):
+    def __init__(self, ctx: Context, project: str, hostname: str, create: bool = True):
         self.cf = previews.Cloudflare(ctx.cfg.cloudflare_token())
         self.zone = self.cf.zone(hostname)
         self.account = self.zone["account"]
-        self.id = self.cf.ensure_tunnel(self.account, previews.tunnel_name(ctx.cfg.get_controller_id(), project))
+        self.name = previews.tunnel_name(ctx.cfg.get_controller_id(), project)
+        self.id = self.cf.ensure_tunnel(self.account, self.name) if create else \
+            self.cf.find_tunnel(self.account, self.name)
+
+    def ensure(self) -> str:
+        if self.id is None:
+            self.id = self.cf.ensure_tunnel(self.account, self.name)
+        return self.id
 
     def update(self, rows) -> None:
         self.cf.set_ingress(self.account, self.id, previews.ingress(rows))
@@ -2136,6 +2144,13 @@ def cmd_expose(ctx: Context) -> int:
             )
         health = {"path": path, "status": int(code)}
 
+    tunnel = None
+    if domain:
+        # Refuse a hostname with someone else's DNS record before creating anything for it.
+        host = previews.hostname(name, preview, domain)
+        tunnel = NamedTunnel(ctx, name, host, create=False)
+        tunnel.cf.check_hostname(tunnel.zone["id"], host, tunnel.id)
+
     old = next((r for r in db.previews(ctx.conn, server["id"]) if r["name"] == preview), None)
     auth = None
     proxy_port = None
@@ -2148,13 +2163,11 @@ def cmd_expose(ctx: Context) -> int:
 
     warnings = []
     fields = {"port": port, "protected": int(bool(auth)), "proxy_port": proxy_port}
-    if domain:
-        host = previews.hostname(name, preview, domain)
-        tunnel = NamedTunnel(ctx, name, host)
+    if tunnel:
         if host.count(".") - tunnel.zone["name"].count(".") > 1:
             warnings.append(f"{host} is more than one level below {tunnel.zone['name']}; Cloudflare's free "
                             f"certificate doesn't cover it, so HTTPS fails without an Advanced Certificate")
-        tunnel.cf.route_dns(tunnel.zone["id"], host, tunnel.id)
+        tunnel.cf.route_dns(tunnel.zone["id"], host, tunnel.ensure())
         if old and old["kind"] == "quick":
             remote.stop_unit(old["unit"])
         others = [dict(r) for r in db.previews(ctx.conn, server["id"]) if r["name"] != preview]

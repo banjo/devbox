@@ -137,10 +137,14 @@ class Cloudflare:
                 return {"id": found[0]["id"], "name": name, "account": found[0]["account"]["id"]}
         raise DevboxError(f"no Cloudflare zone for {hostname} that this token can see")
 
-    def ensure_tunnel(self, account: str, name: str) -> str:
+    def find_tunnel(self, account: str, name: str) -> str | None:
         found = self._request("GET", f"/accounts/{account}/cfd_tunnel", query={"name": name, "is_deleted": "false"})
+        return found[0]["id"] if found else None
+
+    def ensure_tunnel(self, account: str, name: str) -> str:
+        found = self.find_tunnel(account, name)
         if found:
-            return found[0]["id"]
+            return found
         created = self._request("POST", f"/accounts/{account}/cfd_tunnel",
                                 {"name": name, "config_src": "cloudflare"})
         return created["id"]
@@ -182,17 +186,25 @@ class Cloudflare:
         self._request("PUT", f"/accounts/{account}/cfd_tunnel/{tunnel_id}/configurations",
                       {"config": {"ingress": rules}})
 
-    def route_dns(self, zone: str, hostname: str, tunnel_id: str) -> None:
-        """Point `hostname` at the tunnel. Never replaces a record that isn't ours."""
-        target = tunnel_id + TUNNEL_TARGET
+    def check_hostname(self, zone: str, hostname: str, tunnel_id: str | None) -> bool:
+        """Whether `hostname` already points at the tunnel. Raises if it has a record devbox didn't make
+        for this tunnel; a tunnel that doesn't exist yet (`tunnel_id` None) owns no records."""
+        target = tunnel_id + TUNNEL_TARGET if tunnel_id else None
         records = self._request("GET", f"/zones/{zone}/dns_records", query={"name": hostname})
         for r in records or []:
-            if r.get("type") == "CNAME" and r.get("content") == target:
-                return
+            if target and r.get("type") == "CNAME" and r.get("content") == target:
+                return True
             raise DevboxError(
                 f"{hostname} already has a DNS record ({r.get('type')} {r.get('content')}) that devbox "
                 f"didn't make for this project; remove it or use another preview name"
             )
+        return False
+
+    def route_dns(self, zone: str, hostname: str, tunnel_id: str) -> None:
+        """Point `hostname` at the tunnel. Never replaces a record that isn't ours."""
+        if self.check_hostname(zone, hostname, tunnel_id):
+            return
+        target = tunnel_id + TUNNEL_TARGET
         self._request("POST", f"/zones/{zone}/dns_records",
                       {"type": "CNAME", "name": hostname, "content": target, "proxied": True,
                        "comment": "devbox preview"})

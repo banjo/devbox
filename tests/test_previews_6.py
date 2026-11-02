@@ -269,6 +269,29 @@ def test_named_preview_never_replaces_someone_elses_dns_record(capsys, box, cf):
     assert box.units == {}
 
 
+def test_refused_hostname_creates_no_tunnel_or_proxy(capsys, box, cf):
+    # #32: the refusal used to come after the tunnel (and password proxy) were created.
+    cf.dns["crm.example.com"] = {"type": "CNAME", "content": "public.r2.dev"}
+    code, err = expose(capsys, "3000", "--protect")
+    assert code == 1 and "already has a DNS record (CNAME public.r2.dev)" in err
+    assert cf.tunnels == {} and box.units == {}
+    assert cf.dns["crm.example.com"] == {"type": "CNAME", "content": "public.r2.dev"}
+
+
+def test_existing_tunnel_reuses_its_own_record(capsys, box, cf):
+    cf.tunnels[tunnel_name()] = "tid-old"
+    cf.dns["crm.example.com"] = {"type": "CNAME", "content": "tid-old.cfargotunnel.com"}
+    code, data = expose(capsys, "3000")
+    assert code == 0 and data["url"] == "https://crm.example.com"
+    assert cf.tunnels == {tunnel_name(): "tid-old"} and "tid-old" in cf.ingress
+
+
+def test_record_of_a_deleted_tunnel_is_refused(capsys, box, cf):
+    cf.dns["crm.example.com"] = {"type": "CNAME", "content": "tid-gone.cfargotunnel.com"}
+    code, err = expose(capsys, "3000")
+    assert code == 1 and "tid-gone.cfargotunnel.com" in err and cf.tunnels == {}
+
+
 def test_quick_overrides_the_domain_and_switching_cleans_up(capsys, box, cf):
     code, named = expose(capsys, "3000")
     code, quick = expose(capsys, "3000", "--quick")
