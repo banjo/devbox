@@ -3,6 +3,7 @@
 These take the CLI `Context` and return plain data; formatting lives in cli.py.
 """
 
+import json
 import re
 import shutil
 import subprocess
@@ -374,6 +375,7 @@ def history(ctx, project: str | None, limit: int | None) -> dict:
             "billed_hours": usage["billed_hours"],
             "cost": usage["cost"],
             "restored_from_snapshot": restored["hetzner_image_id"] if restored else None,
+            "startup": json.loads(s["startup"]) if s["startup"] else None,
             "activity": db.event_counts(conn, s["id"]),
         })
     snaps = []

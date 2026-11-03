@@ -113,6 +113,9 @@ MIGRATIONS = [
     """
     ALTER TABLE servers ADD COLUMN host_key TEXT;
     """,
+    """
+    ALTER TABLE servers ADD COLUMN startup TEXT;
+    """,
 ]
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
@@ -444,7 +447,7 @@ def event_counts(conn: sqlite3.Connection, server_id: int) -> dict[str, int]:
 _SERVER_FIELDS = {
     "ip", "server_type", "location", "status", "preview_port", "preview_url",
     "price_hourly", "price_monthly", "power", "setup_stage", "setup_error", "diagnostics",
-    "stop_action", "stop_requested_at", "created_at", "host_key",
+    "stop_action", "stop_requested_at", "created_at", "host_key", "startup",
 }
 
 

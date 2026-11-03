@@ -53,13 +53,19 @@ Previews are described in [Previews](previews.md).
   extends it.
 - Progress is printed to stderr as `[mm:ss] ...` lines, including the last line of setup output
   while cloud-init runs (with secrets masked). With `--json`, stdout only has the final JSON.
+- When `up` creates, restores or powers on a server, it prints how long each stage took
+  (`startup: create 10s, ssh 21s, cloud-init 59s, ...`). `up --json` has the seconds per stage in
+  `stages`, and the server keeps them, so `history` shows "up in 1m32s" and `history --json` the
+  breakdown. Failures include `stages` too.
+- cloud-init installs its base packages only when they are missing, so a server restored from a
+  snapshot skips `apt-get update`.
 - If cloud-init reports an error or tools are missing, `up` fails right away instead of waiting.
 - On failure, `up` exits 1 (124 for a timeout, 130 for Ctrl-C) and prints the stage, how long it
   took, the server id and IP, that the server is kept and still billed, where the diagnostics file
   is (`~/.local/state/devbox/diagnostics/`: cloud-init status, the last 60 lines of setup output and
   failed units, secrets masked), and the commands to retry or delete. With `--json` the same
   information is in the error object (`code`, `stage`, `elapsed_seconds`, `limit_seconds`,
-  `server_id`, `server_retained`, `billable`, `diagnostics`, `cleanup`, ...).
+  `stages`, `server_id`, `server_retained`, `billable`, `diagnostics`, `cleanup`, ...).
 - The server is recorded as "setup failed at <stage>" (`status` shows it). Running `up` again
   continues setup on the same server; it never creates a second one.
 - `--cleanup-on-failure` deletes the server when startup fails, but only a fresh server created by

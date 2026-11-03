@@ -280,6 +280,7 @@ def cloud(monkeypatch):
     monkeypatch.setattr(cli.Remote, "wait_cloud_init", lambda self, deadline, progress, secrets=(): [])
     monkeypatch.setattr(cli.Remote, "verify_tools", lambda self, deadline, progress: None)
     monkeypatch.setattr(cli.Remote, "collect_diagnostics", lambda self, timeout=20: "cloud-init log\n")
+    monkeypatch.setattr(cli.Remote, "prepare_snapshot", lambda self, timeout=60: fake.calls.append(("prepare_snapshot", self.ip)))
     monkeypatch.setattr(
         cli.Remote, "sync",
         lambda self, path, manifest, timeout=None: {"mode": "git", "files": 1, "deleted": 0, "warning": None},

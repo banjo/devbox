@@ -1,7 +1,9 @@
 # Snapshots, pause and resume
 
-- `pause` (or `down --snapshot`) shuts the server down cleanly, saves its disk as a Hetzner
-  snapshot, then deletes the server. If the snapshot fails, the server is kept and powered on again.
+- `pause` (or `down --snapshot`) first cleans up what is safe to lose (apt cache, journal beyond
+  50 MB, dangling Docker images; stopped containers and the build cache stay) and discards free disk
+  blocks, so the snapshot is smaller and restores faster. If that fails, it snapshots as is. Then it
+  shuts the server down cleanly, saves its disk as a Hetzner snapshot and deletes the server. If the snapshot fails, the server is kept and powered on again.
   If the snapshot succeeds but deleting the server fails, the server stays shut down (and billed),
   `status` shows it as powered off, and running `pause` again finishes the job with the same
   snapshot; `up` powers it back on instead.

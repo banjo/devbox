@@ -625,6 +625,11 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
     deadline.check("secrets")
     secrets_written = push_secrets(ctx, server, name)
     progress.say("Ready")
+    stages = progress.stage_seconds()
+    if created or powered_on or server["status"] != "running":
+        kind = ("restore" if snapshot else "create") if created else ("power-on" if powered_on else "retry")
+        db.update_server(ctx.conn, server["id"], startup=json.dumps(
+            {"kind": kind, "seconds": round(deadline.elapsed(), 1), "stages": stages}))
     return {
         "project": project,
         "server": db.active_server(ctx.conn, name),
@@ -635,6 +640,7 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
         "warnings": warnings,
         "secrets_written": secrets_written,
         "cancelled_stop": cancelled_stop,
+        "stages": stages,
     }
 
 
@@ -655,6 +661,7 @@ def report_up(ctx: Context, r: dict, deadline: "startup.Deadline") -> int:
         "offer": offer,
         "warnings": r["warnings"],
         "startup_seconds": round(deadline.elapsed(), 1),
+        "stages": r["stages"],
         "cancelled_stop": r["cancelled_stop"],
     }
     verb = "powered on" if r["powered_on"] else "reusing"
@@ -667,6 +674,8 @@ def report_up(ctx: Context, r: dict, deadline: "startup.Deadline") -> int:
     ]
     if offer:
         text.append(f"  {offer['choice']}: {describe_offer(offer)}")
+    if r["created"] or r["powered_on"]:
+        text.append("  startup: " + stage_summary(r["stages"]))
     if r["created"] and snapshot:
         text.append(
             f"  from snapshot taken {snapshot['created_at'][:16].replace('T', ' ')}: installed tools, "
@@ -681,6 +690,11 @@ def report_up(ctx: Context, r: dict, deadline: "startup.Deadline") -> int:
         text.append(f"no notes for {name} yet; work out how to start it, then save them with `devbox project notes {name} --set ...`")
     emit(ctx.args, data, "\n".join(text))
     return 0
+
+
+def stage_summary(stages: dict) -> str:
+    """`create 10s, ssh 21s, cloud-init 59s`, skipping stages under half a second."""
+    return ", ".join(f"{s} {startup.duration_label(t)}" for s, t in stages.items() if t >= 0.5) or "under a second"
 
 
 def project_secret_values(name: str) -> list[str]:
@@ -706,6 +720,7 @@ def startup_failure(ctx: Context, exc, state: dict, deadline, progress, limit_la
         "stage": stage,
         "elapsed_seconds": round(deadline.elapsed(), 1),
         "limit_seconds": deadline.limit,
+        "stages": progress.stage_seconds(),
         "project": name,
         "server_id": server["hetzner_id"] if server else None,
         "ip": server["ip"] if server else None,
@@ -874,6 +889,12 @@ def prune_snapshots(ctx: Context, project: str) -> list[int]:
 def snapshot_server(ctx: Context, server):
     """Shut the server down and snapshot it. On failure, try to power it back on."""
     name = server["project"]
+    if server["power"] not in POWERED_DOWN:
+        print(f"cleaning up {name} before the snapshot...", file=sys.stderr)
+        try:
+            ctx.remote(server).prepare_snapshot()
+        except DevboxError as e:
+            print(f"warning: cleanup before the snapshot failed, snapshotting as is: {e}", file=sys.stderr)
     print(f"shutting down {name} for a snapshot...", file=sys.stderr)
     ctx.hcloud.shutdown(server["hetzner_id"])
     db.update_server(ctx.conn, server["id"], power="off")
@@ -1602,6 +1623,8 @@ def cmd_history(ctx: Context) -> int:
         notes = []
         if e["restored_from_snapshot"]:
             notes.append(f"from snapshot {e['restored_from_snapshot']}")
+        if e["startup"]:
+            notes.append(f"up in {startup.duration_label(e['startup']['seconds'])}")
         if e["status"] != "deleted":
             notes.append("running")
         elif counts.get("pause") or counts.get("idle_pause"):

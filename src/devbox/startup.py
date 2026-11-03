@@ -71,12 +71,25 @@ class Progress:
         self.stream = stream or sys.stderr
         self.quiet = quiet
         self.stage = "prepare"
+        self._stage_started = deadline.elapsed()
+        self.timings: dict[str, float] = {}
         self._last_wait_note = None
         self._last_wait_at = -1e9
 
     def step(self, stage: str, message: str) -> None:
+        self._close_stage()
         self.stage = stage
         self.say(message)
+
+    def _close_stage(self) -> None:
+        now = self.deadline.elapsed()
+        self.timings[self.stage] = self.timings.get(self.stage, 0.0) + now - self._stage_started
+        self._stage_started = now
+
+    def stage_seconds(self) -> dict[str, float]:
+        """Seconds spent in each stage so far, in the order of STAGES."""
+        self._close_stage()
+        return {s: round(self.timings[s], 1) for s in STAGES if s in self.timings}
 
     def say(self, message: str) -> None:
         if not self.quiet:

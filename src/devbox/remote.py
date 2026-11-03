@@ -59,6 +59,13 @@ DIAGNOSTICS = (
     "echo '== last setup output'; tail -n 60 /var/log/cloud-init-output.log 2>&1; "
     "echo '== failed units'; systemctl --failed --no-legend --plain 2>&1"
 )
+# Before a snapshot: drop what is safe to lose (apt cache, old journal, dangling Docker images; the build
+# cache and stopped containers stay) and discard free blocks, so the snapshot is smaller and restores faster.
+SNAPSHOT_CLEANUP = (
+    "apt-get clean; journalctl --vacuum-size=50M >/dev/null 2>&1; "
+    "if command -v docker >/dev/null; then docker image prune -f >/dev/null 2>&1; fi; "
+    "fstrim -a >/dev/null 2>&1; true"
+)
 
 
 def parse_cloud_init_poll(output: str) -> tuple[str | None, int | None, str | None]:
@@ -361,6 +368,9 @@ class Remote:
         """Recent setup output from the server, for failure reports. Bounded by `timeout`."""
         proc = self._ssh(DIAGNOSTICS, check=False, timeout=timeout)
         return proc.stdout + (proc.stderr or "")
+
+    def prepare_snapshot(self, timeout: float = 60) -> None:
+        self._ssh(SNAPSHOT_CLEANUP, timeout=timeout)
 
     def sync(self, local_path: str, manifest: Path, timeout: float | None = None) -> dict:
         """Copy the project to the server.
