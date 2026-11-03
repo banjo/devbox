@@ -318,13 +318,27 @@ class Hcloud:
 
     def ensure_firewall(self, ssh_cidrs: list[str]) -> int:
         name = self.resource_name
-        rules = json.dumps(firewall_rules(ssh_cidrs))
+        wanted = firewall_rules(ssh_cidrs)
+        rules = json.dumps(wanted)
         firewall = self._find_owned("firewall", name)
         if firewall:
-            self.run(
-                "firewall", "replace-rules", str(firewall["id"]), "--rules-file", "-",
-                input=rules, parse=False,
-            )
+            # Replacing rules also re-applies them to every attached server; right after `pause` that can
+            # include the server just deleted (#34). Skip it when nothing changes.
+            if same_rules(firewall.get("rules"), wanted):
+                return firewall["id"]
+            try:
+                self.run(
+                    "firewall", "replace-rules", str(firewall["id"]), "--rules-file", "-",
+                    input=rules, parse=False,
+                )
+            except DevboxError as e:
+                # Hetzner sets the rules first, then applies them per server. Only the apply to a
+                # deleted server failed if the rules are in place.
+                if "resource_no_longer_exists" not in str(e):
+                    raise
+                current = self.run("firewall", "describe", str(firewall["id"]), "-o", "json") or {}
+                if not same_rules(current.get("rules"), wanted):
+                    raise
             return firewall["id"]
         data = self.run(
             "firewall", "create",
@@ -357,6 +371,17 @@ def firewall_rules(ssh_cidrs: list[str]) -> list[dict]:
             "description": "ssh from devbox controller",
         }
     ]
+
+
+def same_rules(current: list[dict] | None, wanted: list[dict]) -> bool:
+    """Whether a firewall's rules (as hcloud lists them) are `wanted`, ignoring order and description."""
+    def key(rules):
+        return sorted(
+            (r.get("direction"), r.get("protocol"), r.get("port"), tuple(sorted(r.get("source_ips") or [])),
+             tuple(sorted(r.get("destination_ips") or [])))
+            for r in rules or []
+        )
+    return key(current) == key(wanted)
 
 
 def build_offers(server_types: list[dict], locations: list[dict]) -> list[dict]:

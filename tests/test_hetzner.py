@@ -34,6 +34,10 @@ with open({str(log)!r}, "a") as f:
     f.write(json.dumps({{"args": args, "stdin": stdin}}) + "\\n")
 key = "_".join(args[:2])
 resp = pathlib.Path({str(responses)!r}) / key
+err = resp.with_suffix(".err")
+if err.exists():
+    sys.stderr.write(err.read_text())
+    sys.exit(1)
 if resp.exists():
     print(resp.read_text())
 """
@@ -97,6 +101,49 @@ def test_firewall_created_then_replaced_by_id(fake_hcloud):
     respond("firewall_list", [{"id": 5, "name": "devbox-abc123", "labels": OWNED}])
     assert hc.ensure_firewall(["198.51.100.1/32"]) == 5
     assert calls()[-1]["args"][:3] == ["firewall", "replace-rules", "5"]
+
+
+def owned_firewall(cidrs):
+    rules = [dict(r, description=None, destination_ips=[]) for r in firewall_rules(cidrs)]
+    return {"id": 5, "name": "devbox-abc123", "labels": OWNED, "rules": rules}
+
+
+def test_firewall_with_the_same_rules_is_left_alone(fake_hcloud):
+    # #34: replace-rules re-applies to every attached server, including one `pause` just deleted.
+    hc, calls, respond = fake_hcloud
+    respond("firewall_list", [owned_firewall(["192.0.2.1/32"])])
+    assert hc.ensure_firewall(["192.0.2.1/32"]) == 5
+    assert [c["args"][:2] for c in calls()] == [["firewall", "list"]]
+
+
+APPLY_FAILED = (
+    "Waiting for set_firewall_rules (firewall: 5) ... done\n"
+    "Waiting for apply_firewall (firewall: 5, server: 174279311) ... failed\n"
+    "hcloud: the resource no longer exists (resource_no_longer_exists, 665548136605115)\n"
+)
+
+
+def test_firewall_apply_to_a_deleted_server_is_ignored_once_the_rules_are_set(fake_hcloud, tmp_path):
+    hc, calls, respond = fake_hcloud
+    respond("firewall_list", [owned_firewall(["192.0.2.1/32"])])
+    (tmp_path / "responses" / "firewall_replace-rules.err").write_text(APPLY_FAILED)
+    respond("firewall_describe", owned_firewall(["198.51.100.1/32"]))
+    assert hc.ensure_firewall(["198.51.100.1/32"]) == 5
+    assert [c["args"][:2] for c in calls()][-2:] == [["firewall", "replace-rules"], ["firewall", "describe"]]
+
+    # Rules not in place: the error stands.
+    respond("firewall_describe", owned_firewall(["192.0.2.1/32"]))
+    with pytest.raises(DevboxError, match="resource_no_longer_exists"):
+        hc.ensure_firewall(["198.51.100.1/32"])
+
+
+def test_other_firewall_errors_are_not_hidden(fake_hcloud, tmp_path):
+    hc, calls, respond = fake_hcloud
+    respond("firewall_list", [owned_firewall(["192.0.2.1/32"])])
+    (tmp_path / "responses" / "firewall_replace-rules.err").write_text("hcloud: rate limit exceeded")
+    with pytest.raises(DevboxError, match="rate limit"):
+        hc.ensure_firewall(["198.51.100.1/32"])
+    assert ["firewall", "describe"] not in [c["args"][:2] for c in calls()]
 
 
 @pytest.mark.parametrize("labels", [
