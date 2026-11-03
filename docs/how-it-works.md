@@ -22,10 +22,8 @@
   cloud-init has installed it, `up` keeps waiting rather than trust another key. The private host
   key passes through Hetzner's user data. Servers created by older versions keep trust-on-first-use
   until they are replaced.
-- Servers run Ubuntu 24.04 with Docker + Compose, `mise`, `cloudflared`, `git` and build tools.
-  Everything runs as root in `/srv/app`. New servers start from Hetzner's `docker-ce` app image
-  (Ubuntu 24.04 with Docker and Compose preinstalled), so cloud-init doesn't install Docker; set
-  `image = "ubuntu-24.04"` in the config to use the plain image (cloud-init installs Docker then).
+- Servers run Ubuntu with Docker + Compose, `mise`, `cloudflared`, `git` and build tools. Everything
+  runs as root in `/srv/app`.
 - Sync sends exactly the files Git sees in the working tree: tracked files plus untracked files that
   are not ignored, using Git's own ignore rules (so `!.env.example` style exceptions work). Ignored
   files on the server, such as `node_modules` and `.env`, are left alone. A file that was synced

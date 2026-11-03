@@ -400,7 +400,7 @@ def test_up_fresh_ignores_snapshot_and_resume_requires_one(capsys, isolated, clo
     run(capsys, "pause", "crm")
     code, out, _ = run(capsys, "up", "crm", "--fresh", "--json")
     assert json.loads(out)["restored_from_snapshot"] is None
-    assert [c for c in cloud.calls if c[0] == "create"][-1][3] == "docker-ce"
+    assert [c for c in cloud.calls if c[0] == "create"][-1][3] == "ubuntu-24.04"
 
 
 def test_snapshot_must_fit_the_server(capsys, isolated, cloud):

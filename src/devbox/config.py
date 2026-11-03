@@ -55,8 +55,7 @@ class Config:
     # is used, or the agent picks from `devbox server-types`.
     server_type: str | None = None
     location: str | None = None
-    # Hetzner's Docker CE app: Ubuntu 24.04 with Docker and Compose, so cloud-init skips installing them.
-    image: str = "docker-ce"
+    image: str = "ubuntu-24.04"
     ssh_key: Path = field(default_factory=lambda: Path.home() / ".ssh" / "devbox")
     # CIDRs allowed to reach SSH on devboxes. "auto" means this host's public IPv4.
     ssh_allow: list[str] = field(default_factory=lambda: ["auto"])
