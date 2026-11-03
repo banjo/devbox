@@ -230,6 +230,12 @@ class FakeCloud:
     def snapshot_price_per_gb_month(self):
         return 0.012
 
+    # Most tests leave IPv4 out of costs; test_costs_ipv4_36 sets prices.
+    ipv4: dict = {}
+
+    def ipv4_prices(self):
+        return dict(self.ipv4)
+
     # Firewalls, SSH keys and ownership, as in Hcloud.
     resource_name = "devbox-test"
     firewalls: list

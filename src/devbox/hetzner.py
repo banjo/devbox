@@ -29,6 +29,7 @@ class Hcloud:
         # Set by `up`: every hcloud call then ends by the startup deadline.
         self.deadline = None
         self.stage = "prepare"
+        self._pricing: dict | None | bool = False
         self.env = dict(os.environ)
         if token:
             self.env["HCLOUD_TOKEN"] = token
@@ -219,20 +220,38 @@ class Hcloud:
         self._deletable(data, "image")
         self.run("image", "delete", str(image_id), parse=False)
 
+    def pricing(self) -> dict | None:
+        """Hetzner's pricing API (read once per run), or None if it cannot be read."""
+        if self._pricing is False:
+            self._pricing = None
+            token = self.env.get("HCLOUD_TOKEN")
+            if token:
+                req = urllib.request.Request(
+                    "https://api.hetzner.cloud/v1/pricing", headers={"Authorization": f"Bearer {token}"}
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        self._pricing = json.load(resp)["pricing"]
+                except (OSError, ValueError, KeyError, TypeError):
+                    pass
+        return self._pricing
+
     def snapshot_price_per_gb_month(self) -> float | None:
         """Gross snapshot price from Hetzner's pricing API, or None if it cannot be read."""
-        token = self.env.get("HCLOUD_TOKEN")
-        if not token:
-            return None
-        req = urllib.request.Request(
-            "https://api.hetzner.cloud/v1/pricing", headers={"Authorization": f"Bearer {token}"}
-        )
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                pricing = json.load(resp)["pricing"]
-            return _price(pricing["image"]["price_per_gb_month"])
-        except (OSError, ValueError, KeyError, TypeError):
+            return _price(self.pricing()["image"]["price_per_gb_month"])
+        except (KeyError, TypeError):
             return None
+
+    def ipv4_prices(self) -> dict[str, tuple[float | None, float | None]]:
+        """Gross (hourly, monthly) price of a primary IPv4 per location; empty if unknown."""
+        try:
+            ips = self.pricing()["primary_ips"]
+            ipv4 = next(p for p in ips if p.get("type") == "ipv4")
+            return {p["location"]: (_price(p.get("price_hourly")), _price(p.get("price_monthly")))
+                    for p in ipv4.get("prices") or [] if p.get("location")}
+        except (KeyError, TypeError, StopIteration):
+            return {}
 
     # Server types and locations
 

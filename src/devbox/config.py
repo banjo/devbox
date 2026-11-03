@@ -65,6 +65,7 @@ class Config:
     keep_snapshots: int = 1
     # Used when Hetzner's pricing API cannot be read.
     snapshot_price_per_gb_month: float | None = None
+    ipv4_price_monthly: float | None = None
     # `devbox idle-check` pauses (or deletes) servers without activity for this long.
     idle_timeout: str = "8h"
     idle_action: str = "pause"
@@ -128,7 +129,7 @@ _STR_KEYS = {
     "server_type", "location", "image", "controller_id", "idle_timeout", "idle_action", "budget_action",
     "startup_timeout", "min_idle", "billing_margin", "preview_domain",
 }
-_FLOAT_KEYS = {"snapshot_price_per_gb_month", "monthly_budget"}
+_FLOAT_KEYS = {"snapshot_price_per_gb_month", "ipv4_price_monthly", "monthly_budget"}
 CONTROLLER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 DOMAIN_RE = re.compile(r"^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 

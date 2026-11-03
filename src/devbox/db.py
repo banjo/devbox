@@ -116,6 +116,10 @@ MIGRATIONS = [
     """
     ALTER TABLE servers ADD COLUMN startup TEXT;
     """,
+    """
+    ALTER TABLE servers ADD COLUMN ipv4_price_hourly REAL;
+    ALTER TABLE servers ADD COLUMN ipv4_price_monthly REAL;
+    """,
 ]
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
@@ -406,6 +410,11 @@ def servers_missing_price(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     ).fetchall()
 
 
+def servers_missing_ipv4_price(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Every devbox server has a primary IPv4, deleted ones included."""
+    return conn.execute("SELECT * FROM servers WHERE ipv4_price_hourly IS NULL").fetchall()
+
+
 # Events (activity counts for stats)
 
 
@@ -448,6 +457,7 @@ _SERVER_FIELDS = {
     "ip", "server_type", "location", "status", "preview_port", "preview_url",
     "price_hourly", "price_monthly", "power", "setup_stage", "setup_error", "diagnostics",
     "stop_action", "stop_requested_at", "created_at", "host_key", "startup",
+    "ipv4_price_hourly", "ipv4_price_monthly",
 }
 
 

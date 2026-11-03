@@ -33,6 +33,7 @@ class Context:
         self._conn = None
         self._hcloud = None
         self._snapshot_price = None
+        self._ipv4_prices = None
         self.snapshot_orphans: list[dict] = []
         self.foreign_servers: list[dict] = []
         self._check_interval = None
@@ -107,6 +108,16 @@ class Context:
             )
         return self._snapshot_price
 
+    def ipv4_price(self, location: str | None) -> tuple[float | None, float | None]:
+        """(hourly, monthly) price of a primary IPv4 in `location`, or the config fallback."""
+        if self._ipv4_prices is None:
+            self._ipv4_prices = self.hcloud.ipv4_prices()
+        hourly, monthly = self._ipv4_prices.get(location or "", (None, None))
+        if hourly is None and self.cfg.ipv4_price_monthly is not None:
+            monthly = self.cfg.ipv4_price_monthly
+            hourly = monthly / costs.HOURS_PER_MONTH
+        return hourly, monthly
+
     def cost_items(self, project: str | None = None) -> list[dict]:
         """Servers and snapshots, ready for `costs.summarize`."""
         items = [costs.server_item(s) for s in db.all_servers(self.conn, project)]
@@ -132,6 +143,11 @@ class Context:
                     db.update_server(
                         self.conn, s["id"], price_hourly=o["price_hourly"], price_monthly=o["price_monthly"]
                     )
+        for s in db.servers_missing_ipv4_price(self.conn):
+            hourly, monthly = self.ipv4_price(s["location"])
+            if hourly is None:
+                continue
+            db.update_server(self.conn, s["id"], ipv4_price_hourly=hourly, ipv4_price_monthly=monthly)
         unpriced = [snap for snap in db.snapshots(self.conn) if snap["price_per_gb_month"] is None]
         if unpriced:
             price = self.snapshot_price()
@@ -585,7 +601,9 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
             price_hourly=offer["price_hourly"], price_monthly=offer["price_monthly"],
             snapshot_id=snapshot["id"] if snapshot else None,
         )
-        db.update_server(ctx.conn, server_id, host_key=host_key)
+        ipv4_hourly, ipv4_monthly = ctx.ipv4_price(info["location"] or offer["location"])
+        db.update_server(ctx.conn, server_id, host_key=host_key,
+                         ipv4_price_hourly=ipv4_hourly, ipv4_price_monthly=ipv4_monthly)
         state.update(server_id=server_id, created=True, snapshot=snapshot)
         server = db.get_server(ctx.conn, server_id)
         created = True
@@ -1513,6 +1531,7 @@ def cmd_costs(ctx: Context) -> int:
         f"total {period}: {costs.money(summary['total'])} over {summary['servers']} "
         f"server{'s' if summary['servers'] != 1 else ''}, {costs.duration(summary['seconds'])} running"
         + (f", incl. {costs.money(summary['snapshot_total'])} for snapshots" if summary["snapshots"] else "")
+        + (f", {costs.money(summary['ipv4_total'])} for IPv4" if summary["ipv4_total"] else "")
     )
     if summary["unknown_price"]:
         lines.append(f"* {summary['unknown_price']} item(s) without a known price are not counted")
@@ -1524,8 +1543,8 @@ def cmd_costs(ctx: Context) -> int:
             f"hour each; restore time not included"
         )
     lines.append(
-        "Estimates incl. VAT: servers per started hour and snapshots per GB, both capped per calendar month, "
-        "with each month's cost spread over the time running in it. IPv4 and traffic not included."
+        "Estimates incl. VAT: servers and their IPv4 per started hour and snapshots per GB, both capped per calendar month, "
+        "with each month's cost spread over the time running in it. Traffic not included."
     )
     emit(ctx.args, summary, "\n".join(lines))
     return 0

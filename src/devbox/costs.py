@@ -5,7 +5,9 @@ Billing model (an estimate of how Hetzner bills):
   costs `started hours × hourly price`, capped at the monthly price.
   Snapshots are counted the same way, with an hourly price of
   `size × price per GB per month / 730`.
-- Prices include VAT. Primary IPv4 addresses and traffic are not included.
+- A server's primary IPv4 address is billed the same way with its own
+  hourly and monthly price, over the server's lifetime.
+- Prices include VAT. Traffic is not included.
 
 Allocation policy for reports:
 - Each month's cost (and billed hours) is computed once, over the whole time
@@ -52,6 +54,14 @@ def snapshot_item(row) -> dict:
         "price_hourly": monthly / HOURS_PER_MONTH if monthly is not None else None,
         "price_monthly": monthly,
     }
+
+
+def _field(item, key: str):
+    """item[key] for dicts and sqlite rows, None when the item has no such field."""
+    try:
+        return item[key]
+    except (KeyError, IndexError):
+        return None
 
 
 def parse_ts(value: str) -> datetime:
@@ -137,6 +147,8 @@ def server_usage(item, since=None, until=None, now: datetime | None = None) -> d
     seconds = 0.0
     hours = 0.0
     cost = 0.0 if item["price_hourly"] is not None else None
+    ipv4_hourly, ipv4_monthly = _field(item, "ipv4_price_hourly"), _field(item, "ipv4_price_monthly")
+    ipv4 = 0.0 if ipv4_hourly is not None and cost is not None else None
     for seg_start, seg_end, seg_hours, seg_cost in month_segments(
         start, end, item["price_hourly"], item["price_monthly"]
     ):
@@ -150,11 +162,14 @@ def server_usage(item, since=None, until=None, now: datetime | None = None) -> d
         hours += seg_hours * share
         if cost is not None:
             cost += seg_cost * share
+        if ipv4 is not None:
+            ipv4 += min(seg_hours * ipv4_hourly, ipv4_monthly if ipv4_monthly is not None else math.inf) * share
     whole = since is None and until is None
     return {
         "seconds": int(round(seconds)),
         "billed_hours": int(round(hours)) if whole else hours,
-        "cost": cost,
+        "cost": cost + ipv4 if ipv4 is not None else cost,
+        "ipv4_cost": ipv4,
     }
 
 
@@ -215,6 +230,7 @@ def summarize(items, since=None, until=None, by: str = "project", now: datetime 
     groups: dict[str, dict] = {}
     total = 0.0
     snapshot_total = 0.0
+    ipv4_total = 0.0
     total_seconds = 0
     total_hours = 0.0
     unknown = 0
@@ -223,7 +239,7 @@ def summarize(items, since=None, until=None, by: str = "project", now: datetime 
     def add(key: str, kind: str, usage: dict) -> None:
         g = groups.setdefault(key, {
             "key": key, "cost": 0.0, "seconds": 0, "billed_hours": 0.0,
-            "servers": 0, "snapshots": 0, "snapshot_cost": 0.0, "unknown_price": 0,
+            "servers": 0, "snapshots": 0, "snapshot_cost": 0.0, "ipv4_cost": 0.0, "unknown_price": 0,
         })
         g["servers" if kind == "server" else "snapshots"] += 1
         if kind == "server":
@@ -235,6 +251,7 @@ def summarize(items, since=None, until=None, by: str = "project", now: datetime 
             g["cost"] += usage["cost"]
             if kind == "snapshot":
                 g["snapshot_cost"] += usage["cost"]
+            g["ipv4_cost"] += usage["ipv4_cost"] or 0.0
 
     for item in items:
         kind = item.get("kind", "server") if isinstance(item, dict) else "server"
@@ -251,6 +268,7 @@ def summarize(items, since=None, until=None, by: str = "project", now: datetime 
             total += usage["cost"]
             if kind == "snapshot":
                 snapshot_total += usage["cost"]
+            ipv4_total += usage["ipv4_cost"] or 0.0
         counted[kind].add(item["id"])
 
         if by in ("month", "day"):
@@ -268,6 +286,7 @@ def summarize(items, since=None, until=None, by: str = "project", now: datetime 
     # Round so that the rows add up exactly to the rounded totals.
     total_r, costs_r = apportion([g["cost"] for g in ordered], total, COST_DIGITS)
     snap_r, snaps_r = apportion([g["snapshot_cost"] for g in ordered], snapshot_total, COST_DIGITS)
+    ipv4_r, ipv4s_r = apportion([g["ipv4_cost"] for g in ordered], ipv4_total, COST_DIGITS)
     hours_r, rows_hours_r = apportion([g["billed_hours"] for g in ordered], total_hours, HOUR_DIGITS)
     return {
         "currency": CURRENCY,
@@ -276,14 +295,15 @@ def summarize(items, since=None, until=None, by: str = "project", now: datetime 
         "by": by,
         "total": total_r,
         "snapshot_total": snap_r,
+        "ipv4_total": ipv4_r,
         "seconds": total_seconds,
         "billed_hours": hours_r,
         "servers": len(counted["server"]),
         "snapshots": len(counted["snapshot"]),
         "unknown_price": unknown,
         "groups": [
-            {**g, "cost": c, "snapshot_cost": sc, "billed_hours": h}
-            for g, c, sc, h in zip(ordered, costs_r, snaps_r, rows_hours_r)
+            {**g, "cost": c, "snapshot_cost": sc, "ipv4_cost": ic, "billed_hours": h}
+            for g, c, sc, ic, h in zip(ordered, costs_r, snaps_r, ipv4s_r, rows_hours_r)
         ],
     }
 

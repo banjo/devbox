@@ -8,8 +8,11 @@ to get the most out of each billing hour.
 - `up` stores the server's hourly and monthly price from Hetzner when it creates it, and every
   server's and snapshot's start and end time stays in the registry. Servers are estimated the way
   Hetzner bills them: per started hour, capped at the monthly price per calendar month. Snapshots
-  are estimated per GB per month, prorated by the hour. Prices include VAT; primary IPv4 and traffic
-  are not included.
+  are estimated per GB per month, prorated by the hour. Each server's primary IPv4 address is
+  billed on top, per started hour and capped at its own monthly price; `up` stores that price for
+  the server's location from Hetzner's pricing API (`ipv4_price_monthly` in the config is the
+  fallback). Every cost (`status`, `down`, `history`, `costs`, the budget) includes it, and
+  `costs --json` shows it as `ipv4_cost`/`ipv4_total`. Prices include VAT; traffic is not included.
 - Reports compute each month's cost once and spread it evenly over the time the server ran that
   month. A period or a day/month row gets its share, so rows always add up to the total and adjacent
   periods add up to the combined period (billed hours in a partial period can be fractional).

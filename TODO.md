@@ -38,7 +38,6 @@ Nothing below has run against Hetzner yet. Check each step and fix what breaks.
 - [ ] More database engines (MySQL/MariaDB, Redis) in `databases.py`
 - [ ] Encrypt stored secrets (e.g. with `age`) instead of relying on file permissions
 - [ ] Fixed preview hostname with a named Cloudflare tunnel, optionally behind Cloudflare Access
-- [ ] Include primary IPv4 in cost estimates
 - [ ] Count preview traffic (tunnel requests) as activity for idle shutdown
 - [ ] Notify (email/webhook) when idle-check pauses a server or the budget is reached
 - [ ] Run as a non-root user on the server and pin SSH host keys instead of `accept-new`
@@ -53,6 +52,6 @@ Nothing below has run against Hetzner yet. Check each step and fix what breaks.
 - Availability from Hetzner is an indicator, not a guarantee; `up` can still fail if a type sells out between listing and creating.
 - One server at a time unless `up --force`.
 - The 5m startup default is a guess until measured on real cold starts (see #18); app health checks are separate from `up` being ready.
-- Costs are estimates of server and snapshot prices; IPv4 and traffic are not included. Servers deleted outside devbox are recorded as deleted when devbox next notices, which can overstate their cost.
+- Costs are estimates of server, IPv4 and snapshot prices; traffic is not included. Servers deleted outside devbox are recorded as deleted when devbox next notices, which can overstate their cost.
 - Submodule contents are not synced.
 - `exec --timeout` does not stop containers started in the background (`-d`).
