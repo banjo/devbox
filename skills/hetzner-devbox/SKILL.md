@@ -58,10 +58,13 @@ Without `--type`/`--location`, `up` uses the config default, or else the project
 
 ### Starting a project
 
-1. `devbox status NAME`. If there is no server, ask the user, then `devbox up NAME` (add `--type`/`--location` the first time, see above). If the project is paused (`status` shows a snapshot), `up` restores it. `up` waits for the server and syncs the code. It does not start anything.
-   - **Restored from a snapshot:** runtimes, dependencies, `.env` and database data are already there. Only run the notes' "every start" steps (start containers, dev servers, `expose`), not the "new server" steps.
-   - **Clean server:** follow all the steps below.
-2. `devbox project notes NAME`.
+1. `devbox status NAME`. If there is no server, ask the user, then `devbox up NAME` (add `--type`/`--location` the first time, see above). If the project is paused (`status` shows a snapshot), `up` restores it. `up` waits for the server and syncs the code. It does not start anything, but it tells you what to do: its output ends with `next:` lines and the project's notes (`next` in `--json`: `state`, `steps`, `previews`, `notes`).
+   - `state: restored` (from a snapshot): runtimes, dependencies, `.env` and database data are already there. Only run the notes' "every start" steps (start containers, dev servers, `expose`), not the "new server" steps.
+   - `state: powered-on`: same, files and data are there, processes and previews stopped.
+   - `state: running`: nothing to start.
+   - `state: new` (clean server): follow all the steps below.
+   - `next.previews` lists the previews the last server had, with the `expose` command for each. Run them once the app answers (add `--wait-for`).
+2. Read the notes from `up`'s output (or `devbox project notes NAME`).
    - **Notes exist:** follow them.
    - **No notes:** read the project to work out what it needs: README, `package.json` scripts, `compose.yaml`/`docker-compose.yml`, `Makefile`, `Dockerfile`, `.env.example`, `.tool-versions`, `.nvmrc`, `mise.toml`, `pyproject.toml` and so on.
 3. Install runtimes and dependencies with foreground `exec`:
@@ -102,9 +105,10 @@ Gotcha: the API needs DATABASE_URL=postgres://postgres:postgres@localhost:5432/a
 
 ### Finishing
 
-1. Default: `devbox pause NAME`. It shuts the server down, saves a snapshot and deletes the server. Pass on the summary: how long it ran, its cost, the snapshot's size and monthly cost, and the project total.
-2. If the user wants nothing kept, remind them that `down` deletes the server and its data (for example the database), then `devbox down NAME` when they confirm. `devbox down NAME --dump` saves registered databases locally first; `devbox db restore NAME --yes` puts the data back on a later server (ask before restoring: it replaces the data). Existing snapshots stay unless deleted with `devbox snapshot delete IMAGE_ID`.
-3. Code is always safe because it lives on this machine.
+1. Default: `devbox pause NAME`. It shuts the server down, saves a snapshot and deletes the server. Pass on the summary: how long it ran, its cost, the snapshot's size and monthly cost, and the project total, plus the `tell the user:` line (how to continue and how long it takes).
+2. If you learned anything about running the project this session, update the notes before or right after (`pause`/`down` remind you).
+3. If the user wants nothing kept, remind them that `down` deletes the server and its data (for example the database), then `devbox down NAME` when they confirm. `down` refuses while a registered database has no dump since the server was last used. `devbox down NAME --dump` saves registered databases locally first; only pass `--no-dump` when the user says the data can go; `devbox db restore NAME --yes` puts the data back on a later server (ask before restoring: it replaces the data). Existing snapshots stay unless deleted with `devbox snapshot delete IMAGE_ID`.
+4. Code is always safe because it lives on this machine.
 
 ### Idle shutdown
 

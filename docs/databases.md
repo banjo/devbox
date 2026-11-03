@@ -15,5 +15,9 @@
 - Dumps are streamed to `~/.local/state/devbox/dumps/NAME/DB-<time>.<ext>` (files 0600, folders
   0700, regardless of umask); `restore` uses the latest one unless `--file` is given, and always
   needs `--yes`.
+- `down` deletes the server's data, so it refuses while a registered database has no dump taken
+  since the server was last used (any activity except `db dump` counts). Use `down --dump`,
+  `db dump` first, `pause` (keeps everything in the snapshot) or `--no-dump` to delete anyway.
+  `down --at-hour-end` checks the same when it is requested.
 - More engines are a small class in `src/devbox/databases.py`: options, a dump command that writes
   to stdout and a restore command that reads stdin.

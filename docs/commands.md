@@ -38,7 +38,10 @@ devbox unexpose NAME [PREVIEW...]         close previews (all of them without na
 devbox ssh NAME                           shell on the server
 devbox status [NAME]                      servers, processes, preview URLs, cost so far
 devbox pause NAME                         snapshot the server, then delete it (= down --snapshot)
-devbox down NAME [--snapshot] [--dump]    delete the server (dumping databases first with --dump); prints cost and activity
+devbox down NAME [--snapshot] [--dump | --no-dump]
+                                          delete the server (dumping databases first with --dump); prints cost and
+                                          activity. Refuses while a registered database has no dump since the
+                                          server was last used, unless --no-dump
     pause/down --at-hour-end                 keep the server until just before its next billing hour, then pause/delete it
 devbox touch NAME [--for D | --clear]     record activity so idle shutdown waits; --for 2h holds the server
                                           until then (max 24h), --clear ends the hold

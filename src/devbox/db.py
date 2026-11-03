@@ -123,6 +123,9 @@ MIGRATIONS = [
     """
     ALTER TABLE servers ADD COLUMN hold_until TEXT;
     """,
+    """
+    ALTER TABLE servers ADD COLUMN previews_at_stop TEXT;
+    """,
 ]
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
@@ -460,7 +463,7 @@ _SERVER_FIELDS = {
     "ip", "server_type", "location", "status", "preview_port", "preview_url",
     "price_hourly", "price_monthly", "power", "setup_stage", "setup_error", "diagnostics",
     "stop_action", "stop_requested_at", "created_at", "host_key", "startup",
-    "ipv4_price_hourly", "ipv4_price_monthly", "hold_until",
+    "ipv4_price_hourly", "ipv4_price_monthly", "hold_until", "previews_at_stop",
 }
 
 
@@ -523,10 +526,41 @@ def _sync_preview_columns(conn: sqlite3.Connection, server_id: int) -> None:
 
 
 def mark_deleted(conn: sqlite3.Connection, server_id: int) -> None:
+    # Remember the previews, so the next `up` can say how to open them again.
+    kept = [{k: r[k] for k in ("name", "port", "kind", "protected")} for r in previews(conn, server_id)]
     conn.execute(
-        "UPDATE servers SET status = 'deleted', deleted_at = ? WHERE id = ?", (now(), server_id)
+        "UPDATE servers SET status = 'deleted', deleted_at = ?, previews_at_stop = ? WHERE id = ?",
+        (now(), json.dumps(kept) if kept else None, server_id),
     )
     conn.execute("DELETE FROM previews WHERE server_id = ?", (server_id,))
+
+
+def previews_before(conn: sqlite3.Connection, project: str) -> list[dict]:
+    """The previews the project's last deleted server had open."""
+    row = conn.execute(
+        "SELECT previews_at_stop FROM servers WHERE project = ? AND status = 'deleted' "
+        "ORDER BY deleted_at DESC, id DESC LIMIT 1", (project,)
+    ).fetchone()
+    return json.loads(row["previews_at_stop"]) if row and row["previews_at_stop"] else []
+
+
+def last_use(conn: sqlite3.Connection, server) -> datetime:
+    """Last activity that may have changed data on the server (a database dump doesn't)."""
+    row = conn.execute(
+        "SELECT MAX(at) AS at FROM events WHERE server_id = ? AND kind != 'db_dump'", (server["id"],)
+    ).fetchone()
+    return max(_parse(s) for s in (server["created_at"], row["at"]) if s)
+
+
+def typical_startup(conn: sqlite3.Connection, project: str, kind: str) -> float | None:
+    """Seconds the project's most recent `up` of this kind (create, restore, ...) took."""
+    for r in conn.execute(
+        "SELECT startup FROM servers WHERE project = ? AND startup IS NOT NULL ORDER BY id DESC", (project,)
+    ):
+        data = json.loads(r["startup"])
+        if data.get("kind") == kind:
+            return data.get("seconds")
+    return None
 
 
 def reconcile(conn: sqlite3.Connection, hetzner_servers: list[dict]) -> list[dict]:

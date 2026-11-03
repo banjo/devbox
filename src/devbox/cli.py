@@ -645,6 +645,14 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
     preview_env = write_preview_env(ctx, server)
     progress.say("Ready")
     stages = progress.stage_seconds()
+    if created:
+        server_state = "restored" if snapshot else "new"
+    elif powered_on:
+        server_state = "powered-on"
+    elif server["status"] != "running":  # setup is retried on a server that was just created
+        server_state = "restored" if server["snapshot_id"] else "new"
+    else:
+        server_state = "running"
     if created or powered_on or server["status"] != "running":
         kind = ("restore" if snapshot else "create") if created else ("power-on" if powered_on else "retry")
         db.update_server(ctx.conn, server["id"], startup=json.dumps(
@@ -661,6 +669,7 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
         "cancelled_stop": cancelled_stop,
         "stages": stages,
         "preview_env": preview_env,
+        "state": server_state,
     }
 
 
@@ -684,6 +693,7 @@ def report_up(ctx: Context, r: dict, deadline: "startup.Deadline") -> int:
         "stages": r["stages"],
         "preview_env": r["preview_env"],
         "cancelled_stop": r["cancelled_stop"],
+        "next": up_guidance(ctx, name, project["notes"], server, r["state"]),
     }
     verb = "powered on" if r["powered_on"] else "reusing"
     if r["created"]:
@@ -698,19 +708,75 @@ def report_up(ctx: Context, r: dict, deadline: "startup.Deadline") -> int:
     if r["created"] or r["powered_on"]:
         text.append("  startup: " + stage_summary(r["stages"]))
     if r["created"] and snapshot:
-        text.append(
-            f"  from snapshot taken {snapshot['created_at'][:16].replace('T', ' ')}: installed tools, "
-            f"dependencies and data from then are back; background processes and the preview must be started again"
-        )
+        text.append(f"  from snapshot taken {snapshot['created_at'][:16].replace('T', ' ')}")
     if r["cancelled_stop"]:
         text.append(f"  cancelled the {r['cancelled_stop']} planned for the end of the billing hour")
     if r["secrets_written"]:
         text.append("  secrets written to " + ", ".join(f"{f} ({n} keys)" for f, n in r["secrets_written"].items()))
     text += [f"warning: {w}" for w in r["warnings"]]
-    if not data["has_notes"]:
-        text.append(f"no notes for {name} yet; work out how to start it, then save them with `devbox project notes {name} --set ...`")
+    text += guidance_lines(data["next"])
     emit(ctx.args, data, "\n".join(text))
     return 0
+
+
+UP_STEPS = {
+    "new": "new server, nothing installed: run the notes' new-server steps, then the every-start steps",
+    "restored": "restored from a snapshot, installs, env files and data are back: run only the notes' "
+                "every-start steps (background processes, expose)",
+    "powered-on": "powered on, files, installs and data are there but processes and previews stopped: "
+                  "run the notes' every-start steps",
+    "running": "already running, nothing to start: check `devbox ps {name}` if something seems off",
+}
+
+
+def preview_command(project: str, p: dict, domain: str | None) -> str:
+    parts = ["devbox expose", project, str(p["port"])]
+    if p["name"] != previews.DEFAULT:
+        parts += ["--name", p["name"]]
+    if p["protected"]:
+        parts.append("--protect")
+    if p["kind"] == "quick" and domain:
+        parts.append("--quick")
+    return " ".join(parts)
+
+
+def up_guidance(ctx: Context, name: str, notes: str, server, state: str) -> dict:
+    """What the agent should do after `up` (`next` in `up --json`)."""
+    steps = [UP_STEPS[state].format(name=name)]
+    if not notes.strip():
+        steps += [
+            f"no notes for {name} yet: work out how it starts from the README, package.json scripts, "
+            "compose files, Makefile, .env.example and version files (.nvmrc, .tool-versions, ...)",
+            f"install with `devbox exec {name} -- ...`, start long-running things with "
+            f"`devbox exec {name} --detach --name web -- ...`, then `devbox expose {name} PORT --wait-for /`",
+            f"save what worked with `devbox project notes {name} --set-file -`: new-server steps, "
+            "every-start steps, ports and gotchas, no secrets",
+        ]
+    if state == "running":
+        before = []
+    elif state == "powered-on":
+        before = [preview_dict(r) for r in db.previews(ctx.conn, server["id"])]
+    else:
+        before = db.previews_before(ctx.conn, name)
+    reopen = [
+        {"name": p["name"], "port": p["port"], "kind": p["kind"], "protected": bool(p["protected"]),
+         "command": preview_command(name, p, ctx.cfg.preview_domain)}
+        for p in before
+    ]
+    if reopen:
+        steps.append("once the app runs, open the previews it had again (add --wait-for PATH)")
+    return {"state": state, "steps": steps, "previews": reopen, "notes": notes.strip() or None}
+
+
+def guidance_lines(guidance: dict) -> list[str]:
+    lines = [f"next: {s}" for s in guidance["steps"]]
+    lines += [f"  {p['command']}" for p in guidance.get("previews", [])]
+    if guidance.get("tell_user"):
+        lines.append(f"tell the user: {guidance['tell_user']}")
+    if guidance.get("notes"):
+        lines.append("notes:")
+        lines += [f"  {line}" if line else "" for line in guidance["notes"].splitlines()]
+    return lines
 
 
 def stage_summary(stages: dict) -> str:
@@ -986,6 +1052,11 @@ def cmd_down(ctx: Context) -> int:
     if ctx.args.at_hour_end:
         if getattr(ctx.args, "dump", False):
             raise DevboxError("--dump can't be combined with --at-hour-end; dump now with `devbox db dump`")
+        if not snapshot:
+            with ctx.lock():
+                server = db.active_server(ctx.conn, db.require_project(ctx.conn, name)["name"])
+                if server is not None:
+                    refuse_unsaved_databases(ctx, server)
         return request_stop_at_hour_end(ctx, name, "pause" if snapshot else "down")
     with ctx.lock():
         db.require_project(ctx.conn, name)
@@ -995,6 +1066,8 @@ def cmd_down(ctx: Context) -> int:
             emit(ctx.args, {"project": name, "deleted": None}, f"{name} has no server")
             return 0
         dumps = []
+        if not snapshot and not getattr(ctx.args, "dump", False):
+            refuse_unsaved_databases(ctx, server)
         if getattr(ctx.args, "dump", False):
             if server["status"] != "running":
                 raise DevboxError(f"server for {name} is not running; cannot dump databases")
@@ -1014,8 +1087,46 @@ def cmd_down(ctx: Context) -> int:
             f"  note: snapshot {remaining['hetzner_image_id']} from {remaining['created_at'][:10]} is kept; "
             f"the next `devbox up {name}` restores it (use --fresh for a clean server)"
         )
-    emit(ctx.args, {"project": name, "deleted": server["hetzner_id"], **summary}, "\n".join(lines))
+    guidance = down_guidance(ctx, name, snapshot, remaining)
+    lines += guidance_lines(guidance)
+    emit(ctx.args, {"project": name, "deleted": server["hetzner_id"], **summary, "next": guidance}, "\n".join(lines))
     return 0
+
+
+def refuse_unsaved_databases(ctx: Context, server) -> None:
+    """`down` deletes database data: refuse while a registered database has no dump since the last use."""
+    if getattr(ctx.args, "no_dump", False) or server["status"] != "running":
+        return
+    name = server["project"]
+    used = db.last_use(ctx.conn, server).timestamp()
+    stale = [d["name"] for d in db.list_databases(ctx.conn, name)
+             if not any(Path(x["path"]).stat().st_mtime >= used for x in list_dumps(ctx, name, d["name"]))]
+    if stale:
+        dump = (f"dump now with `devbox db dump {name}`" if ctx.args.at_hour_end
+                else f"`devbox down {name} --dump` dumps first")
+        raise DevboxError(
+            f"{name}'s database{'s' if len(stale) > 1 else ''} {', '.join(stale)} "
+            f"{'have' if len(stale) > 1 else 'has'} no dump since the server was last used, and down deletes "
+            f"the data: {dump}, `devbox pause {name}` keeps everything, or --no-dump deletes it anyway"
+        )
+
+
+def down_guidance(ctx: Context, name: str, paused: bool, snapshot) -> dict:
+    """What to do after `pause`/`down` (`next` in --json): save what was learned, tell the user how to go on."""
+    if snapshot:
+        took = db.typical_startup(ctx.conn, name, "restore")
+        how = "restores this snapshot" if paused else \
+            f"restores the older snapshot from {snapshot['created_at'][:10]} (--fresh for a clean server)"
+    else:
+        took = db.typical_startup(ctx.conn, name, "create")
+        how = "starts a clean server"
+    about = f", about {startup.duration_label(took)}" if took is not None else ""
+    return {
+        "steps": [f"if you learned anything about running {name}, update the notes: "
+                  f"`devbox project notes {name} --set-file -`"],
+        "tell_user": f"{name} is {'paused' if paused else 'deleted'}; `devbox up {name}` {how}{about}",
+        "startup_seconds": took,
+    }
 
 
 def request_stop_at_hour_end(ctx: Context, name: str, action: str) -> int:
@@ -2406,6 +2517,8 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
     p.add_argument("name")
     p.add_argument("--snapshot", action="store_true", help="snapshot the server first (same as pause)")
     p.add_argument("--dump", action="store_true", help="dump all project databases locally first")
+    p.add_argument("--no-dump", action="store_true",
+                   help="delete even though a registered database has no recent dump (its data is lost)")
     p.add_argument("--at-hour-end", action="store_true",
                    help="keep the server until just before its next billing hour, then delete it (needs autostop)")
 

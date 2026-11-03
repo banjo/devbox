@@ -57,6 +57,12 @@ Previews are described in [Previews](previews.md).
   (`startup: create 10s, ssh 21s, cloud-init 59s, ...`). `up --json` has the seconds per stage in
   `stages`, and the server keeps them, so `history` shows "up in 1m32s" and `history --json` the
   breakdown. Failures include `stages` too.
+- `up`, `pause` and `down` end with what to do next (`next` in `--json`). After `up`: the server's
+  `state` (`new`, `restored`, `powered-on` or `running`) and which of the notes' steps that calls
+  for, the project's notes, a checklist when there are none, and the previews the last server had,
+  each with the `expose` command that opens it again (`next.previews`). After `pause`/`down`: a
+  reminder to update the notes and a line for the user on how to continue, with the time the last
+  restore or create took (`next.tell_user`, `next.startup_seconds`).
 - cloud-init installs its base packages only when they are missing, so a server restored from a
   snapshot skips `apt-get update`.
 - If cloud-init reports an error or tools are missing, `up` fails right away instead of waiting.
