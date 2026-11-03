@@ -642,6 +642,7 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
     progress.step("secrets", "Writing secrets...") if secret_store(ctx, name).load() else None
     deadline.check("secrets")
     secrets_written = push_secrets(ctx, server, name)
+    preview_env = write_preview_env(ctx, server)
     progress.say("Ready")
     stages = progress.stage_seconds()
     if created or powered_on or server["status"] != "running":
@@ -659,6 +660,7 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
         "secrets_written": secrets_written,
         "cancelled_stop": cancelled_stop,
         "stages": stages,
+        "preview_env": preview_env,
     }
 
 
@@ -680,6 +682,7 @@ def report_up(ctx: Context, r: dict, deadline: "startup.Deadline") -> int:
         "warnings": r["warnings"],
         "startup_seconds": round(deadline.elapsed(), 1),
         "stages": r["stages"],
+        "preview_env": r["preview_env"],
         "cancelled_stop": r["cancelled_stop"],
     }
     verb = "powered on" if r["powered_on"] else "reusing"
@@ -2175,6 +2178,13 @@ def preview_dict(r) -> dict:
         | {"protected": bool(r["protected"])}
 
 
+def write_preview_env(ctx: Context, server) -> dict[str, str]:
+    """Tell the app its preview URLs (previews.ENV_FILE); rewritten from scratch every time."""
+    values = previews.env(server["project"], ctx.cfg.preview_domain, db.previews(ctx.conn, server["id"]))
+    ctx.remote(server).write_file(previews.ENV_FILE, previews.env_script(values), mode="644")
+    return values
+
+
 def close_previews(ctx: Context, server, rows) -> None:
     remote = ctx.remote(server)
     for r in rows:
@@ -2193,6 +2203,7 @@ def close_previews(ctx: Context, server, rows) -> None:
         except DevboxError as e:
             # The hostname is already unserved: nothing on the server listens for it.
             print(f"warning: could not update the Cloudflare tunnel's routes: {e}", file=sys.stderr)
+    write_preview_env(ctx, server)
 
 
 def cmd_expose(ctx: Context) -> int:
@@ -2268,8 +2279,9 @@ def cmd_expose(ctx: Context) -> int:
                 remote.stop_unit(previews.NAMED_UNIT)
             NamedTunnel(ctx, name, old["hostname"]).update(remaining)
 
+    env = write_preview_env(ctx, server)
     data = {"project": name, "name": preview, "port": port, "url": url, "kind": "named" if domain else "quick",
-            "protected": bool(auth), "auth": auth, "health": health, "warnings": warnings}
+            "protected": bool(auth), "auth": auth, "health": health, "warnings": warnings, "preview_env": env}
     text = [url]
     if auth:
         text.append(f"  password protected: user {auth['user']}, password {auth['password']}")
@@ -2278,6 +2290,9 @@ def cmd_expose(ctx: Context) -> int:
     if not domain:
         text.append("  this URL changes whenever the tunnel restarts" + (
             "; set preview_domain in config for stable URLs" if not ctx.cfg.preview_domain else ""))
+    var = next(k for k, v in env.items() if v == url and k.startswith("DEVBOX_PREVIEW_URL"))
+    text.append(f"  ${var} has this URL for processes started from now on"
+                + ("" if domain else "; restart the app if it needs it"))
     text += [f"warning: {w}" for w in warnings]
     emit(ctx.args, data, "\n".join(text))
     return 0

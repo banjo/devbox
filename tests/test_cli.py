@@ -292,6 +292,9 @@ def cloud(monkeypatch):
         lambda self, path, manifest, timeout=None: {"mode": "git", "files": 1, "deleted": 0, "warning": None},
     )
     monkeypatch.setattr(cli.Remote, "list_units", lambda self: [])
+    fake.files = {}
+    monkeypatch.setattr(cli.Remote, "write_file",
+                        lambda self, path, content, mode="600": fake.files.__setitem__(path, content))
     monkeypatch.setattr(cli.Remote, "running_work", lambda self: list(fake.running_work))
     # Never read the real crontab/systemd; tests that care set this themselves.
     monkeypatch.setattr(cli.admin, "_run", lambda cmd: None)

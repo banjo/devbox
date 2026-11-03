@@ -14,6 +14,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,6 +31,8 @@ CADDY_IMAGE = "caddy:2"
 AUTH_USER = "devbox"
 API = "https://api.cloudflare.com/client/v4"
 TUNNEL_TARGET = ".cfargotunnel.com"
+# Sourced by every login shell on the server, so `exec`, background processes and `ssh` see it.
+ENV_FILE = "/etc/profile.d/devbox-preview.sh"
 
 
 def validate_name(name: str) -> None:
@@ -56,6 +59,34 @@ def hostname(project: str, name: str, domain: str) -> str:
     if len(label) > 63:
         raise DevboxError(f"hostname label '{label}' is longer than 63 characters; use a shorter preview name")
     return f"{label}.{domain}"
+
+
+def env(project: str, domain: str | None, rows) -> dict[str, str]:
+    """Environment variables telling the app its preview URLs.
+
+    With a domain the default preview's URL is known before anything is exposed.
+    Every exposed preview adds its own; an exposed default (also a quick one)
+    replaces the precomputed one.
+    """
+    values: dict[str, str] = {}
+
+    def add(name: str, url: str) -> None:
+        suffix = "" if name == DEFAULT else "_" + name.upper().replace("-", "_")
+        values[f"DEVBOX_PREVIEW_URL{suffix}"] = url
+        values[f"DEVBOX_PREVIEW_HOST{suffix}"] = urllib.parse.urlsplit(url).hostname or ""
+
+    if domain:
+        values["DEVBOX_PREVIEW_DOMAIN"] = domain
+        add(DEFAULT, f"https://{hostname(project, DEFAULT, domain)}")
+    for r in sorted(rows, key=lambda r: r["name"]):
+        add(r["name"], r["url"])
+    return values
+
+
+def env_script(values: dict[str, str]) -> str:
+    lines = ["# Written by devbox on up/expose/unexpose. Changes are overwritten."]
+    lines += [f"export {k}={shlex.quote(v)}" for k, v in sorted(values.items())]
+    return "\n".join(lines) + "\n"
 
 
 def tunnel_name(controller: str, project: str) -> str:

@@ -128,7 +128,7 @@ Hetzner bills every started hour from when a server is created. A new server per
 - `devbox status` shows each running server's cost so far, kept snapshots and their monthly cost, the total for this month and the budget left.
 - `devbox snapshot list` shows snapshots with size and cost; old ones beyond the configured number are deleted automatically on the next pause.
 - `devbox costs` answers questions like "what did this cost?": `--month 2026-10`, `--days 7`, `--since 2026-10-01 --until 2026-11-01`, `--project NAME`, and `--by project|month|day|type|server`.
-- Costs are estimates (incl. VAT): servers per started hour, snapshots per GB, both capped monthly; IPv4 and traffic are not included. Say so when reporting them.
+- Costs are estimates (incl. VAT): servers and their IPv4 per started hour, snapshots per GB, all capped monthly; traffic is not included. Say so when reporting them.
 
 ## Examples
 
@@ -149,7 +149,7 @@ Hetzner bills every started hour from when a server is created. A new server per
 ## Pitfalls
 
 - Without `preview_domain` in config, the preview URL changes every time the tunnel restarts, and after `down`/`up`. Always give the user the current URL from `devbox status NAME`. With `preview_domain` the URL stays the same, but the preview still has to be started again after a restore (`status` says "not running").
-- Vite and similar dev servers may reject the preview's host name; allow it in their config (for Vite, `server.allowedHosts`).
+- Vite and similar dev servers may reject the preview's host name. Don't allow every host; use the env value devbox sets on the server: `allowedHosts: [process.env.DEVBOX_PREVIEW_HOST]`. `DEVBOX_PREVIEW_URL` / `DEVBOX_PREVIEW_HOST` (plus `_NAME` variants for named previews) are there in every `exec` and background process. With `preview_domain` they are set from `up` on, so start the app after `up` and it has the right URL. With quick tunnels they are set by `expose`, so restart the app afterwards if it needs its URL. For a frontend with an API or WebSocket backend, expose only the frontend and proxy the rest through the dev server (Vite `server.proxy`, `ws: true`), so one preview URL covers everything. Put this in the project notes. See `docs/previews.md`.
 - Foreground `exec` blocks until the command exits. Never use it for dev servers or `compose up` without `-d`; use `--detach`.
 - A single argument after `--` is run as a shell script, so quote it: `-- 'npm ci && npm test'`. Several arguments are quoted individually, so `&&` between them is passed literally.
 - Processes do not restart on their own. After a crash, check `logs` and run the same `exec --detach` again.
