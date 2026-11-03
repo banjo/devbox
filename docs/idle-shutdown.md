@@ -7,8 +7,15 @@
   every `sync --watch` round), `exec`, `ps`, `logs`, `stop`, `ssh`, `expose`, `pull`, `forward`,
   `secrets set/push`, `db dump/restore` and `touch`. Read-only overviews (`status`, `history`,
   `costs`, `snapshot list`, `doctor`) do not count, so an automated loop polling `status` can't keep
-  a server alive forever. Browsing the preview doesn't count either; use `devbox touch NAME` while
-  testing by hand.
+  a server alive forever. Browsing the preview doesn't count either; hold the server while testing
+  by hand (below).
+- `devbox touch NAME --for 2h` holds the server: idle shutdown leaves it alone until the hold ends
+  (at most 24h ahead), with any policy (a timeout, `hour-end` or `pause/down --at-hour-end`). After
+  that the normal rules apply again, counted from the last real activity, so an idle server is
+  stopped at the next check (with `hour-end`, in the window before the next billing hour) instead
+  of after another full timeout. `touch NAME --clear` ends the hold early. `status`, `touch`,
+  `idle-check` and `autostop status` show when it ends (`hold_until` in `--json`). The hold belongs
+  to the server, so a restored server starts without one.
 - Running work is never interrupted. Before acting, `idle-check` asks the server whether a
   foreground `exec` is still running (every `exec` runs in its own `devbox-exec-*` scope) or a
   background job started with `exec --detach --keep-alive` is active, and leaves the server alone if

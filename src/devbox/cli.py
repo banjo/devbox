@@ -1064,13 +1064,18 @@ def idle_info(ctx: Context, server, now: datetime) -> dict:
     `policy` is "timeout" (idle for a fixed time), "hour-end" (idle, then just
     before the next billing hour), "requested" (`pause/down --at-hour-end`) or
     "off". `remaining_seconds` is the time until the stop is due (<= 0: due
-    now), or None when nothing will stop the server.
+    now), or None when nothing will stop the server. A hold (`touch --for`)
+    moves the earliest stop to its end; after that the normal rules apply,
+    counted from the last real activity.
     """
     project = db.get_project(ctx.conn, server["project"])
     setting, timeout = project_idle_timeout(ctx, project)
     last = db.last_activity(ctx.conn, server)
     idle = now - last
     created = costs.parse_ts(server["created_at"])
+    hold = costs.parse_ts(server["hold_until"]) if server["hold_until"] else None
+    if hold is not None and hold <= now:
+        hold = None
     info = {
         "last_activity": last.isoformat(timespec="seconds"),
         "idle_seconds": int(idle.total_seconds()),
@@ -1081,6 +1086,7 @@ def idle_info(ctx: Context, server, now: datetime) -> dict:
         "planned_at": None,
         "remaining_seconds": None,
         "missed_boundary": None,
+        "hold_until": hold.isoformat(timespec="seconds") if hold else None,
     }
     if server["stop_action"]:
         info.update(policy="requested", planned_action=server["stop_action"])
@@ -1091,9 +1097,12 @@ def idle_info(ctx: Context, server, now: datetime) -> dict:
     elif timeout is None:
         return info
     else:
-        info.update(policy="timeout", planned_at=(last + timeout).isoformat(timespec="seconds"),
-                    remaining_seconds=int((timeout - idle).total_seconds()))
+        due = max(last + timeout, hold) if hold else last + timeout
+        info.update(policy="timeout", planned_at=due.isoformat(timespec="seconds"),
+                    remaining_seconds=int((due - now).total_seconds()))
         return info
+    if hold:
+        ready = max(ready, hold)
     action_time = billing.action_time(ctx.cfg.state_dir, info["planned_action"])
     margin = config.parse_duration(ctx.cfg.billing_margin)
     interval = timedelta(minutes=ctx.check_interval())
@@ -1197,6 +1206,9 @@ def print_idle_check(ctx: Context, results: list[dict]) -> None:
         elif e["action"] is None:
             if e["remaining_seconds"] is None:
                 lines.append(f"{e['project']}: idle {idle}, idle shutdown off")
+            elif e["hold_until"]:
+                lines.append(f"{e['project']}: idle {idle} ({limit}), held until {clock(e['hold_until'])}; "
+                             f"{e['planned_action']} at {clock(e['planned_at'])} at the earliest")
             elif hourly:
                 lines.append(f"{e['project']}: idle {idle} ({limit}), "
                              f"{e['planned_action']} at about {clock(e['planned_at'])}")
@@ -1316,6 +1328,8 @@ def cmd_autostop_status(ctx: Context) -> int:
             lines.append(f"{s['project']}: idle {costs.duration(s['idle_seconds'])}, idle shutdown off")
             continue
         when = f"first check {local(s['first_check'])}" if s["first_check"] else "but nothing will act on it"
+        if s["hold_until"]:
+            when = f"held until {local(s['hold_until'])}, {when}"
         if s["policy"] == "timeout":
             lines.append(f"{s['project']}: idle {costs.duration(s['idle_seconds'])} of {s['idle_timeout']}, "
                          f"eligible {local(s['eligible_at'])}, {when}")
@@ -1345,10 +1359,28 @@ def cmd_autostop_status(ctx: Context) -> int:
     return 0 if data["healthy"] else 1
 
 
+MAX_HOLD = timedelta(hours=24)
+
+
+def parse_hold(value: str) -> timedelta:
+    hold = config.parse_duration(value)
+    if hold is None or hold <= timedelta(0) or hold > MAX_HOLD:
+        raise DevboxError(f"invalid hold '{value}': use a duration up to 24h, like 30m or 2h")
+    return hold
+
+
 def cmd_touch(ctx: Context) -> int:
+    if ctx.args.hold and ctx.args.clear:
+        raise DevboxError("use either --for or --clear")
+    hold = parse_hold(ctx.args.hold) if ctx.args.hold else None
     server = ctx.running_server(ctx.args.name)
+    now = datetime.now(timezone.utc)
+    if hold:
+        db.update_server(ctx.conn, server["id"], hold_until=(now + hold).isoformat(timespec="seconds"))
+    elif ctx.args.clear:
+        db.update_server(ctx.conn, server["id"], hold_until=None)
     ctx.event(server, "touch")
-    info = idle_info(ctx, server, datetime.now(timezone.utc))
+    info = idle_info(ctx, db.get_server(ctx.conn, server["id"]), now)
     left = info["remaining_seconds"]
     if left is None:
         when = "idle shutdown is off"
@@ -1357,7 +1389,11 @@ def cmd_touch(ctx: Context) -> int:
         when = f"without more activity the server is {verb} at about {clock(info['planned_at'])}"
     else:
         when = f"idle shutdown in {costs.duration(left)} without activity"
-    text = "activity recorded; " + when
+    if info["hold_until"]:
+        text = f"held until {clock(info['hold_until'])}: idle shutdown waits until then; " \
+               f"`devbox touch {ctx.args.name} --clear` ends it early. After the hold: {when}"
+    else:
+        text = ("hold cleared; " if ctx.args.clear else "activity recorded; ") + when
     emit(ctx.args, {"project": ctx.args.name, **info}, text)
     return 0
 
@@ -1425,6 +1461,8 @@ def cmd_status(ctx: Context) -> int:
         lines.append(f"  cost: {cost_line(e['usage'], s)}")
         idle = e["idle"]
         idle_for = costs.duration(idle["idle_seconds"])
+        if idle["hold_until"] and idle["policy"] != "off":
+            lines.append(f"  held until {clock(idle['hold_until'])} (`devbox touch {e['project']} --clear` ends it)")
         if idle["policy"] == "off":
             lines.append(f"  idle {idle_for} (idle shutdown off)")
         elif idle["policy"] == "timeout":
@@ -2365,6 +2403,9 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
 
     p = add("touch", cmd_touch, "record activity so idle shutdown waits")
     p.add_argument("name")
+    p.add_argument("--for", dest="hold", metavar="DURATION",
+                   help="hold: idle shutdown waits until this much time has passed (max 24h), e.g. while testing the preview")
+    p.add_argument("--clear", action="store_true", help="end a hold early")
 
     p = add("idle-check", cmd_idle_check, "pause or delete servers idle past their timeout (run from cron)")
     p.add_argument("--dry-run", action="store_true", help="only report what would happen")

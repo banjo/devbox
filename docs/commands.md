@@ -40,7 +40,8 @@ devbox status [NAME]                      servers, processes, preview URLs, cost
 devbox pause NAME                         snapshot the server, then delete it (= down --snapshot)
 devbox down NAME [--snapshot] [--dump]    delete the server (dumping databases first with --dump); prints cost and activity
     pause/down --at-hour-end                 keep the server until just before its next billing hour, then pause/delete it
-devbox touch NAME                         record activity so idle shutdown waits
+devbox touch NAME [--for D | --clear]     record activity so idle shutdown waits; --for 2h holds the server
+                                          until then (max 24h), --clear ends the hold
 devbox idle-check [--dry-run]             pause/delete servers idle past their timeout (for cron)
 devbox autostop enable|disable [--yes]    install/remove the cron entry for idle-check (shows the plan without --yes)
 devbox autostop status                    whether idle shutdown really runs, and when each server is checked

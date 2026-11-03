@@ -47,7 +47,7 @@ Nothing below has run against Hetzner yet. Check each step and fix what breaks.
 - Previews are public: anyone with the URL can open them.
 - The preview URL changes every time the tunnel restarts.
 - `down` without `--snapshot` loses everything that exists only on the server (database contents, files not synced back). `pause` keeps it in a snapshot.
-- Idle shutdown only sees devbox commands and running `exec`/keep-alive work, not people using the preview, and only runs when `idle-check` is scheduled.
+- Idle shutdown only sees devbox commands and running `exec`/keep-alive work, not people using the preview (hold the server with `touch --for` while testing), and only runs when `idle-check` is scheduled.
 - A restored server keeps the snapshot's disk size, so it can't move to a smaller server type.
 - Availability from Hetzner is an indicator, not a guarantee; `up` can still fail if a type sells out between listing and creating.
 - One server at a time unless `up --force`.

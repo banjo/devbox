@@ -120,6 +120,9 @@ MIGRATIONS = [
     ALTER TABLE servers ADD COLUMN ipv4_price_hourly REAL;
     ALTER TABLE servers ADD COLUMN ipv4_price_monthly REAL;
     """,
+    """
+    ALTER TABLE servers ADD COLUMN hold_until TEXT;
+    """,
 ]
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
@@ -457,7 +460,7 @@ _SERVER_FIELDS = {
     "ip", "server_type", "location", "status", "preview_port", "preview_url",
     "price_hourly", "price_monthly", "power", "setup_stage", "setup_error", "diagnostics",
     "stop_action", "stop_requested_at", "created_at", "host_key", "startup",
-    "ipv4_price_hourly", "ipv4_price_monthly",
+    "ipv4_price_hourly", "ipv4_price_monthly", "hold_until",
 }
 
 
