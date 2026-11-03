@@ -914,6 +914,7 @@ def server_summary(ctx: Context, server, snapshot=None, pruned=None) -> dict:
         "uptime_seconds": usage["seconds"],
         "billed_hours": usage["billed_hours"],
         "cost": usage["cost"],
+        "ipv4_cost": usage["ipv4_cost"],
         "currency": costs.CURRENCY,
         "activity": db.event_counts(ctx.conn, server["id"]),
         "snapshot": snap,
@@ -937,7 +938,9 @@ def summary_lines(summary: dict) -> list[str]:
     lines = [
         f"  {s['server_type']} in {s['location']}, up {costs.duration(summary['uptime_seconds'])} "
         f"({summary['billed_hours']} billed hours at {rate})",
-        f"  cost: {costs.money(summary['cost'])} (estimate, server only, incl. VAT)",
+        f"  cost: {costs.money(summary['cost'])} (estimate, "
+        + (f"server + {costs.money(summary['ipv4_cost'])} IPv4" if summary.get("ipv4_cost") else "server only")
+        + ", incl. VAT)",
     ]
     counts = summary["activity"]
     parts = [f"{counts[k]} {label}{'s' if counts[k] != 1 else ''}" for k, label in ACTIVITY_LABELS if counts.get(k)]
@@ -1671,8 +1674,9 @@ def cmd_costs(ctx: Context) -> int:
         )
     )
     lines = [f"{'KEY':<24} {'SERVERS':>7} {'SNAPS':>5} {'TIME':>8} {'HOURS':>6} {'COST':>9}"]
-    # Rows are shown in cents, apportioned so they add up to the total shown below.
-    _, cents = costs.apportion([g["cost"] for g in summary["groups"]], summary["total"], 2)
+    # Rows are rounded like the total below and apportioned so they add up to it.
+    _, cents = costs.apportion([g["cost"] for g in summary["groups"]], summary["total"],
+                               costs.money_digits(summary["total"]))
     for g, row_cents in zip(summary["groups"], cents):
         cost = costs.money(row_cents) + ("*" if g["unknown_price"] else "")
         lines.append(

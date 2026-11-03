@@ -1,7 +1,7 @@
 """Tests for issue #36: the primary IPv4 price in every cost."""
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -96,3 +96,26 @@ def test_hcloud_reads_ipv4_prices_from_the_pricing_api():
     assert hc.snapshot_price_per_gb_month() == 0.0143
     hc._pricing = None
     assert hc.ipv4_prices() == {} and hc.snapshot_price_per_gb_month() is None
+
+
+# #40: the IPv4 share in the human output
+
+
+def test_money_shows_tenths_of_a_cent_only_when_cents_hide_them():
+    assert costs.money(0.002) == "€0.002" and costs.money(0.013) == "€0.013"
+    assert costs.money(0.01) == "€0.01" and costs.money(0.0) == "€0.00"
+    assert costs.money(1.2345) == "€1.23" and costs.money(None) == "€?"
+
+
+def test_pause_and_costs_show_the_ipv4_share(capsys, isolated, cloud):
+    cloud.ipv4 = IPV4
+    run(capsys, "project", "add", "crm", "--path", str(isolated / "crm"))
+    run(capsys, "up", "crm", "--type", "cx23", "--location", "fsn1")
+    c = conn()
+    c.execute("UPDATE servers SET created_at = ?",
+              ((datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat(),))
+    c.commit()
+    code, out, _ = run(capsys, "costs")
+    assert "€0.001 for IPv4" in out
+    code, out, _ = run(capsys, "pause", "crm")
+    assert "(estimate, server + €0.001 IPv4, incl. VAT)" in out and "server only" not in out

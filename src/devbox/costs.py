@@ -399,8 +399,13 @@ def resolve_period(
     return start, end
 
 
+def money_digits(value: float) -> int:
+    """Cents, or tenths of a cent for small amounts cents would hide (one IPv4 hour is €0.001)."""
+    return 3 if 0 < abs(value) < 0.10 and round(value, 2) != round(value, 3) else 2
+
+
 def money(value: float | None) -> str:
-    return "€?" if value is None else f"€{value:.2f}"
+    return "€?" if value is None else f"€{value:.{money_digits(value)}f}"
 
 
 def hours(value: float) -> str:

@@ -12,11 +12,14 @@ to get the most out of each billing hour.
   billed on top, per started hour and capped at its own monthly price; `up` stores that price for
   the server's location from Hetzner's pricing API (`ipv4_price_monthly` in the config is the
   fallback). Every cost (`status`, `down`, `history`, `costs`, the budget) includes it, and
-  `costs --json` shows it as `ipv4_cost`/`ipv4_total`. Prices include VAT; traffic is not included.
+  `costs --json` shows it as `ipv4_cost`/`ipv4_total`. `pause`/`down` print it as
+  `server + €0.001 IPv4`, `costs` as `€0.002 for IPv4`. Prices include VAT; traffic is not included.
+- Amounts are printed in cents, except amounts under €0.10 that cents would hide: those get a third
+  decimal (`€0.013`, not `€0.01`).
 - Reports compute each month's cost once and spread it evenly over the time the server ran that
   month. A period or a day/month row gets its share, so rows always add up to the total and adjacent
   periods add up to the combined period (billed hours in a partial period can be fractional).
-  Rounded rows (6 decimals in JSON, cents in the table, 2 decimals for hours) are adjusted with the
+  Rounded rows (6 decimals in JSON, the table like its total, 2 decimals for hours) are adjusted with the
   largest-remainder method so they still add up exactly to the rounded total. `costs` rejects
   impossible or empty dates, `--days` outside 1–36500, and periods where `--until` is not after the
   start.

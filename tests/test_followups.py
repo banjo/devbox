@@ -249,7 +249,7 @@ def test_cancelled_hour_end_stop_is_a_reuse_and_costs_shows_the_saving(capsys, i
     c = conn()
     c.execute("UPDATE servers SET price_hourly = 0.0123")
     code, out, _ = run(capsys, "costs")
-    assert "reused a paid hour 1 time instead of starting a new server" in out and "~€0.01 saved" in out
+    assert "reused a paid hour 1 time instead of starting a new server" in out and "~€0.012 saved" in out
     code, out, _ = run(capsys, "costs", "--json")
     assert json.loads(out)["reuse"] == {"count": 1, "saved": pytest.approx(0.0123)}
     code, out, _ = run(capsys, "costs", "--since", "2000-01-01", "--until", "2001-01-01", "--json")
