@@ -36,9 +36,11 @@ costs around €0.01 an hour, and every server is capped at its monthly price. R
 - 🔑 Your own account: servers, SSH keys, firewalls and snapshots live in your Hetzner project
 - 📦 `devbox up` reuses the running server or creates one, from the latest snapshot if there is one
 - 🔁 Syncs exactly the files Git sees, once or on every save
-- 🧵 Commands, background processes, logs, port forwarding and public preview URLs
+- 🧵 Commands, background processes, logs, port forwarding and public preview URLs, which the app
+  can read from `$DEVBOX_PREVIEW_URL`
 - 🗄️ Dump and restore project databases (Postgres, SQLite)
-- 💤 Pauses idle servers to a snapshot, without stopping work that is still running
+- 💤 Pauses idle servers to a snapshot, without stopping work that is still running; `touch --for 2h`
+  holds a server while you test it
 - 🤖 `--json` on every command, made to be driven by an agent
 
 ## Getting started

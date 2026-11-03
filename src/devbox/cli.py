@@ -2416,7 +2416,7 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
                    help="keep the server until just before its next billing hour, then pause it (needs autostop)")
     p.set_defaults(snapshot=True)
 
-    p = add("touch", cmd_touch, "record activity so idle shutdown waits")
+    p = add("touch", cmd_touch, "record activity so idle shutdown waits, or hold the server (--for 2h)")
     p.add_argument("name")
     p.add_argument("--for", dest="hold", metavar="DURATION",
                    help="hold: idle shutdown waits until this much time has passed (max 24h), e.g. while testing the preview")
@@ -2454,7 +2454,7 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
     p.add_argument("name", nargs="?")
     p.add_argument("--limit", type=int, metavar="N", help="only the N most recent servers and snapshots")
 
-    p = add("costs", cmd_costs, "estimated server and snapshot costs for a period, grouped")
+    p = add("costs", cmd_costs, "estimated server, IPv4 and snapshot costs for a period, grouped")
     p.add_argument("--project", help="only this project")
     period = p.add_mutually_exclusive_group()
     period.add_argument("--month", metavar="YYYY-MM", help="one calendar month (UTC)")
@@ -2561,7 +2561,7 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
     p.add_argument("-f", "--follow", action="store_true")
     p.add_argument("-n", "--lines", type=int, default=200)
 
-    p = add("expose", cmd_expose, "open a public preview URL to a port on the server")
+    p = add("expose", cmd_expose, "open a public preview URL to a port on the server (also in $DEVBOX_PREVIEW_URL)")
     p.add_argument("name")
     p.add_argument("port", type=int)
     p.add_argument("--name", dest="preview", metavar="PREVIEW",

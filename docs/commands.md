@@ -32,7 +32,7 @@ devbox exec NAME --detach --name P [--keep-alive] -- CMD
 devbox ps NAME                            list background processes
 devbox logs NAME P [-f] [-n LINES]        output from process P
 devbox stop NAME P                        stop process P
-devbox expose NAME PORT                   public preview URL for PORT
+devbox expose NAME PORT                   public preview URL for PORT; the app finds it in $DEVBOX_PREVIEW_URL
     expose options: --name PREVIEW (several side by side), --protect (password), --wait-for /health, --quick
 devbox unexpose NAME [PREVIEW...]         close previews (all of them without names)
 devbox ssh NAME                           shell on the server
