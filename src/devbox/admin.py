@@ -141,10 +141,10 @@ def cloudflare_check(cfg) -> dict:
            "and put it in cloudflare_token_file")
     try:
         cf = previews.Cloudflare(cfg.cloudflare_token())
-        status = cf.verify_token()
+        zone = cf.zone(cfg.preview_domain)
+        status = cf.verify_token(zone["account"])
         if status != "active":
             return check("cloudflare", FAIL, f"the Cloudflare token is {status}", fix)
-        zone = cf.zone(cfg.preview_domain)
         cf.tunnels(zone["account"], previews.tunnel_name(cfg.get_controller_id(), ""))
     except DevboxError as e:
         return check("cloudflare", FAIL, str(e), fix)

@@ -176,8 +176,16 @@ class Cloudflare:
     def delete_record(self, zone: str, record_id: str) -> None:
         self._request("DELETE", f"/zones/{zone}/dns_records/{record_id}")
 
-    def verify_token(self) -> str:
-        return (self._request("GET", "/user/tokens/verify") or {}).get("status", "unknown")
+    def verify_token(self, account: str) -> str:
+        """Status of the token. User tokens are verified at /user, account tokens (`cfat…`) only at the
+        account; try the user endpoint first and fall back to the account."""
+        try:
+            return (self._request("GET", "/user/tokens/verify") or {}).get("status", "unknown")
+        except DevboxError as user_error:
+            try:
+                return (self._request("GET", f"/accounts/{account}/tokens/verify") or {}).get("status", "unknown")
+            except DevboxError:
+                raise user_error
 
     def tunnel_token(self, account: str, tunnel_id: str) -> str:
         return self._request("GET", f"/accounts/{account}/cfd_tunnel/{tunnel_id}/token")

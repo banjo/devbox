@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from devbox import admin, cli, config, db, previews
+from devbox import DevboxError, admin, cli, config, db, previews
 from devbox.remote import Remote
 from devbox.startup import Deadline, Progress, StageTimeout
 
@@ -96,9 +96,16 @@ class CleanupCloudflare(FakeCloudflare):
         super().__init__()
         self.deleted: list[str] = []
         self.token_status = "active"
+        self.account_token = False
 
     def _request(self, method, path, body=None, query=None):
         if path == "/user/tokens/verify":
+            if self.account_token:
+                raise DevboxError("Cloudflare API GET /user/tokens/verify failed: 1000: Invalid API Token")
+            return {"status": self.token_status}
+        if path == "/accounts/acc1/tokens/verify":
+            if not self.account_token:
+                raise DevboxError("Cloudflare API GET /accounts/acc1/tokens/verify failed: 1000: Invalid API Token")
             return {"status": self.token_status}
         if method == "GET" and path == "/accounts/acc1/cfd_tunnel" and "include_prefix" in query:
             return [{"id": tid, "name": name} for name, tid in self.tunnels.items()
@@ -166,6 +173,28 @@ def test_doctor_checks_cloudflare(capsys, isolated, cloud, cf2):
     )
     check = doctor_check(capsys)
     assert check["status"] == "warn" and "Advanced Certificate" in check["fix"]
+
+
+def test_doctor_accepts_an_account_token(capsys, isolated, cloud, cf2):
+    # #33: account tokens (cfat…) are only verifiable at /accounts/{id}/tokens/verify.
+    cf2.account_token = True
+    check = doctor_check(capsys)
+    assert check["status"] == "ok" and "token active" in check["detail"]
+
+    cf2.token_status = "disabled"
+    check = doctor_check(capsys)
+    assert check["status"] == "fail" and "disabled" in check["detail"]
+
+
+def test_doctor_reports_the_user_endpoint_error_for_a_bad_token(capsys, isolated, cloud, cf2, monkeypatch):
+    def invalid(self, method, path, body=None, query=None):
+        if path.endswith("/tokens/verify"):
+            raise DevboxError(f"Cloudflare API GET {path} failed: 1000: Invalid API Token")
+        return cf2._request(method, path, body, query)
+
+    monkeypatch.setattr(previews.Cloudflare, "_request", invalid)
+    check = doctor_check(capsys)
+    assert check["status"] == "fail" and "/user/tokens/verify" in check["detail"]
 
 
 def test_doctor_skips_cloudflare_without_preview_domain(capsys, isolated, cloud):
