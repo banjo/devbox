@@ -6,7 +6,7 @@
 </h1>
 
 <p align="center">
-  Disposable dev servers for coding agents, on your own <a href="https://www.hetzner.com/cloud">Hetzner</a> account, for about a cent an hour.
+  Disposable dev servers for coding agents, on your own cloud account, for about a cent an hour. Hetzner Cloud today.
 </p>
 
 <p align="center">
@@ -17,23 +17,23 @@
   <a href="skills/hetzner-devbox/SKILL.md"><b>Agent skill</b></a>
 </p>
 
-Your agent edits code on your machine. devbox starts a real server in your Hetzner Cloud project,
+Your agent edits code on your machine. devbox starts a real server in your own cloud project,
 copies the code there, and runs builds, tests, databases and dev servers on it. Your laptop stays
 light, and when the work is done the server is paused or deleted.
 
 There is no platform in between and no subscription. The servers, snapshots and API token are yours,
-and you pay Hetzner's hourly price directly: a small `cx` server with 2 vCPUs and 4 GB of memory
+and you pay the provider's hourly price directly. On Hetzner Cloud, a small `cx` server with 2 vCPUs and 4 GB of memory
 costs around €0.01 an hour, and every server is capped at its monthly price. Run
 `devbox server-types` to see the current prices.
 
 > [!NOTE]
-> devbox is a proof of concept. See [PLAN.md](PLAN.md).
+> devbox is early software. Hetzner Cloud is the only supported provider for now; see [#35](https://github.com/banjo/devbox/issues/35) and the [backlog](https://github.com/banjo/devbox/issues/41).
 
 ## Highlights
 
-- 💶 Pay Hetzner's hourly price with no markup. devbox tracks every server and snapshot, can stop at
+- 💶 Pay the provider's hourly price with no markup. devbox tracks every server and snapshot, can stop at
   a monthly budget, and uses the hour you already paid for before shutting down
-- 🔑 Your own account: servers, SSH keys, firewalls and snapshots live in your Hetzner project
+- 🔑 Your own account: servers, SSH keys, firewalls and snapshots live in your own cloud project
 - 📦 `devbox up` reuses the running server or creates one, from the latest snapshot if there is one
 - 🔁 Syncs exactly the files Git sees, once or on every save
 - 🧵 Commands, background processes, logs, port forwarding and public preview URLs, which the app
@@ -46,7 +46,7 @@ costs around €0.01 an hour, and every server is capped at its monthly price. R
 ## Getting started
 
 Install [`uv`](https://docs.astral.sh/uv/) and [`hcloud`](https://github.com/hetznercloud/cli), save
-a Hetzner API token, then install the CLI:
+a Hetzner Cloud API token, then install the CLI:
 
 ```sh
 git clone https://github.com/banjo/devbox && cd devbox
@@ -68,7 +68,7 @@ See [Installation](docs/installation.md) for the full setup, including the agent
 
 ## Documentation
 
-- [Installation](docs/installation.md): tools, Hetzner token, config and the agent skill
+- [Installation](docs/installation.md): tools, API token, config and the agent skill
 - [Commands](docs/commands.md): every command and the `--json` output
 - [How it works](docs/how-it-works.md): state, labels, server choice, sync and startup
 - [Development loop](docs/development-loop.md): watch mode, pulling files, port forwarding, secrets
@@ -78,6 +78,10 @@ See [Installation](docs/installation.md) for the full setup, including the agent
 - [Idle shutdown](docs/idle-shutdown.md): what counts as activity, and `devbox autostop`
 - [Costs](docs/costs.md): cost tracking, budgets and using the paid hour
 - [Housekeeping](docs/housekeeping.md): `doctor`, `cleanup` and `history`
+
+## License
+
+[MIT](LICENSE)
 
 ## Development
 
