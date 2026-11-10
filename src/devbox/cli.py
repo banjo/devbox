@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -524,6 +525,35 @@ def startup_limit(ctx: Context, project) -> tuple[str, float]:
     return value, limit.total_seconds()
 
 
+def check_server_limit(ctx: Context, name: str, others: list[str]) -> None:
+    """Refuse a new server when `max_servers` are already running, unless --additional."""
+    limit = ctx.cfg.max_servers
+    if limit is None or len(others) < limit or ctx.args.additional:
+        return
+    running = ", ".join(others)
+    count = f"{len(others)} devbox server{'s are' if len(others) != 1 else ' is'} running ({running})"
+    config_file = config.config_dir() / "config.toml"
+    options = [
+        {"action": "reuse",
+         "text": f"run the work on a running server instead: `devbox exec {others[0]} -- ...` "
+                 "(see `devbox status` for its load, memory and disk headroom)",
+         "command": f"devbox exec {others[0]} -- ..."},
+        {"action": "raise_limit",
+         "text": f"allow more servers: set max_servers = {len(others) + 1} (or 0 for no limit) in {config_file}",
+         "command": None},
+        {"action": "additional",
+         "text": f"start this one anyway, once: `devbox up {name} --additional`",
+         "command": f"devbox up {name} --additional"},
+    ]
+    lines = [f"{count} and max_servers is {limit}, so `up` won't create a server for {name}. Options:"]
+    lines += [f"  {i}. {o['text']}" for i, o in enumerate(options, 1)]
+    lines.append(f"Each server is billed separately. If you are finished with {others[0]}, "
+                 f"`devbox pause {others[0]}` frees its place and keeps it in a snapshot.")
+    raise DevboxError("\n".join(lines), code="server_limit", details={
+        "running": others, "max_servers": limit, "options": options,
+    })
+
+
 def cmd_up(ctx: Context) -> int:
     name = ctx.args.name
     project = db.require_project(ctx.conn, name)
@@ -553,6 +583,7 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
     offer = None
     snapshot = None
     warnings: list[str] = []
+    other_servers: list[str] = []
     hc = ctx.hcloud
 
     hc.stage = "prepare"
@@ -566,11 +597,8 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
             raise DevboxError(f"{name} has no snapshot to resume from; use `devbox up {name}`")
         others = [s["project"] for s in db.active_servers(ctx.conn)]
         others += [o["name"] for o in orphans]
-        if others and not ctx.args.force:
-            raise DevboxError(
-                f"another devbox server is running ({', '.join(others)}); "
-                "stop it with `devbox down` or pass --force"
-            )
+        check_server_limit(ctx, name, others)
+        other_servers = others
         warnings += check_budget(ctx)
         offer = choose_offer(ctx, name, snapshot)
         public_key = ensure_local_ssh_key(cfg.ssh_key)
@@ -670,6 +698,7 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
         "stages": stages,
         "preview_env": preview_env,
         "state": server_state,
+        "other_servers": other_servers,
     }
 
 
@@ -693,6 +722,7 @@ def report_up(ctx: Context, r: dict, deadline: "startup.Deadline") -> int:
         "stages": r["stages"],
         "preview_env": r["preview_env"],
         "cancelled_stop": r["cancelled_stop"],
+        "other_servers": r["other_servers"],
         "next": up_guidance(ctx, name, project["notes"], server, r["state"]),
     }
     verb = "powered on" if r["powered_on"] else "reusing"
@@ -711,6 +741,9 @@ def report_up(ctx: Context, r: dict, deadline: "startup.Deadline") -> int:
         text.append(f"  from snapshot taken {snapshot['created_at'][:16].replace('T', ' ')}")
     if r["cancelled_stop"]:
         text.append(f"  cancelled the {r['cancelled_stop']} planned for the end of the billing hour")
+    if r["other_servers"]:
+        text.append(f"  {len(r['other_servers']) + 1} servers running now (also {', '.join(r['other_servers'])}); "
+                    "each is billed separately")
     if r["secrets_written"]:
         text.append("  secrets written to " + ", ".join(f"{f} ({n} keys)" for f, n in r["secrets_written"].items()))
     text += [f"warning: {w}" for w in r["warnings"]]
@@ -1515,6 +1548,13 @@ def cmd_touch(ctx: Context) -> int:
     return 0
 
 
+def capacity_line(c: dict) -> str:
+    """`load 0.42 on 2 cores, 2.1 of 3.7 GB memory free, 28.3 of 38.1 GB disk free`"""
+    return (f"load {c['load']['5m']:.2f} on {c['cores']} core{'s' if c['cores'] != 1 else ''} (5 min avg), "
+            f"{c['memory_free_gb']:.1f} of {c['memory_gb']:.1f} GB memory free, "
+            f"{c['disk_free_gb']:.1f} of {c['disk_gb']:.1f} GB disk free")
+
+
 def cmd_status(ctx: Context) -> int:
     orphans = ctx.reconcile()
     if ctx.args.name:
@@ -1531,6 +1571,7 @@ def cmd_status(ctx: Context) -> int:
             "project": p["name"],
             "server": row(server),
             "processes": None,
+            "capacity": None,
             "snapshot": {**dict(snap), "monthly_cost": costs.snapshot_item(snap)["price_monthly"]} if snap else None,
         }
         if server:
@@ -1541,7 +1582,7 @@ def cmd_status(ctx: Context) -> int:
             entry["previews"] = [preview_dict(r) for r in db.previews(ctx.conn, server["id"])]
             if server["status"] == "running" and server["power"] not in POWERED_DOWN:
                 try:
-                    entry["processes"] = ctx.remote(server).list_units()
+                    entry["processes"], entry["capacity"] = ctx.remote(server).overview()
                 except DevboxError as e:
                     entry["processes_error"] = str(e)
         result.append(entry)
@@ -1576,6 +1617,8 @@ def cmd_status(ctx: Context) -> int:
                 lines.append(f"  diagnostics: {s['diagnostics']}")
             lines.append(f"  still billed: `devbox up {e['project']}` retries setup, `devbox down {e['project']}` deletes it")
         lines.append(f"  cost: {cost_line(e['usage'], s)}")
+        if e.get("capacity"):
+            lines.append(f"  capacity: {capacity_line(e['capacity'])}")
         idle = e["idle"]
         idle_for = costs.duration(idle["idle_seconds"])
         if idle["hold_until"] and idle["policy"] != "off":
@@ -2438,6 +2481,71 @@ def cmd_ssh(ctx: Context) -> int:
     os.execvp(cmd[0], cmd)
 
 
+DESCRIPTION = "Disposable dev servers for coding agents, on your own Hetzner Cloud account."
+DOCS_URL = "https://github.com/banjo/devbox/tree/main/docs"
+EXAMPLE_CONFIG_URL = "https://github.com/banjo/devbox/blob/main/examples/config.toml"
+# How `devbox --help` groups the commands. Every command must be in exactly one group.
+COMMAND_GROUPS = [
+    ("Projects", ["project"]),
+    ("Servers", ["server-types", "up", "resume", "status", "pause", "down", "touch"]),
+    ("Code and commands", ["sync", "pull", "exec", "ps", "logs", "stop", "forward", "ssh"]),
+    ("Previews", ["expose", "unexpose"]),
+    ("Data", ["secrets", "db", "snapshot"]),
+    ("Costs", ["costs", "history"]),
+    ("Idle shutdown", ["idle-check", "autostop"]),
+    ("Maintenance", ["doctor", "cleanup"]),
+]
+CONFIG_HELP = [
+    ("hcloud_token_file", "file with the Hetzner Cloud API token (or set HCLOUD_TOKEN)"),
+    ("server_type, location", "defaults for new servers (otherwise the project's last choice)"),
+    ("max_servers", "servers running at once before `up` refuses another (default 1, 0 = no limit)"),
+    ("idle_timeout, idle_action", "when idle servers are paused or deleted (default 8h, pause)"),
+    ("monthly_budget, budget_action", "monthly spending limit in EUR, warn or block"),
+    ("preview_domain", "stable preview URLs on your own domain"),
+]
+
+
+def describe(help: str) -> str:
+    """A command's one-line help as the description on its own --help page."""
+    return help[0].upper() + help[1:] + "."
+
+
+def help_columns(rows: list[tuple[str, str]], indent: int = 2, width: int | None = None) -> list[str]:
+    """`  name   text` rows, with text wrapped to the terminal and aligned under itself."""
+    width = width or max(len(name) for name, _ in rows) + 2
+    total = max(60, min(shutil.get_terminal_size().columns, 120) - 2)
+    lines = []
+    for name, text in rows:
+        lines += textwrap.wrap(text, width=total, initial_indent=" " * indent + f"{name:<{width}}",
+                               subsequent_indent=" " * (indent + width)) or [" " * indent + name]
+    return lines
+
+
+def command_list(helps: dict[str, str]) -> str:
+    grouped = [name for _, names in COMMAND_GROUPS for name in names]
+    if sorted(grouped) != sorted(helps):
+        raise AssertionError(f"COMMAND_GROUPS and the registered commands differ: {sorted(set(grouped) ^ set(helps))}")
+    lines = []
+    width = max(map(len, helps)) + 2
+    for title, names in COMMAND_GROUPS:
+        lines.append(f"{title.lower()}:")
+        lines += help_columns([(name, helps[name]) for name in names], width=width)
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def config_epilog() -> str:
+    lines = [f"config: {config.config_dir() / 'config.toml'}"]
+    lines += help_columns(CONFIG_HELP)
+    lines += [
+        f"  every setting: {EXAMPLE_CONFIG_URL}",
+        "",
+        f"docs: {DOCS_URL}",
+        "`devbox COMMAND --help` shows a command's options; every command accepts --json.",
+    ]
+    return "\n".join(lines)
+
+
 def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
     class Parser(argparse.ArgumentParser):
         # Subparsers are created with the same class, so usage errors are JSON at every level.
@@ -2451,51 +2559,78 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
     # SUPPRESS: the action is shared by every parser, and a real default would let
     # each subparser reset a `--json` given earlier. `main` fills in False.
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="JSON output")
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="JSON output (before or after the command)")
 
-    parser = Parser(
-        prog="devbox", description="Temporary Hetzner development servers.", parents=[common]
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser = Parser(prog="devbox", usage="devbox [-h] [--json] COMMAND ...", parents=[common],
+                    formatter_class=argparse.RawDescriptionHelpFormatter)
+    # The commands are listed in groups in the description instead of argparse's flat list.
+    sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND", help=argparse.SUPPRESS,
+                                prog="devbox")
+    helps: dict[str, str] = {}
+    nested: list[tuple[argparse.ArgumentParser, str, dict[str, str]]] = []
 
     def add(name, func, help, **kw):
-        p = sub.add_parser(name, help=help, parents=[common], **kw)
+        p = group(name, help, **kw)
         p.set_defaults(func=func)
         return p
 
-    proj = sub.add_parser("project", help="manage projects", parents=[common])
-    proj_sub = proj.add_subparsers(dest="project_command", required=True)
+    def group(name, help, **kw):
+        helps[name] = help
+        kw.setdefault("description", describe(help))
+        return sub.add_parser(name, help=help, parents=[common], **kw)
 
-    p = proj_sub.add_parser("add", help="register a project", parents=[common])
-    p.add_argument("name")
+    def subcommands(name, help, dest):
+        """A command with subcommands (`devbox db dump`), listed like the top-level commands."""
+        p = group(name, help, usage=f"devbox {name} [-h] [--json] COMMAND ...",
+                  formatter_class=argparse.RawDescriptionHelpFormatter)
+        children: dict[str, str] = {}
+        nested.append((p, help, children))
+        subs = p.add_subparsers(dest=dest, required=True, metavar="COMMAND", help=argparse.SUPPRESS,
+                                prog=f"devbox {name}")
+        subs.children = children
+        return subs
+
+    def add_sub(subs, name, func, help, **kw):
+        subs.children[name] = help
+        kw.setdefault("description", describe(help))
+        p = subs.add_parser(name, help=help, parents=[common], **kw)
+        p.set_defaults(func=func)
+        return p
+
+    def project_arg(p, optional=False):
+        if optional:
+            p.add_argument("name", nargs="?", help="project name (default: all projects)")
+        else:
+            p.add_argument("name", help="project name")
+
+    proj_sub = subcommands("project", "register projects and keep notes on how to run them", "project_command")
+
+    p = add_sub(proj_sub, "add", cmd_project_add, "register a project")
+    project_arg(p)
     p.add_argument("--path", required=True, help="local project folder")
-    p.set_defaults(func=cmd_project_add)
 
-    p = proj_sub.add_parser("list", help="list projects", parents=[common])
-    p.set_defaults(func=cmd_project_list)
+    add_sub(proj_sub, "list", cmd_project_list, "list projects")
 
-    p = proj_sub.add_parser("notes", help="show or replace a project's notes", parents=[common])
-    p.add_argument("name")
-    group = p.add_mutually_exclusive_group()
-    group.add_argument("--set", metavar="TEXT")
-    group.add_argument("--set-file", metavar="FILE", help="read notes from FILE ('-' for stdin)")
-    p.set_defaults(func=cmd_project_notes)
+    p = add_sub(proj_sub, "notes", cmd_project_notes, "show or replace a project's notes")
+    project_arg(p)
+    notes = p.add_mutually_exclusive_group()
+    notes.add_argument("--set", metavar="TEXT", help="replace the notes with TEXT")
+    notes.add_argument("--set-file", metavar="FILE", help="replace the notes with FILE ('-' for stdin)")
 
-    p = proj_sub.add_parser("set", help="change project settings", parents=[common])
-    p.add_argument("name")
+    p = add_sub(proj_sub, "set", cmd_project_set, "change project settings")
+    project_arg(p)
     p.add_argument("--idle-timeout", metavar="DURATION",
                    help="e.g. 2h, 1d, off, hour-end (stop before the next billing hour), or 'default'")
     p.add_argument("--startup-timeout", metavar="DURATION", help="deadline for `up`, e.g. 10m, or 'default'")
-    p.set_defaults(func=cmd_project_set)
 
-    p = proj_sub.add_parser("remove", help="hide a project (cost history is kept)", parents=[common])
-    p.add_argument("name")
-    p.set_defaults(func=cmd_project_remove)
+    p = add_sub(proj_sub, "remove", cmd_project_remove, "hide a project (cost history is kept)")
+    project_arg(p)
 
     p = add("server-types", cmd_server_types, "list server types that can be ordered, cheapest first")
-    p.add_argument("--min-cores", type=int, metavar="N")
-    p.add_argument("--min-memory", type=float, metavar="GB")
-    p.add_argument("--arch", choices=["x86", "arm"])
+    p.add_argument("--min-cores", type=int, metavar="N", help="at least N vCPUs")
+    p.add_argument("--min-memory", type=float, metavar="GB", help="at least this much memory")
+    p.add_argument("--arch", choices=["x86", "arm"], help="CPU architecture")
     p.add_argument("--location", help="e.g. fsn1, nbg1, hel1, ash, hil, sin")
     p.add_argument("--zone", help="network zone, e.g. eu-central, us-east, us-west, ap-southeast")
     p.add_argument("--all", action="store_true", help="include types that are currently unavailable")
@@ -2504,11 +2639,13 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
         ("up", "create (restoring the latest snapshot, if any) or reuse the server, and sync code", False),
         ("resume", "like up, but only from a snapshot", True),
     ]:
-        p = add(name, cmd_up, help)
-        p.add_argument("name")
+        p = add(name, cmd_up, help, epilog=f"Defaults such as max_servers, server_type and startup_timeout are set in "
+                                            f"{config.config_dir() / 'config.toml'}.")
+        project_arg(p)
         p.add_argument("--type", help="server type for a new server (default: last used)")
         p.add_argument("--location", help="location for a new server (default: last used)")
-        p.add_argument("--force", action="store_true", help="allow a second devbox server")
+        p.add_argument("--additional", "--force", dest="additional", action="store_true",
+                       help="create a server even if max_servers are already running (this run only)")
         p.add_argument("--over-budget", action="store_true", help="create even if the monthly budget is used up")
         p.add_argument("--startup-timeout", metavar="DURATION", help="deadline for the whole startup, e.g. 5m (default from config/project)")
         p.add_argument("--cleanup-on-failure", action="store_true",
@@ -2517,8 +2654,18 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
         if not require_snapshot:
             p.add_argument("--fresh", action="store_true", help="ignore snapshots and start from a clean image")
 
+    p = add("status", cmd_status, "show servers, processes, capacity headroom, preview URLs and cost so far")
+    project_arg(p, optional=True)
+
+    p = add("pause", cmd_down, "snapshot the server, then delete it; `up` restores it")
+    project_arg(p)
+    p.add_argument("--dump", action="store_true", help="also dump all project databases locally first")
+    p.add_argument("--at-hour-end", action="store_true",
+                   help="keep the server until just before its next billing hour, then pause it (needs autostop)")
+    p.set_defaults(snapshot=True)
+
     p = add("down", cmd_down, "delete the server")
-    p.add_argument("name")
+    project_arg(p)
     p.add_argument("--snapshot", action="store_true", help="snapshot the server first (same as pause)")
     p.add_argument("--dump", action="store_true", help="dump all project databases locally first")
     p.add_argument("--no-dump", action="store_true",
@@ -2526,133 +2673,29 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
     p.add_argument("--at-hour-end", action="store_true",
                    help="keep the server until just before its next billing hour, then delete it (needs autostop)")
 
-    p = add("pause", cmd_down, "snapshot the server, then delete it; `up` restores it")
-    p.add_argument("name")
-    p.add_argument("--dump", action="store_true", help="also dump all project databases locally first")
-    p.add_argument("--at-hour-end", action="store_true",
-                   help="keep the server until just before its next billing hour, then pause it (needs autostop)")
-    p.set_defaults(snapshot=True)
-
     p = add("touch", cmd_touch, "record activity so idle shutdown waits, or hold the server (--for 2h)")
-    p.add_argument("name")
+    project_arg(p)
     p.add_argument("--for", dest="hold", metavar="DURATION",
                    help="hold: idle shutdown waits until this much time has passed (max 24h), e.g. while testing the preview")
     p.add_argument("--clear", action="store_true", help="end a hold early")
 
-    p = add("idle-check", cmd_idle_check, "pause or delete servers idle past their timeout (run from cron)")
-    p.add_argument("--dry-run", action="store_true", help="only report what would happen")
-
-    auto = sub.add_parser("autostop", help="schedule idle-check with cron and check that it runs", parents=[common])
-    auto_sub = auto.add_subparsers(dest="autostop_command", required=True)
-    p = auto_sub.add_parser("enable", help="show, then with --yes test and install, the cron entry", parents=[common])
-    p.add_argument("--yes", action="store_true", help="test-run the scheduled command and install it")
-    p.set_defaults(func=cmd_autostop_enable)
-    p = auto_sub.add_parser("status", help="schedule health, coverage and when servers will be checked", parents=[common])
-    p.set_defaults(func=cmd_autostop_status)
-    p = auto_sub.add_parser("disable", help="show, then with --yes remove, this config's cron entry", parents=[common])
-    p.add_argument("--yes", action="store_true", help="really remove the cron entry")
-    p.set_defaults(func=cmd_autostop_disable)
-
-    snap = sub.add_parser("snapshot", help="manage snapshots", parents=[common])
-    snap_sub = snap.add_subparsers(dest="snapshot_command", required=True)
-    p = snap_sub.add_parser("list", help="list snapshots and their cost", parents=[common])
-    p.add_argument("name", nargs="?")
-    p.set_defaults(func=cmd_snapshot_list)
-    p = snap_sub.add_parser("delete", help="delete a snapshot", parents=[common])
-    p.add_argument("image_id", type=int)
-    p.set_defaults(func=cmd_snapshot_delete)
-
-    p = add("doctor", cmd_doctor, "check config, tools, Hetzner access, SSH key, firewall and leftovers")
-
-    p = add("cleanup", cmd_cleanup, "list unused devbox resources; delete them with --yes")
-    p.add_argument("--yes", action="store_true", help="really delete the listed resources")
-
-    p = add("history", cmd_history, "past servers and snapshots with dates, cost and activity")
-    p.add_argument("name", nargs="?")
-    p.add_argument("--limit", type=int, metavar="N", help="only the N most recent servers and snapshots")
-
-    p = add("costs", cmd_costs, "estimated server, IPv4 and snapshot costs for a period, grouped")
-    p.add_argument("--project", help="only this project")
-    period = p.add_mutually_exclusive_group()
-    period.add_argument("--month", metavar="YYYY-MM", help="one calendar month (UTC)")
-    period.add_argument("--days", metavar="N", help="the last N days (1 or more)")
-    period.add_argument("--since", metavar="YYYY-MM-DD", help="from this day (UTC)")
-    p.add_argument("--until", metavar="YYYY-MM-DD", help="up to, not including, this day")
-    p.add_argument("--by", choices=costs.GROUPINGS, default="project", help="grouping (default: project)")
-
-    p = add("status", cmd_status, "show servers, processes, preview URLs and cost so far")
-    p.add_argument("name", nargs="?")
-
     p = add("sync", cmd_sync, "copy local code to the server")
-    p.add_argument("name")
+    project_arg(p)
     p.add_argument("--watch", action="store_true", help="keep running and sync whenever local files change")
     p.add_argument("--interval", type=float, default=1.0, metavar="SECONDS", help="how often --watch checks (default 1)")
 
     p = add("pull", cmd_pull, "copy files that differ on the server into a local staging folder for review")
-    p.add_argument("name")
+    project_arg(p)
     p.add_argument("paths", nargs="*", help="only these files or folders (Git-ignored ones included)")
     p.add_argument("--all", action="store_true", help="include files Git ignores (dependencies are still skipped)")
-
-    p = add("forward", cmd_forward, "forward local ports to ports on the server until Ctrl-C")
-    p.add_argument("name")
-    p.add_argument("ports", nargs="+", metavar="PORT", help="REMOTE or LOCAL:REMOTE, e.g. 5432 or 15432:5432")
-
-    sec = sub.add_parser("secrets", help="env values stored locally and written to the server", parents=[common])
-    sec_sub = sec.add_subparsers(dest="secrets_command", required=True)
-    p = sec_sub.add_parser("set", help="store KEY=VALUE pairs (written to the server now and on every up)", parents=[common])
-    p.add_argument("name")
-    p.add_argument("assignments", nargs="*", metavar="KEY=VALUE")
-    p.add_argument("--file", default=envsecrets.DEFAULT_FILE, help="env file in the project (default .env)")
-    p.add_argument("--from-file", metavar="PATH", help="read KEY=VALUE lines from a .env file ('-' for stdin)")
-    p.add_argument("--no-push", action="store_true", help="only store; don't write to a running server")
-    p.set_defaults(func=cmd_secrets_set)
-    p = sec_sub.add_parser("list", help="show stored key names (never values)", parents=[common])
-    p.add_argument("name")
-    p.set_defaults(func=cmd_secrets_list)
-    p = sec_sub.add_parser("unset", help="forget stored keys", parents=[common])
-    p.add_argument("name")
-    p.add_argument("keys", nargs="+", metavar="KEY")
-    p.add_argument("--file", default=envsecrets.DEFAULT_FILE)
-    p.set_defaults(func=cmd_secrets_unset)
-    p = sec_sub.add_parser("push", help="write stored secrets to the running server", parents=[common])
-    p.add_argument("name")
-    p.set_defaults(func=cmd_secrets_push)
-
-    dbp = sub.add_parser("db", help="database dumps and restores", parents=[common])
-    db_sub = dbp.add_subparsers(dest="db_command", required=True)
-    p = db_sub.add_parser("engines", help="supported engines and their options", parents=[common])
-    p.set_defaults(func=cmd_db_engines)
-    p = db_sub.add_parser("add", help="describe a project database", parents=[common])
-    p.add_argument("name")
-    p.add_argument("database", help="a short name for this database, e.g. main")
-    p.add_argument("--engine", required=True, choices=sorted(databases.ENGINES))
-    p.add_argument("--option", action="append", metavar="KEY=VALUE", help="engine option (see `devbox db engines`)")
-    p.set_defaults(func=cmd_db_add)
-    p = db_sub.add_parser("list", help="project databases and their latest dumps", parents=[common])
-    p.add_argument("name")
-    p.set_defaults(func=cmd_db_list)
-    p = db_sub.add_parser("remove", help="forget a database (dump files are kept)", parents=[common])
-    p.add_argument("name")
-    p.add_argument("database")
-    p.set_defaults(func=cmd_db_remove)
-    p = db_sub.add_parser("dump", help="dump a database from the server to a local file", parents=[common])
-    p.add_argument("name")
-    p.add_argument("database", nargs="?")
-    p.add_argument("--output", "-o", metavar="FILE", help="default: ~/.local/state/devbox/dumps/NAME/")
-    p.set_defaults(func=cmd_db_dump)
-    p = db_sub.add_parser("restore", help="replace a database on the server with a dump", parents=[common])
-    p.add_argument("name")
-    p.add_argument("database", nargs="?")
-    p.add_argument("--file", metavar="FILE", help="default: the latest dump of this database")
-    p.add_argument("--yes", action="store_true", help="confirm replacing the data")
-    p.set_defaults(func=cmd_db_restore)
 
     p = add(
         "exec", cmd_exec, "run a command on the server",
         description="Run a command in /srv/app. A single argument is run as a shell script; "
         "several arguments are quoted as one command.",
+        epilog="usage: devbox exec NAME [--detach --name PROC] -- CMD...",
     )
-    p.add_argument("name")
+    project_arg(p)
     p.add_argument("--detach", action="store_true", help="run in the background as a named process")
     p.add_argument("--name", dest="proc", metavar="PROC", help="process name for --detach")
     p.add_argument(
@@ -2663,24 +2706,30 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
         "--timeout", type=float, metavar="SECONDS",
         help="stop the command on the server after this many seconds (foreground only; exit code 124)",
     )
-    p.epilog = "usage: devbox exec NAME [--detach --name PROC] -- CMD..."
 
     p = add("ps", cmd_ps, "list background processes")
-    p.add_argument("name")
-
-    p = add("stop", cmd_stop, "stop a background process")
-    p.add_argument("name")
-    p.add_argument("proc")
+    project_arg(p)
 
     p = add("logs", cmd_logs, "show output from a background process")
-    p.add_argument("name")
-    p.add_argument("proc")
-    p.add_argument("-f", "--follow", action="store_true")
-    p.add_argument("-n", "--lines", type=int, default=200)
+    project_arg(p)
+    p.add_argument("proc", help="background process name (see `devbox ps`)")
+    p.add_argument("-f", "--follow", action="store_true", help="keep printing new output until Ctrl-C")
+    p.add_argument("-n", "--lines", type=int, default=200, help="how many recent lines to show (default 200)")
+
+    p = add("stop", cmd_stop, "stop a background process")
+    project_arg(p)
+    p.add_argument("proc", help="background process name (see `devbox ps`)")
+
+    p = add("forward", cmd_forward, "forward local ports to ports on the server until Ctrl-C")
+    project_arg(p)
+    p.add_argument("ports", nargs="+", metavar="PORT", help="REMOTE or LOCAL:REMOTE, e.g. 5432 or 15432:5432")
+
+    p = add("ssh", cmd_ssh, "open a shell on the server")
+    project_arg(p)
 
     p = add("expose", cmd_expose, "open a public preview URL to a port on the server (also in $DEVBOX_PREVIEW_URL)")
-    p.add_argument("name")
-    p.add_argument("port", type=int)
+    project_arg(p)
+    p.add_argument("port", type=int, help="port the app listens on, on the server")
     p.add_argument("--name", dest="preview", metavar="PREVIEW",
                    help="name of this preview, for several side by side (default: 'default')")
     p.add_argument("--wait-for", metavar="PATH", help="only open the preview once PATH answers 2xx/3xx")
@@ -2691,12 +2740,85 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
                    help="random trycloudflare.com URL even when preview_domain is set")
 
     p = add("unexpose", cmd_unexpose, "close previews (all, or the ones named)")
-    p.add_argument("name")
-    p.add_argument("preview", nargs="*")
+    project_arg(p)
+    p.add_argument("preview", nargs="*", help="preview names (default: all of the project's previews)")
 
-    p = add("ssh", cmd_ssh, "open a shell on the server")
-    p.add_argument("name")
+    sec_sub = subcommands("secrets", "env values stored locally and written to the server", "secrets_command")
+    p = add_sub(sec_sub, "set", cmd_secrets_set, "store KEY=VALUE pairs (written to the server now and on every up)")
+    project_arg(p)
+    p.add_argument("assignments", nargs="*", metavar="KEY=VALUE", help="values to store")
+    p.add_argument("--file", default=envsecrets.DEFAULT_FILE, help="env file in the project (default .env)")
+    p.add_argument("--from-file", metavar="PATH", help="read KEY=VALUE lines from a .env file ('-' for stdin)")
+    p.add_argument("--no-push", action="store_true", help="only store; don't write to a running server")
+    p = add_sub(sec_sub, "list", cmd_secrets_list, "show stored key names (never values)")
+    project_arg(p)
+    p = add_sub(sec_sub, "unset", cmd_secrets_unset, "forget stored keys")
+    project_arg(p)
+    p.add_argument("keys", nargs="+", metavar="KEY", help="key names to forget")
+    p.add_argument("--file", default=envsecrets.DEFAULT_FILE, help="env file in the project (default .env)")
+    p = add_sub(sec_sub, "push", cmd_secrets_push, "write stored secrets to the running server")
+    project_arg(p)
 
+    db_sub = subcommands("db", "describe project databases, dump and restore them", "db_command")
+    add_sub(db_sub, "engines", cmd_db_engines, "supported engines and their options")
+    p = add_sub(db_sub, "add", cmd_db_add, "describe a project database")
+    project_arg(p)
+    p.add_argument("database", help="a short name for this database, e.g. main")
+    p.add_argument("--engine", required=True, choices=sorted(databases.ENGINES), help="database engine")
+    p.add_argument("--option", action="append", metavar="KEY=VALUE", help="engine option (see `devbox db engines`)")
+    p = add_sub(db_sub, "list", cmd_db_list, "project databases and their latest dumps")
+    project_arg(p)
+    p = add_sub(db_sub, "remove", cmd_db_remove, "forget a database (dump files are kept)")
+    project_arg(p)
+    p.add_argument("database", help="database name (see `devbox db list`)")
+    p = add_sub(db_sub, "dump", cmd_db_dump, "dump a database from the server to a local file")
+    project_arg(p)
+    p.add_argument("database", nargs="?", help="database name (default: the project's only database)")
+    p.add_argument("--output", "-o", metavar="FILE", help="default: ~/.local/state/devbox/dumps/NAME/")
+    p = add_sub(db_sub, "restore", cmd_db_restore, "replace a database on the server with a dump")
+    project_arg(p)
+    p.add_argument("database", nargs="?", help="database name (default: the project's only database)")
+    p.add_argument("--file", metavar="FILE", help="default: the latest dump of this database")
+    p.add_argument("--yes", action="store_true", help="confirm replacing the data")
+
+    snap_sub = subcommands("snapshot", "list and delete snapshots", "snapshot_command")
+    p = add_sub(snap_sub, "list", cmd_snapshot_list, "list snapshots and their cost")
+    project_arg(p, optional=True)
+    p = add_sub(snap_sub, "delete", cmd_snapshot_delete, "delete a snapshot")
+    p.add_argument("image_id", type=int, help="snapshot image ID (see `devbox snapshot list`)")
+
+    p = add("costs", cmd_costs, "estimated server, IPv4 and snapshot costs for a period, grouped")
+    p.add_argument("--project", help="only this project")
+    period = p.add_mutually_exclusive_group()
+    period.add_argument("--month", metavar="YYYY-MM", help="one calendar month (UTC)")
+    period.add_argument("--days", metavar="N", help="the last N days (1 or more)")
+    period.add_argument("--since", metavar="YYYY-MM-DD", help="from this day (UTC)")
+    p.add_argument("--until", metavar="YYYY-MM-DD", help="up to, not including, this day")
+    p.add_argument("--by", choices=costs.GROUPINGS, default="project", help="grouping (default: project)")
+
+    p = add("history", cmd_history, "past servers and snapshots with dates, cost and activity")
+    project_arg(p, optional=True)
+    p.add_argument("--limit", type=int, metavar="N", help="only the N most recent servers and snapshots")
+
+    p = add("idle-check", cmd_idle_check, "pause or delete servers idle past their timeout (run from cron)")
+    p.add_argument("--dry-run", action="store_true", help="only report what would happen")
+
+    auto_sub = subcommands("autostop", "schedule idle-check with cron and check that it runs", "autostop_command")
+    p = add_sub(auto_sub, "enable", cmd_autostop_enable, "show, then with --yes test and install, the cron entry")
+    p.add_argument("--yes", action="store_true", help="test-run the scheduled command and install it")
+    add_sub(auto_sub, "status", cmd_autostop_status, "schedule health, coverage and when servers will be checked")
+    p = add_sub(auto_sub, "disable", cmd_autostop_disable, "show, then with --yes remove, this config's cron entry")
+    p.add_argument("--yes", action="store_true", help="really remove the cron entry")
+
+    add("doctor", cmd_doctor, "check config, tools, Hetzner access, SSH key, firewall, leftovers and scheduling")
+
+    p = add("cleanup", cmd_cleanup, "list unused devbox resources and stale local files; delete them with --yes")
+    p.add_argument("--yes", action="store_true", help="really delete the listed resources")
+
+    parser.description = f"{DESCRIPTION}\n\n{command_list(helps)}"
+    parser.epilog = config_epilog()
+    for p, help, children in nested:
+        p.description = "\n".join([describe(help), "", "commands:", *help_columns(list(children.items()))])
     return parser
 
 

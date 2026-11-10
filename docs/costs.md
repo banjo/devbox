@@ -77,7 +77,8 @@ just before the next hour starts and reuse it for the next job.
   says so and suggests `project set NAME --idle-timeout off` (`monthly_cap_hint` in
   `status --json`).
 - Run parallel jobs on one server (`exec --detach`) instead of starting a second one; each server
-  pays its own hours.
+  pays its own hours. When a second server is worth it, see
+  [Several servers](how-it-works.md#several-servers); `max_servers` keeps the count in check.
 - Use `down` instead of `pause` when nothing on the server needs to survive: no snapshot storage and
   no restore time.
 - `server-types` lists the cheapest first. Since June 2026 the `cpx` and `ccx` families cost 2–3

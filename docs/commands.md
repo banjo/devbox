@@ -1,5 +1,8 @@
 # Commands
 
+`devbox --help` lists the commands by group, with the main config settings; `devbox COMMAND --help`
+shows a command's options.
+
 ```text
 devbox project add NAME --path PATH       register a project
 devbox project list                       list projects
@@ -12,7 +15,8 @@ devbox server-types [filters]             server types that can be ordered now, 
 devbox up NAME [--type T --location L]    reuse the server, or create one (from the latest snapshot
                                           if there is one; --fresh for a clean image), sync code
 devbox resume NAME                        like up, but only from a snapshot
-    up/resume options: --startup-timeout 5m, --cleanup-on-failure, --fresh, --force, --over-budget
+    up/resume options: --startup-timeout 5m, --cleanup-on-failure, --fresh, --over-budget,
+                       --additional (create a server even if max_servers are running; once)
 devbox sync NAME [--watch]                copy local code to the server (keep syncing on save with --watch)
 devbox pull NAME [PATHS...] [--all]       copy files that differ on the server into a local staging folder
 devbox forward NAME PORT...               forward local ports to the server (PORT or LOCAL:REMOTE)
@@ -36,7 +40,7 @@ devbox expose NAME PORT                   public preview URL for PORT; the app f
     expose options: --name PREVIEW (several side by side), --protect (password), --wait-for /health, --quick
 devbox unexpose NAME [PREVIEW...]         close previews (all of them without names)
 devbox ssh NAME                           shell on the server
-devbox status [NAME]                      servers, processes, preview URLs, cost so far
+devbox status [NAME]                      servers, processes, capacity headroom, preview URLs, cost so far
 devbox pause NAME                         snapshot the server, then delete it (= down --snapshot)
 devbox down NAME [--snapshot] [--dump | --no-dump]
                                           delete the server (dumping databases first with --dump); prints cost and
@@ -62,3 +66,18 @@ All commands accept `--json`, before or after the command (`devbox --json status
 `code` where known; usage errors have `code: "usage"` and exit 2) and the exit code is nonzero.
 `exec` runs a single argument as a shell script (`devbox exec myapp -- 'npm ci && npm test'`) and
 quotes several arguments as one command.
+
+## Several servers
+
+Every project can have its own server. How many may run at once is `max_servers` in the config
+(default `1`, `0` for no limit):
+
+```toml
+max_servers = 3
+```
+
+When that many are running, `up` for another project refuses (`code: "server_limit"`) and suggests,
+in order: running the work on a server that is already up (`devbox exec OTHER`), raising
+`max_servers`, or `up NAME --additional` for one extra server this time. `devbox status` shows each
+server's load, free memory and free disk to help choose. See
+[How it works](how-it-works.md#several-servers).

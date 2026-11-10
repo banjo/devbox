@@ -78,6 +78,9 @@ class Config:
     # Monthly spending limit in EUR, and what `up` does when it is reached.
     monthly_budget: float | None = None
     budget_action: str = "warn"
+    # How many servers may run at once before `up` refuses to create another one.
+    # None means no limit (0 or "unlimited" in the config file).
+    max_servers: int | None = 1
     # Stable preview URLs: a named Cloudflare tunnel per project on this domain
     # (a zone in the Cloudflare account of the token). Unset: random quick-tunnel URLs.
     preview_domain: str | None = None
@@ -134,6 +137,15 @@ CONTROLLER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 DOMAIN_RE = re.compile(r"^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 
 
+def parse_max_servers(value, path: Path) -> int | None:
+    """A whole number of at least 1, or None for no limit (0 or "unlimited")."""
+    if isinstance(value, str) and value.strip().lower() == "unlimited":
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise DevboxError(f"{path}: max_servers must be a whole number (0 for no limit) or \"unlimited\"")
+    return value or None
+
+
 def load(path: Path | None = None) -> Config:
     path = path or config_dir() / "config.toml"
     cfg = Config()
@@ -157,6 +169,8 @@ def load(path: Path | None = None) -> Config:
             if not isinstance(value, int) or value < 1:
                 raise DevboxError(f"{path}: keep_snapshots must be a whole number of at least 1")
             cfg.keep_snapshots = value
+        elif key == "max_servers":
+            cfg.max_servers = parse_max_servers(value, path)
         elif key == "ssh_allow":
             if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
                 raise DevboxError(f"{path}: ssh_allow must be a list of strings")

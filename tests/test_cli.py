@@ -292,6 +292,9 @@ def cloud(monkeypatch):
         lambda self, path, manifest, timeout=None: {"mode": "git", "files": 1, "deleted": 0, "warning": None},
     )
     monkeypatch.setattr(cli.Remote, "list_units", lambda self: [])
+    # status reads processes and headroom in one call; the processes come from list_units.
+    fake.capacity = None
+    monkeypatch.setattr(cli.Remote, "overview", lambda self: (self.list_units(), fake.capacity))
     fake.files = {}
     monkeypatch.setattr(cli.Remote, "write_file",
                         lambda self, path, content, mode="600": fake.files.__setitem__(path, content))
