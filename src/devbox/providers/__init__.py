@@ -3,10 +3,11 @@
 from devbox import DevboxError
 from devbox.providers.base import Access, Capabilities, Provider, require  # noqa: F401
 from devbox.providers.hetzner import HetznerProvider
+from devbox.providers.ssh import SshProvider
 
 DEFAULT = "hetzner"
 
-_REGISTRY: dict[str, type] = {HetznerProvider.name: HetznerProvider}
+_REGISTRY: dict[str, type] = {HetznerProvider.name: HetznerProvider, SshProvider.name: SshProvider}
 
 
 def register(cls: type) -> type:
