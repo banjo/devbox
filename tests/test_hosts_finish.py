@@ -631,6 +631,12 @@ def test_a_server_that_is_also_a_registered_host_is_not_deleted_while_it_has_wor
         code, _, err = run(capsys, *argv)
         assert code == 1 and "also the registered host 'box'" in err and "crm" in err, argv
     assert db.active_server(db.connect(config.load().db_path), "blog") is not None
+    # idle shutdown skips it too, even when it is overdue
+    import argparse
+
+    ctx = cli.Context(argparse.Namespace())
+    skipped = cli.unsupported_idle_action(ctx, db.active_server(ctx.conn, "blog"), "pause")
+    assert skipped and "also the registered host 'box'" in skipped
     assert run(capsys, "down", "crm")[0] == 0
     assert run(capsys, "down", "blog", "--no-dump")[0] == 0
 

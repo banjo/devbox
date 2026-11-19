@@ -1495,6 +1495,10 @@ def unsupported_idle_action(ctx: Context, server, action: str) -> str | None:
         return f"its provider cannot delete servers, so it cannot {action}"
     if action == "pause" and not caps.has_snapshots:
         return "its provider has no snapshots, so it cannot pause"
+    try:
+        refuse_if_hosting_workspaces(ctx, server)
+    except DevboxError as e:
+        return str(e)
     return None
 
 
