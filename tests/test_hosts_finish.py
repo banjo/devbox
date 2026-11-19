@@ -633,3 +633,26 @@ def test_a_server_that_is_also_a_registered_host_is_not_deleted_while_it_has_wor
     assert db.active_server(db.connect(config.load().db_path), "blog") is not None
     assert run(capsys, "down", "crm")[0] == 0
     assert run(capsys, "down", "blog", "--no-dump")[0] == 0
+
+
+def test_host_remove_force_forgets_workspaces_of_a_host_that_is_gone(capsys, world):
+    add_host(capsys, world)
+    assert run(capsys, "up", "crm", "--host", "mini")[0] == 0
+    world.access = "none"  # the machine no longer answers incus
+    from devbox.providers.ssh import SshProvider
+
+    def gone(self, name):
+        raise DevboxError(f"ssh to host {name} failed")
+
+    original = SshProvider.ensure_host
+    SshProvider.ensure_host = gone
+    try:
+        code, _, err = run(capsys, "host", "remove", "mini")
+        assert code == 1 and "still has workspaces" in err
+        code, out, err = run(capsys, "host", "remove", "mini", "--force", "--json")
+    finally:
+        SshProvider.ensure_host = original
+    assert code == 0 and json.loads(out)["deleted_workspaces"] == ["crm"]
+    assert "unreachable" in err and "stay on the machine" in err
+    assert run(capsys, "host", "list")[1].startswith("no hosts")
+    assert db.active_server(db.connect(config.load().db_path), "crm") is None

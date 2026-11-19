@@ -83,7 +83,11 @@ only has to verify what is there. `up` reports `image_cache` (`published`, `hit`
 The hash covers the source image, `cloud-init.yaml`, devbox's setup and Docker-check scripts and the
 host's Incus version. When any of them change, the next `up` builds and publishes a new image and
 deletes the old one; a changed Incus version matters because a cached image may carry the runc workaround.
-If publishing fails, `up` continues and only the cache is missing. `devbox cleanup` lists images that no
+The image is published uncompressed: on a 16-core mini PC (dir storage) publishing a 1.4 GB workspace took
+about 26 s instead of 56 s with gzip, and launching from it 3 s instead of 11 s, at the cost of disk (about
+1.4 GB instead of 0.5 GB per host). The first `up` on a host therefore takes about 30 s longer than without
+the cache, and later ones are much faster. `up` skips publishing when less than 90 s of the startup limit are
+left. If publishing fails, `up` continues and only the cache is missing. `devbox cleanup` lists images that no
 longer match, and `host remove` deletes the image. devbox only lists and deletes images that carry its
 own properties and this install's controller id. Set `incus_image_cache = false` to turn it off.
 
@@ -94,10 +98,14 @@ not trust, `devbox up PROJECT --host NAME --isolate` (or `incus_isolate = true` 
 `--no-isolate` to override) sets `security.port_isolation=true` on the workspace's network card.
 Incus then marks its bridge port as isolated: isolated ports cannot exchange traffic with each other,
 while each can still reach the bridge itself (the host, DHCP, DNS) and the internet. A workspace that
-is not isolated can still talk to both kinds. It is off by default. Turning it on for an existing
-workspace changes the NIC; check the result with `devbox exec`. Port isolation affects the Layer 2
-bridge only. It does not change what the workspaces can reach on the host's own addresses, and it is not a
-replacement for a firewall on the host.
+is not isolated can still talk to both kinds. It is off by default. Turning it on or off for an existing
+workspace takes effect at once, without a restart. Port isolation affects the Layer 2 bridge only; it is not
+a replacement for a firewall on the host.
+
+Checked on Incus 6.0.0 (Ubuntu archive) and 7.6 (Zabbly): two workspaces on `incusbr0` could ping each other
+and reach each other's port 5173; after `--isolate` on both, ping and TCP between them failed, while each
+still had DNS, internet and (by ping) the gateway; an isolated and a non-isolated workspace could still talk;
+`--no-isolate` restored the traffic. The setting survived `pause` and `up`.
 
 ## Safety
 
@@ -112,6 +120,14 @@ no workspace in the registry uses; they are only deleted with `cleanup --yes`.
 
 `max_servers` limits billed servers. Workspaces on your own hosts do not count toward it, and
 `--additional` is not needed for them.
+
+## Several workspaces at once
+
+`up` commands take turns: they share one state lock, so starting three workspaces together runs the second
+and third after the first has finished (the startup limit only counts from the moment a command gets the
+lock). Each workspace uses 15 to 30 kernel keys from a quota that all containers on the host share
+(`kernel.keys.maxkeys`, default 200); about a dozen workspaces exhaust it and Docker fails with
+`disk quota exceeded`. `devbox host bootstrap` reports a low value ([Own hosts](hosts.md#bootstrap)).
 
 ## Known limits
 

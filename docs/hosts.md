@@ -50,7 +50,7 @@ What it checks and may do:
    `sudo -n`) and runs `incus admin init --minimal` (bridge `incusbr0`, `dir` storage) when it is
    missing or uninitialised.
 2. **A newer Incus (`--zabbly`)**: the archive ships Incus 6.0.x on Ubuntu 24.04. On it, current
-   Docker (runc 1.3 and newer) cannot start containers inside a workspace
+   Docker (docker-ce with runc 1.5) cannot start containers inside a workspace
    (`open sysctl net.ipv4.ip_unprivileged_port_start ... permission denied`). The plan flags versions
    older than 6.1 and says so. With `--zabbly`, the plan instead adds the
    [Zabbly](https://github.com/zabbly/incus) package repository
@@ -60,7 +60,10 @@ What it checks and may do:
    (`4EFC 5906 96CB 15B8 7C73 A3AD 82CC 8797 C838 DCFD`) before it is trusted; a different key is deleted
    and the step fails. This is never done automatically: it needs `--zabbly` **and** `--yes`, and
    `--yes` alone leaves Incus as it is. An upgrade restarts the Incus daemon on the host; the plan says
-   how many containers are running. A host whose Incus is already new enough is left alone.
+   how many containers are running. A host whose Incus is already new enough is left alone. Checked on a
+   Hetzner server: Incus 6.0.0 from the archive fails with runc 1.5.3 and needs the fallback; after
+   `--zabbly --yes` (about 50 s, running containers kept running) Incus 7.6 starts Docker containers with
+   the stock runc and no workaround. The Zabbly package also sets `kernel.keys.maxkeys=2000` (below).
    Without it, provisioning keeps its fallback: if Docker cannot start containers it registers runc
    1.2.3 as Docker's default runtime in that workspace, and `up` warns that a newer Incus avoids this.
 3. **Docker + UFW**: on a host with Docker, `FORWARD` is `DROP`, and UFW blocks the Incus bridge
@@ -69,14 +72,34 @@ What it checks and may do:
    `ufw route allow out on incusbr0`. It never edits Docker's own rules. If `FORWARD` is `DROP` but
    UFW is not active, bootstrap only reports it (a `manual:` line with the rules to add): the host's
    firewall is yours, and `--zabbly` or `--yes` never change that.
-4. **Access**: the SSH user needs to be in the `incus-admin` group or have passwordless `sudo -n`.
+4. **Kernel key quota** (report only): all unprivileged containers on a host share one kernel key quota
+   (`kernel.keys.maxkeys`, 200 by default). A workspace uses 15 to 30 keys depending on what runs in it;
+   when the quota is used up Docker fails with `unable to create session key: disk quota exceeded`
+   (seen on a host with 12 workspaces). The plan prints a `manual:` line when the value is below 1000;
+   devbox does not change kernel settings. The Zabbly Incus package raises it to 2000, and
+   `echo 'kernel.keys.maxkeys = 2000' | sudo tee /etc/sysctl.d/99-devbox-incus.conf && sudo sysctl --system`
+   does the same for the archive package.
+5. **Access**: the SSH user needs to be in the `incus-admin` group or have passwordless `sudo -n`.
    devbox uses the group when it can and `sudo -n incus` otherwise. If neither works, bootstrap
    says so and changes nothing. It never writes global files on the host except the Zabbly repository
    files above, and only when asked.
 
 `host remove` forgets the host. It refuses while workspaces exist; `--force` deletes the workspaces
 devbox created, and devbox's cached base image ([Workspaces](workspaces.md#base-image-cache)). It never
-touches the machine itself.
+touches the machine itself. If the machine can no longer be reached, `--force` still forgets the host and
+its workspaces in the registry (with a warning; any containers stay on the machine).
+
+## A Hetzner server as a host
+
+A server devbox created can also be registered as a host (`host add NAME --ssh root@IP --key ~/.ssh/devbox`),
+so one project runs on the server directly and others in containers on the same machine. Two things to know:
+
+- Such a server has Docker, so its `FORWARD` policy is `DROP` and UFW is not active: containers get DNS but
+  no other connectivity. Bootstrap prints the `manual:` rules (`iptables -I DOCKER-USER ...`); they were
+  checked to restore the network, and `up` fails after about a minute with a pointer to them instead of
+  waiting for a timeout.
+- `down` and `pause` of that server refuse while workspaces are registered on the same address, because
+  deleting or snapshotting the machine would destroy or freeze them. Remove the workspaces first.
 
 ## Where things are
 

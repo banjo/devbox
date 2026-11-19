@@ -2748,9 +2748,16 @@ def cmd_host_remove(ctx: Context) -> int:
                 raise DevboxError(
                     f"host {name} still has workspaces ({projects}): `devbox down PROJECT` removes each, or "
                     f"--force deletes them all now (the machine itself is never touched)")
-            incus_ = ctx.incus(ctx.ssh.ensure_host(name))
+            try:
+                incus_ = ctx.incus(ctx.ssh.ensure_host(name))
+            except DevboxError as e:
+                # The machine is gone or unreachable: --force still lets the registry forget it.
+                incus_ = None
+                print(f"warning: host {name} is unreachable ({e}); forgetting its workspaces without deleting "
+                      "their containers, which stay on the machine if it still exists", file=sys.stderr)
             for w in workspaces:
-                incus_.delete(w["provider_id"])
+                if incus_ is not None:
+                    incus_.delete(w["provider_id"])
                 ctx.event(w, "down")
                 db.mark_deleted(ctx.conn, w["id"])
                 ctx.known_hosts(w).unlink(missing_ok=True)
@@ -2758,6 +2765,8 @@ def cmd_host_remove(ctx: Context) -> int:
                 removed.append(w["project"])
         images = []
         try:  # the cached base images are devbox's own; they are of no use without the registry entry
+            if workspaces and incus_ is None:
+                raise DevboxError("host unreachable")
             inc = ctx.incus(ctx.ssh.ensure_host(name))
             for img in inc.base_images():
                 inc.delete_base_image(img["fingerprint"])
