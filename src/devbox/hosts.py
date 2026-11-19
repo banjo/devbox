@@ -361,9 +361,8 @@ def make_plan(host: str, facts: dict, zabbly: bool = False) -> Plan:
                              "sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y incus"]})
             plan.notes.append("the distribution's Incus is old (Ubuntu 24.04 ships 6.0.x); add --zabbly to install the "
                               "current release from the Zabbly repository instead")
-    if installed and version:
-        origin = "Zabbly repository" if facts.get("zabbly_repo") == "1" else "installed"
-        plan.notes.append(f"Incus {version} ({origin})")
+    if installed and version and not old_incus:
+        plan.notes.append(f"Incus {version}" + (" (Zabbly repository)" if facts.get("zabbly_repo") == "1" else ""))
     if old_incus and not zabbly:
         plan.notes.append(
             f"Incus {version} is older than {OLD_INCUS_BELOW[0]}.{OLD_INCUS_BELOW[1]}: Docker with a current runc cannot "

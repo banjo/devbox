@@ -2761,8 +2761,6 @@ def bootstrap_next(name: str, plan: "hosts.Plan", applied: bool, zabbly: bool) -
         flag = " --zabbly" if zabbly else ""
         return {"steps": [f"check the plan, then `devbox host bootstrap {name}{flag} --yes` applies it"]}
     steps = [f"`devbox up PROJECT --host {name}` starts a project in its own container on {name}"]
-    if applied or plan.notes:
-        steps.append(f"`devbox host list` shows the hosts and their workspaces")
     return {"steps": steps}
 
 
@@ -2849,6 +2847,10 @@ def bring_up_workspace(ctx: Context, project, host_name: str | None, deadline: "
     if container is not None and (container.get("config") or {}).get(incus.PROJECT) != name:
         raise DevboxError(f"container {cname} on host {host_name} belongs to another project; devbox does not reuse it")
     cpus, memory = workspace_limits(ctx)
+    if container is not None:  # an existing workspace keeps the limits it has unless --cpus/--memory say otherwise
+        current = incus.Incus.limits(container)
+        cpus = ctx.args.cpus or (int(current["cpus"]) if str(current["cpus"] or "").isdigit() else cpus)
+        memory = ctx.args.memory or current["memory"] or memory
     isolate = ctx.args.isolate if ctx.args.isolate is not None else (
         incus.Incus.isolated(container) if container is not None else cfg.incus_isolate)
     label = limits_label(cpus, memory, isolate)
@@ -2896,8 +2898,7 @@ def bring_up_workspace(ctx: Context, project, host_name: str | None, deadline: "
             inc.set_limits(cname, ctx.args.cpus, ctx.args.memory)
         if ctx.args.isolate is not None and ctx.args.isolate != inc.isolated(container):
             inc.set_isolation(cname, isolate)
-            warnings.append(f"network isolation {'on' if isolate else 'off'} for {cname}; it applies after the "
-                            f"container restarts (`devbox pause {name}`, then `devbox up {name}`)")
+            progress.say(f"Network isolation {'on' if isolate else 'off'} for {cname}")
         if (ctx.args.cpus or ctx.args.memory or ctx.args.isolate is not None) and label != server["server_type"]:
             db.update_server(ctx.conn, server["id"], server_type=label)
             progress.say(f"Workspace settings changed: {label.removeprefix('incus container, ')}")

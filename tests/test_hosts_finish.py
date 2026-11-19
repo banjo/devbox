@@ -354,10 +354,18 @@ def test_isolation_of_an_existing_workspace_can_be_changed(capsys, world):
     assert code == 0, err
     assert any(c[:4] == ["config", "device", "override", "devbox-crm"] for c in world.calls)
     assert incus.Incus.isolated(world.containers["devbox-crm"])
-    assert any("pause" in w for w in json.loads(out)["warnings"])
+    assert json.loads(out)["warnings"] == []  # the NIC change is live, nothing to restart
     assert "isolated" in run(capsys, "status", "crm")[1]
     run(capsys, "up", "crm", "--no-isolate")
     assert any(c[:3] == ["config", "device", "set"] for c in world.calls)  # the NIC is overridden now: set it
+
+
+def test_changing_isolation_keeps_the_workspace_limits(capsys, world):
+    add_host(capsys, world)
+    assert run(capsys, "up", "crm", "--host", "mini", "--cpus", "3", "--memory", "6GiB")[0] == 0
+    code, out, _ = run(capsys, "up", "crm", "--isolate")
+    assert code == 0 and "3 cpu, 6GiB, isolated" in run(capsys, "status", "crm")[1]
+    assert world.containers["devbox-crm"]["config"]["limits.memory"] == "6GiB"
 
 
 def test_isolate_needs_a_workspace_and_a_valid_config_value(capsys, world):
@@ -513,3 +521,24 @@ def test_up_on_a_host_returns_next_steps(capsys, world):
     code, out, _ = run(capsys, "up", "crm", "--host", "mini", "--json")
     nxt = json.loads(out)["next"]
     assert nxt["state"] == "new" and nxt["steps"]
+
+
+# --- found in manual testing ---------------------------------------------------------------------
+
+
+def test_a_project_name_ending_in_a_dash_is_refused_before_anything_is_created(capsys, world):
+    add_host(capsys, world)
+    (world.tmp / "p4-").mkdir()
+    assert run(capsys, "project", "add", "p4-", "--path", str(world.tmp / "p4-"))[0] == 0
+    code, _, err = run(capsys, "up", "p4-", "--host", "mini")
+    assert code == 1 and "ends with a dash" in err
+    assert not any(c[0] == "launch" for c in world.calls) and db.active_server(db.connect(config.load().db_path), "p4-") is None
+    assert incus.container_name("a--b") == "devbox-a--b"
+    assert incus.container_name("x" * 41) == "devbox-" + "x" * 41
+
+
+def test_the_base_image_is_published_uncompressed(capsys, world):
+    add_host(capsys, world)
+    assert run(capsys, "up", "crm", "--host", "mini")[0] == 0
+    publish = next(c for c in world.calls if c[0] == "publish")
+    assert publish[publish.index("--compression") + 1] == "none"

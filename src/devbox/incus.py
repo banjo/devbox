@@ -32,6 +32,9 @@ WORKAROUND_MARKER = "devbox: runc workaround registered"
 
 def container_name(project: str) -> str:
     name = NAME_PREFIX + project
+    if name.endswith("-"):
+        raise DevboxError(f"project name '{project}' ends with a dash, which Incus does not accept in a container "
+                          f"name ({name}); register the project under another name")
     if not CONTAINER_NAME_RE.match(name):
         raise DevboxError(f"project name '{project}' is too long for a container name ({name})")
     return name
@@ -366,7 +369,9 @@ class Incus:
         say("Publishing the base image for later workspaces...")
         self.run(["stop", name], timeout=180)
         try:
-            self.run(["publish", name, "--alias", alias, "--reuse", f"{BASE_PROP}=true",
+            # Uncompressed: publishing takes half the time and launching from the image a third (measured on a
+            # 1.4 GB workspace on dir storage: 26 s vs 56 s to publish, 3 s vs 11 s to launch).
+            self.run(["publish", name, "--alias", alias, "--reuse", "--compression", "none", f"{BASE_PROP}=true",
                       f"{CONTROLLER}={self.controller_id}"], timeout=900)
         finally:
             self.run(["start", name], timeout=180)
