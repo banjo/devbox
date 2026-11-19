@@ -649,10 +649,10 @@ def cmd_up(ctx: Context) -> int:
     if ctx.args.cpus or ctx.args.memory or ctx.args.isolate is not None:
         raise DevboxError("--cpus, --memory and --isolate only apply to workspaces on your own hosts (`up NAME --host HOST`)")
     limit_label, limit = startup_limit(ctx, project)
-    deadline = startup.Deadline(limit)
-    progress = startup.Progress(deadline)
     state = {"server_id": None, "created": False, "snapshot": None}
     with ctx.lock():
+        deadline = startup.Deadline(limit)  # starts once this command holds the lock
+        progress = startup.Progress(deadline)
         ctx.provider.deadline = deadline
         try:
             result = bring_up(ctx, project, deadline, progress, state)
@@ -2812,10 +2812,11 @@ def cmd_up_workspace(ctx: Context, project, host_name: str | None) -> int:
     if ctx.args.memory and not config.MEMORY_RE.match(ctx.args.memory):
         raise DevboxError(f"invalid --memory '{ctx.args.memory}': use a size like 4GiB or 512MiB")
     limit_label, limit = startup_limit(ctx, project)
-    deadline = startup.Deadline(limit)
-    progress = startup.Progress(deadline)
     state = {"server_id": None, "created": False, "snapshot": None}
     with ctx.lock():
+        # The startup clock starts once this command holds the lock, not while it waits for another `up`.
+        deadline = startup.Deadline(limit)
+        progress = startup.Progress(deadline)
         try:
             result = bring_up_workspace(ctx, project, host_name, deadline, progress, state)
         except (DevboxError, KeyboardInterrupt) as e:

@@ -560,3 +560,29 @@ def test_history_shows_workspaces_as_free_on_their_host(capsys, world):
     out = run(capsys, "history")[1]
     row = next(line for line in out.splitlines() if "crm" in line)
     assert "host mini" in row and "free" in row and "€?" not in row and "3 cpu, 6GiB" in row
+
+
+def test_the_startup_clock_starts_after_the_lock_is_held(capsys, world, monkeypatch):
+    """Concurrent `up`s take turns; time spent waiting for the other one must not eat the startup limit."""
+    import contextlib
+
+    from devbox import startup
+
+    add_host(capsys, world)
+    order = []
+    real_lock, real_init = cli.Context.lock, startup.Deadline.__init__
+
+    @contextlib.contextmanager
+    def lock(self):
+        with real_lock(self):
+            order.append("lock")
+            yield
+
+    def init(self, *a, **kw):
+        order.append("deadline")
+        real_init(self, *a, **kw)
+
+    monkeypatch.setattr(cli.Context, "lock", lock)
+    monkeypatch.setattr(startup.Deadline, "__init__", init)
+    assert run(capsys, "up", "crm", "--host", "mini")[0] == 0
+    assert order[:2] == ["lock", "deadline"]
