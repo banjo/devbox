@@ -176,6 +176,7 @@ FACTS_SCRIPT = f"""
 . /etc/os-release 2>/dev/null
 echo "os=${{ID:-unknown}}-${{VERSION_ID:-}}"
 echo "codename=${{VERSION_CODENAME:-}}"
+echo "keys_maxkeys=$(cat /proc/sys/kernel/keys/maxkeys 2>/dev/null)"
 echo "arch=$(dpkg --print-architecture 2>/dev/null)"
 [ -e {ZABBLY_SOURCES} ] && echo zabbly_repo=1 || echo zabbly_repo=0
 echo "user=$(id -un)"
@@ -203,6 +204,12 @@ echo "{FACTS_MARKER}"
 sudo -n ufw status 2>/dev/null </dev/null
 true
 """
+
+# Every workspace's root is the same host uid, so all of them share one kernel key quota (200 keys by default).
+# systemd and every Docker container in a workspace use some; when it runs out, Docker fails with
+# "unable to create session key: disk quota exceeded". Incus's production setup guide recommends 2000.
+KEYS_RECOMMENDED = 2000
+KEYS_LOW_BELOW = 1000
 
 UFW_RULES = {
     "in": ["ufw", "allow", "in", "on", BRIDGE],
@@ -378,6 +385,14 @@ def make_plan(host: str, facts: dict, zabbly: bool = False) -> Plan:
     elif not installed and sudo:
         plan.notes.append("after the install, devbox will run incus through `sudo -n` unless the user joins incus-admin")
 
+    keys = facts.get("keys_maxkeys", "")
+    if installed and keys.isdigit() and int(keys) < KEYS_LOW_BELOW:
+        plan.manual.append(
+            f"kernel.keys.maxkeys is {keys}. All workspaces share this key quota (about 15 keys each, more with "
+            "Docker containers running), so around a dozen workspaces exhaust it and Docker then fails with "
+            f"'disk quota exceeded'. devbox does not change kernel settings; raise it yourself: "
+            f"`echo 'kernel.keys.maxkeys = {KEYS_RECOMMENDED}' | sudo tee /etc/sysctl.d/99-devbox-incus.conf && "
+            "sudo sysctl --system`")
     ufw_active = facts.get("ufw_status", "").lstrip().startswith("Status: active")
     forward_drop = facts.get("forward_policy", "").endswith("DROP")
     if ufw_active:

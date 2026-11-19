@@ -119,8 +119,10 @@ NETWORK_CHECK = (
 DOCKER_CHECK = r'''
 command -v docker >/dev/null || exit 1
 systemctl is-active --quiet docker || systemctl start docker
-check() { timeout 120 docker run --rm hello-world >/dev/null 2>&1; }
-if check; then docker rmi hello-world >/dev/null 2>&1; exit 0; fi
+log=$(mktemp)
+# Docker may still be settling right after the container started (cached image): try a few times.
+check() { for i in 1 2 3; do timeout 120 docker run --rm hello-world >"$log" 2>&1 && return 0; sleep 3; done; return 1; }
+if check; then docker rmi hello-world >/dev/null 2>&1; rm -f "$log"; exit 0; fi
 arch=$(dpkg --print-architecture)
 curl -fsSL --connect-timeout 20 --max-time 120 --retry 2 -o /usr/local/bin/runc-compat \
   "https://github.com/opencontainers/runc/releases/download/v1.2.3/runc.$arch" || exit 1
@@ -135,7 +137,8 @@ json.dump(data, open(path, "w"), indent=2)
 PY
 systemctl restart docker
 sleep 3
-check || { echo "docker cannot start containers inside this container" >&2; exit 1; }
+check || { echo "docker cannot start containers inside this container: $(tail -n 3 "$log" | tr '\n' ' ')" >&2; exit 1; }
+rm -f "$log"
 docker rmi hello-world >/dev/null 2>&1
 echo "devbox: runc workaround registered"
 exit 0
@@ -414,7 +417,15 @@ class Incus:
             say(f"Setup step {i}/{len(commands)}...")
             self.exec(name, command, timeout=bound())
         say("Checking that Docker can run containers...")
-        checked = self.exec(name, DOCKER_CHECK, timeout=bound())
+        try:
+            checked = self.exec(name, DOCKER_CHECK, timeout=bound())
+        except DevboxError as e:
+            if "disk quota exceeded" in str(e):
+                raise DevboxError(
+                    f"{e}\nThe host's kernel key quota is used up (kernel.keys.maxkeys, shared by all workspaces); "
+                    f"`devbox host bootstrap {self.shell.host.name}` shows the fix, or `devbox down` workspaces "
+                    "you no longer need") from e
+            raise
         workaround = WORKAROUND_MARKER in (checked.stdout or "")
         if workaround:
             say("Docker needed the runc 1.2.3 workaround on this Incus version; "

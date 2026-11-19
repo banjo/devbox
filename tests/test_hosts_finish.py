@@ -586,3 +586,31 @@ def test_the_startup_clock_starts_after_the_lock_is_held(capsys, world, monkeypa
     monkeypatch.setattr(startup.Deadline, "__init__", init)
     assert run(capsys, "up", "crm", "--host", "mini")[0] == 0
     assert order[:2] == ["lock", "deadline"]
+
+
+def test_a_low_kernel_key_quota_is_reported_and_never_changed_by_devbox():
+    low = hosts.make_plan("h", facts(incus_version="7.6", keys_maxkeys="200", ufw_status="", forward_policy=""))
+    assert any("kernel.keys.maxkeys is 200" in m and "sudo sysctl --system" in m for m in low.manual)
+    assert step_ids(low) == [] and low.nothing_to_do
+    assert not hosts.make_plan("h", facts(incus_version="7.6", keys_maxkeys="2000", ufw_status="", forward_policy="")).manual
+    assert not hosts.make_plan("h", facts(incus_version="7.6", ufw_status="", forward_policy="")).manual  # unknown: say nothing
+    assert "keys_maxkeys=" in hosts.FACTS_SCRIPT
+
+
+def test_a_key_quota_failure_in_docker_names_the_cause(tmp_path):
+    fake, inc = inc_for(tmp_path)
+    fake.add_container("devbox-a")
+    fake.exec_fail["hello-world"] = 1
+    with pytest.raises(DevboxError, match="incus exec failed"):
+        inc.provision("devbox-a", "k", "p", "q")
+    real = fake.incus
+
+    def quota(args):
+        if args[0] == "exec" and "hello-world" in args[-1]:
+            return __import__("fake_host").done(err="unable to create session key: disk quota exceeded", code=1)
+        return real(args)
+
+    fake.incus = quota
+    fake.exec_fail.clear()
+    with pytest.raises(DevboxError, match="kernel key quota is used up"):
+        inc.provision("devbox-a", "k", "p", "q")
