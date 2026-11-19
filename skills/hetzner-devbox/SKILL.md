@@ -27,12 +27,13 @@ Do **not** use it for reading or editing code, Git, or small checks such as lint
 - **Never run heavy commands on this machine.** No `docker`, `npm install`, `npm run build`, dev servers or test suites locally. Use `devbox exec`.
 - **Ask before `devbox up` creates a server.** It costs money. Check `devbox status NAME` first; if a server is already running, use it without asking.
 - **Order the cheapest type that fits, every time.** 4 GB when a cheap one exists, otherwise the cheapest 2 GB. Never default to a `cpx*` because it feels safe; see "Choosing a server".
-- **Only one server at a time.** If `up` says another server is running, ask the user whether to `devbox down` that one. Never pass `--force` without their approval.
+- **Ask before starting another server.** Each server is billed separately. If `up` refuses because `max_servers` servers are running (`code: server_limit`), don't stop the other server. Check `devbox status` for its capacity and offer the user its options in the order `up` lists them: run the work on the running server, raise `max_servers` in the config, or `up NAME --additional` this once. Never pass `--additional` or edit `max_servers` without their approval, and only suggest `pause` of the other server if the user says they're done with it.
 - **Prefer `devbox pause` over `devbox down`** when the user is done. Pause keeps everything in a snapshot (a few cents a month) and the next `up` restores it. Ask before `devbox down`: it deletes the server and everything that exists only there, such as database contents.
 - **Mind the budget.** If `up` warns about the monthly budget, tell the user. If it refuses, only pass `--over-budget` when the user says so.
 - **Previews are public** unless you pass `--protect`. Anyone with the URL can open it. Do not expose admin tools or real data; when the app holds anything private, use `--protect` and give the user the password `expose` prints.
 - **Do not commit or push** unless the user asks.
 - Add `--json` when you need to parse output.
+- When unsure about a command or flag, run `devbox --help` (commands by group, main config settings) or `devbox COMMAND --help` instead of guessing.
 
 ## Procedure
 
@@ -124,12 +125,12 @@ Hetzner bills every started hour from when a server is created. A new server per
 
 - When you finish a short job and more may follow, use `devbox pause NAME --at-hour-end` (or `down --at-hour-end` if nothing needs to be kept) instead of `pause`. The server stays usable until just before its next billing hour; the next `up`/`exec` reuses it and cancels the stop. Tell the user when it will be paused (the command prints it). If it warns that nothing will carry it out, autostop isn't working: tell the user and suggest `devbox autostop enable`, or pause right away instead.
 - For projects with many short jobs, suggest `devbox project set NAME --idle-timeout hour-end` to the user.
-- Run parallel work on the one server with `exec --detach` rather than asking for a second server.
+- Run parallel work for a project on its one server with `exec --detach` rather than asking for a second server.
 - If `status` says the project's servers are on track to cost more than one server kept running all month, pass that on and let the user decide.
 
 ### Costs
 
-- `devbox status` shows each running server's cost so far, kept snapshots and their monthly cost, the total for this month and the budget left.
+- `devbox status` shows each running server's cost so far and capacity (load, free memory and disk), kept snapshots and their monthly cost, the total for this month and the budget left.
 - `devbox snapshot list` shows snapshots with size and cost; old ones beyond the configured number are deleted automatically on the next pause.
 - `devbox costs` answers questions like "what did this cost?": `--month 2026-10`, `--days 7`, `--since 2026-10-01 --until 2026-11-01`, `--project NAME`, and `--by project|month|day|type|server`.
 - Costs are estimates (incl. VAT): servers and their IPv4 per started hour, snapshots per GB, all capped monthly; traffic is not included. Say so when reporting them.
@@ -142,6 +143,7 @@ Hetzner bills every started hour from when a server is created. A new server per
 | "Change the dashboard layout" | Edit locally; `sync` if a server is running |
 | "Run the tests" | `devbox exec NAME -- 'npm test'` (or whatever the notes say) |
 | "Which servers are running?" | `devbox status`. It only covers this controller; also report servers it lists under other controllers, and never treat `no devbox servers for controller ...` alone as "nothing is running in Hetzner" |
+| "Start shop too" (while crm runs and `up` says `server_limit`) | Show crm's capacity from `devbox status`, then ask: share crm, raise `max_servers`, or `up shop --additional` |
 | "What have I spent this month?" | `devbox costs --month YYYY-MM` |
 | "What did we run on this project?" | `devbox history NAME` |
 | "Something's broken with devbox" | `devbox doctor` |
@@ -157,7 +159,7 @@ Hetzner bills every started hour from when a server is created. A new server per
 - A project's registered path can be a git worktree of the repo you are working in, with the branch you need checked out there (`devbox project list` shows the path). Do the edits in that path, not in the main clone, so `sync` carries them. The server copy has no `.git`, so run git commands locally, never in `exec`.
 - Formatting on the server: run the formatter in `exec` on the files you changed (keep the list in a file that is synced, since git is not available there), then `devbox pull` immediately and copy back only the source files you touched. `pull` also stages junk (tool temp dirs), and a later `sync` overwrites the server copy with the local one.
 - Verifying UI plus IndexedDB/data migrations in a real browser: run the dev server with `exec --detach`, then run a Playwright script via foreground `exec` (the notes say where Playwright lives). To test a schema migration, write a legacy-shaped record into a database at the old version through raw `indexedDB` in the page, reload the app so the upgrade runs, then read the record back.
-- When another project's server is already running and the user agrees to reuse it for a scratch job (the one-server limit blocks `up`), stream a tarball into a directory outside `/srv/app`: `tar czf - . | devbox exec OTHER --timeout 120 -- 'mkdir -p /tmp/x && tar xzf - -C /tmp/x'`. stdin is forwarded, and the other project's files stay untouched. Using `exec` cancels a pending pause, so tell the user the server stays up until the idle timeout.
+- When another project's server is already running and has room (`devbox status` shows its load, free memory and disk), and the user agrees to reuse it for a scratch job, stream a tarball into a directory outside `/srv/app`: `tar czf - . | devbox exec OTHER --timeout 120 -- 'mkdir -p /tmp/x && tar xzf - -C /tmp/x'`. stdin is forwarded, and the other project's files stay untouched. Using `exec` cancels a pending pause, so tell the user the server stays up until the idle timeout. Start a server of its own instead when the job needs its own containers, databases or ports, or will run for long.
 - A project whose `package.json` has `devEngines.packageManager` with a newer pnpm breaks the mise `pnpm` shim (corepack cannot fetch it). Install that exact version into a prefix (`npm i --prefix /tmp/pn pnpm@X`) and put `/tmp/pn/node_modules/.bin` FIRST on PATH, or call a workspace's `node_modules/.bin/<tool>` directly.
 - Foreground `exec` blocks until the command exits. Never use it for dev servers or `compose up` without `-d`; use `--detach`.
 - A single argument after `--` is run as a shell script, so quote it: `-- 'npm ci && npm test'`. Several arguments are quoted individually, so `&&` between them is passed literally.

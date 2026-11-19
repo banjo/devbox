@@ -15,7 +15,8 @@
   choice is sold out (or can't hold the snapshot being restored), `up` stops and suggests the
   cheapest comparable alternatives, same region first. Availability is Hetzner's indicator, not a
   guarantee.
-- One server at a time. `up --force` allows a second one.
+- One server per project. By default only one server runs at a time; `max_servers` in the config
+  allows more. See [Several servers](#several-servers).
 - SSH host keys are pinned. For every new server (fresh or restored from a snapshot) devbox
   generates an ed25519 host key locally and hands it to cloud-init, so it knows the server's key
   before the first connection and only ever accepts that one (`StrictHostKeyChecking=yes`). Until
@@ -42,6 +43,51 @@
   gone.
 
 Previews are described in [Previews](previews.md).
+
+## Several servers
+
+Each project has at most one server, and several projects can have one at the same time. How many
+may run at once is set by `max_servers` in the config (default `1`; `0` or `"unlimited"` for no
+limit). Only creating a server counts against it: `up` on a project whose server is already running
+(or powered off) just reuses it. Unregistered devbox servers that `status` lists count too, since
+they are billed.
+
+When the limit is reached, `up` refuses and lists, in this order:
+
+1. Use a running server for the work instead (`devbox exec OTHER -- ...`). `devbox status` shows
+   each server's load, free memory and free disk to help decide.
+2. Raise `max_servers` in `~/.config/devbox/config.toml`.
+3. Start this one anyway with `up --additional` (`--force` is an older name for the same flag). It
+   only applies to that run.
+
+With `--json` the error has `code: "server_limit"`, `running`, `max_servers` and `options` (each with
+`action`: `reuse`, `raise_limit` or `additional`).
+
+### Share a server or start another one?
+
+- Parallel jobs for the **same project** belong on its one server: start them with
+  `exec --detach --name ...` and check them with `ps` and `logs`.
+- A short job for **another project** can run on a server that is already up and has room. `exec`
+  runs in that server's `/srv/app`, so copy the other project somewhere else first and work there:
+  `tar czf - . | devbox exec OTHER -- 'mkdir -p /tmp/job && tar xzf - -C /tmp/job'`, then
+  `devbox exec OTHER -- 'cd /tmp/job && ...'`. The server's own project files stay untouched. This
+  counts as activity on OTHER, so it postpones its idle shutdown and cancels a planned
+  `--at-hour-end` stop.
+- Start a second server when the work needs its own environment (Docker containers, databases or
+  ports that would clash), will run for a long time, or the running server is short on memory or
+  disk (`devbox status`).
+
+### What changes with several servers
+
+- `status` lists every server with its cost, idle timer, processes and `capacity` (load averages,
+  memory and disk headroom; `capacity` in `--json`, `null` when the server can't be reached).
+- `up` says how many servers are running after it created one (`other_servers` in `--json`).
+- Each server is billed on its own: every server pays its own started hours and IPv4 address, so two
+  servers for an hour cost two hours. See [Costs](costs.md).
+- Idle shutdown (`idle-check`, `autostop`) checks every server on its own, with its project's idle
+  timeout. `pause`, `down` and `touch` only affect the project you name.
+- The monthly budget covers all servers and snapshots together; `up` checks it before every new
+  server.
 
 ## Startup
 

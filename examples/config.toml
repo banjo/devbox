@@ -40,6 +40,10 @@ startup_timeout = "5m"
 # monthly_budget = 20
 # budget_action = "warn"
 
+# How many servers may run at once (one per project). When reached, `up` for
+# another project refuses unless --additional is passed. 0 = no limit.
+max_servers = 1
+
 # Stable preview URLs (`devbox expose`): one Cloudflare tunnel per project and
 # <project>.<domain> / <project>-<preview>.<domain>. The domain must be a zone in
 # the token's Cloudflare account. Token permissions: Account > Cloudflare Tunnel >

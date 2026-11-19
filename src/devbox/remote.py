@@ -66,6 +66,32 @@ SNAPSHOT_CLEANUP = (
     "if command -v docker >/dev/null; then docker image prune -f >/dev/null 2>&1; fi; "
     "fstrim -a >/dev/null 2>&1; true"
 )
+CAPACITY_MARKER = "== devbox capacity"
+# CPU count, load averages, total/available memory (kB) and size/free bytes of the root disk.
+CAPACITY_SCRIPT = (
+    "nproc; cut -d' ' -f1-3 /proc/loadavg; "
+    "awk '/^MemTotal:/ {t=$2} /^MemAvailable:/ {a=$2} END {print t, a}' /proc/meminfo; "
+    "df -B1 --output=size,avail / | tail -n 1"
+)
+
+
+def parse_capacity(output: str) -> dict | None:
+    """Headroom from CAPACITY_SCRIPT output, or None when it can't be read."""
+    lines = [line.split() for line in output.strip().splitlines()]
+    try:
+        cores = int(lines[0][0])
+        load = [float(x) for x in lines[1][:3]]
+        mem_total, mem_free = (int(x) * 1024 for x in lines[2][:2])
+        disk_total, disk_free = (int(x) for x in lines[3][:2])
+    except (IndexError, ValueError):
+        return None
+    gb = 1024 ** 3
+    return {
+        "cores": cores,
+        "load": {"1m": load[0], "5m": load[1], "15m": load[2]},
+        "memory_gb": round(mem_total / gb, 2), "memory_free_gb": round(mem_free / gb, 2),
+        "disk_gb": round(disk_total / gb, 1), "disk_free_gb": round(disk_free / gb, 1),
+    }
 
 
 def parse_cloud_init_poll(output: str) -> tuple[str | None, int | None, str | None]:
@@ -545,6 +571,17 @@ class Remote:
             timeout=30,
         )
         return parse_units(proc.stdout)
+
+    def overview(self) -> tuple[list[dict], dict | None]:
+        """Background processes and capacity headroom, in one SSH call (for `status`)."""
+        proc = self.run(
+            f"systemctl list-units '{UNIT_PREFIX}*' --all --no-legend --plain --no-pager; "
+            f"echo '{CAPACITY_MARKER}'; {CAPACITY_SCRIPT}",
+            cwd=None,
+            timeout=30,
+        )
+        units, _, capacity = proc.stdout.partition(CAPACITY_MARKER + "\n")
+        return parse_units(units), parse_capacity(capacity)
 
     def logs(self, name: str, lines: int, follow: bool) -> int:
         args = ["journalctl", "-u", UNIT_PREFIX + name, "--no-pager", "-o", "cat", "-n", str(lines)]
