@@ -40,38 +40,11 @@ def doctor(ctx, resolve_ssh_allow) -> list[dict]:
     if cfg.preview_domain:
         add(cloudflare_check(cfg))
 
-    if shutil.which("hcloud") is None:
-        add(check("hcloud", FAIL, "hcloud CLI not found", "install it from https://github.com/hetznercloud/cli"))
+    provider = ctx.provider
+    found, usable = provider.check_connection(cfg)
+    checks += found
+    if not usable:
         return checks + registry_checks(ctx)
-    add(check("hcloud", OK, f"version {ctx.hcloud.version() or 'unknown'}"))
-
-    try:
-        token = cfg.hcloud_token()
-    except DevboxError as e:
-        add(check("token", FAIL, str(e), "check hcloud_token_file in the config"))
-        return checks + registry_checks(ctx)
-    if not token:
-        add(check("token", WARN, "no hcloud_token_file or HCLOUD_TOKEN; relying on the active hcloud context",
-                  "set hcloud_token_file in ~/.config/devbox/config.toml"))
-    else:
-        add(check("token", OK, "token found"))
-
-    try:
-        servers = ctx.hcloud.list_servers()
-    except DevboxError as e:
-        add(check("hetzner api", FAIL, str(e), "check the token and network access"))
-        return checks + registry_checks(ctx)
-    add(check("hetzner api", OK, f"reachable, {len(servers)} devbox server(s)"))
-
-    try:
-        offers = ctx.hcloud.offers()
-        if offers and all(o["available"] is None for o in offers):
-            add(check("availability", WARN, "hcloud does not report per-location availability",
-                      "update hcloud to a recent version"))
-        else:
-            add(check("availability", OK, f"{sum(1 for o in offers if o['available'])} type/location offers available"))
-    except DevboxError as e:
-        add(check("availability", WARN, str(e)))
 
     pub = cfg.ssh_key.with_name(cfg.ssh_key.name + ".pub")
     if not cfg.ssh_key.exists() or not pub.exists():
@@ -81,35 +54,7 @@ def doctor(ctx, resolve_ssh_allow) -> list[dict]:
         add(check("local ssh key", OK, str(cfg.ssh_key)))
         public_key = pub.read_text().strip()
 
-    if public_key:
-        try:
-            found = ctx.hcloud.find_ssh_key(public_key)
-            key = found["key"]
-            if found["status"] == "owned":
-                add(check("hetzner ssh key", OK, f"'{key['name']}' (id {key['id']})"))
-            elif found["status"] == "legacy":
-                add(check("hetzner ssh key", OK, f"using the key '{key['name']}' (id {key['id']}) from an older devbox version"))
-            else:
-                add(check("hetzner ssh key", OK, f"not registered yet; `up` creates '{ctx.hcloud.resource_name}'"))
-        except DevboxError as e:
-            add(check("hetzner ssh key", FAIL, str(e)))
-
-    try:
-        fw = ctx.hcloud.find_firewall()
-        if fw is None:
-            add(check("firewall", OK, f"not created yet; `up` creates '{ctx.hcloud.resource_name}'"))
-        else:
-            current = set(resolve_ssh_allow(cfg.ssh_allow))
-            allowed = {ip for rule in fw.get("rules") or [] for ip in rule.get("source_ips") or []}
-            if current <= allowed:
-                add(check("firewall", OK, f"'{fw['name']}' allows SSH from {', '.join(sorted(current))}"))
-            else:
-                add(check("firewall", WARN,
-                          f"'{fw['name']}' allows {', '.join(sorted(allowed)) or 'nothing'}, this machine is "
-                          f"{', '.join(sorted(current))}",
-                          "the next `devbox up` updates the rules; running servers can't be reached until then"))
-    except DevboxError as e:
-        add(check("firewall", FAIL, str(e)))
+    checks += provider.check_access(public_key, lambda: resolve_ssh_allow(cfg.ssh_allow))
 
     checks += registry_checks(ctx)
 
@@ -121,7 +66,7 @@ def doctor(ctx, resolve_ssh_allow) -> list[dict]:
     else:
         cloud = [c for c in plan if c["kind"] != "local file"]
         if cloud:
-            add(check("leftovers", WARN, f"{len(cloud)} unused devbox resource(s) in Hetzner or Cloudflare",
+            add(check("leftovers", WARN, f"{len(cloud)} unused devbox resource(s) in {ctx.provider.display_name} or Cloudflare",
                       "see `devbox cleanup`"))
         else:
             add(check("leftovers", OK, "no unused devbox resources"))
@@ -247,35 +192,11 @@ def cleanup_plan(ctx, notes: list[str] | None = None) -> list[dict]:
         plan.append({"kind": "snapshot", "id": i["id"], "name": i.get("description"),
                      "reason": f"labeled devbox snapshot not in the registry (project {i.get('project') or '?'})"})
 
-    hc = ctx.hcloud
-    for fw in hc.list_firewalls():
-        if fw["name"] == hc.resource_name or not (hc.owns(fw) or hc.is_legacy(fw)):
-            continue
-        if fw.get("applied_to"):
-            continue
-        plan.append({"kind": "firewall", "id": fw["id"], "name": fw["name"],
-                     "reason": "devbox firewall not attached to any server" + (" (older version)" if hc.is_legacy(fw) else "")})
-
     pub = ctx.cfg.ssh_key.with_name(ctx.cfg.ssh_key.name + ".pub")
-    if not pub.exists():
-        notes.append("SSH keys not checked: the local devbox key doesn't exist, so the key in use is unknown")
-    else:
-        local_key = pub.read_text().strip()
-        try:
-            hc.find_ssh_key(local_key)
-        except DevboxError as e:
-            # Which key is in use is ambiguous; listing any key could remove the one in use.
-            notes.append(f"SSH keys not checked: {e}")
-        else:
-            for key in hc.list_ssh_keys():
-                if not (hc.owns(key) or hc.is_legacy(key)):
-                    continue
-                if same_public_key(key.get("public_key", ""), local_key):
-                    continue  # never the key devbox itself uses
-                plan.append({"kind": "ssh-key", "id": key["id"], "name": key["name"],
-                             "reason": "devbox SSH key that is not the local key"})
+    local_key = pub.read_text().strip() if pub.exists() else None
+    plan += ctx.provider.leftovers(local_key, notes)
 
-    active = {(s["project"], str(s["hetzner_id"])) for s in db.active_servers(ctx.conn)}
+    active = {(s["project"], str(s["provider_id"])) for s in db.active_servers(ctx.conn)}
     known_hosts = ctx.cfg.state_dir / "known_hosts"
     if known_hosts.is_dir():
         for f in sorted(known_hosts.iterdir()):
@@ -325,13 +246,11 @@ def run_cleanup(ctx, plan: list[dict]) -> list[dict]:
     for item in plan:
         try:
             if item["kind"] == "server":
-                ctx.hcloud.delete_server(item["id"])
+                ctx.provider.delete_server(item["id"])
             elif item["kind"] == "snapshot":
-                ctx.hcloud.delete_image(item["id"])
-            elif item["kind"] == "firewall":
-                ctx.hcloud.delete_firewall(item["id"])
-            elif item["kind"] == "ssh-key":
-                ctx.hcloud.delete_ssh_key(item["id"])
+                ctx.provider.delete_image(item["id"])
+            elif item["kind"] in ("firewall", "ssh-key"):
+                ctx.provider.delete_resource(item["kind"], item["id"])
             elif item["kind"] == "local file":
                 Path(item["id"]).unlink(missing_ok=True)
             elif item["kind"] == "dns record":
@@ -365,7 +284,9 @@ def history(ctx, project: str | None, limit: int | None) -> dict:
         restored = snapshots.get(s["snapshot_id"]) if s["snapshot_id"] else None
         entries.append({
             "project": s["project"],
-            "hetzner_id": s["hetzner_id"],
+            "provider_id": s["provider_id"],
+            "hetzner_id": s["provider_id"],
+            "provider": s["provider"],
             "server_type": s["server_type"],
             "location": s["location"],
             "status": s["status"],
@@ -374,7 +295,7 @@ def history(ctx, project: str | None, limit: int | None) -> dict:
             "seconds": usage["seconds"],
             "billed_hours": usage["billed_hours"],
             "cost": usage["cost"],
-            "restored_from_snapshot": restored["hetzner_image_id"] if restored else None,
+            "restored_from_snapshot": restored["image_id"] if restored else None,
             "startup": json.loads(s["startup"]) if s["startup"] else None,
             "activity": db.event_counts(conn, s["id"]),
         })
@@ -383,7 +304,8 @@ def history(ctx, project: str | None, limit: int | None) -> dict:
         item = costs.snapshot_item(s)
         snaps.append({
             "project": s["project"],
-            "hetzner_image_id": s["hetzner_image_id"],
+            "image_id": s["image_id"],
+            "hetzner_image_id": s["image_id"],
             "status": s["status"],
             "created_at": s["created_at"],
             "deleted_at": s["deleted_at"],

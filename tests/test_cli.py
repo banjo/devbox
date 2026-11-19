@@ -3,8 +3,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from devbox import DevboxError, cli
+from devbox import DevboxError, cli, providers
+from devbox.providers import Capabilities
 from devbox.remote import parse_units, to_script
+from fake_provider import FakeProvider as FakeCloud, offer  # noqa: F401
 
 
 @pytest.fixture(autouse=True)
@@ -90,6 +92,10 @@ def test_parse_units():
 
 
 class FakeHcloud:
+    name = "hetzner"
+    display_name = "Hetzner"
+    capabilities = Capabilities(can_create=True, can_delete=True, has_snapshots=True, has_billing=True, has_offers=True)
+
     def __init__(self, offers):
         self._offers = offers
 
@@ -97,20 +103,11 @@ class FakeHcloud:
         return self._offers
 
 
-def offer(type, location, available=True, price=5.0, cores=2, memory=4.0):
-    return {
-        "type": type, "location": location, "city": "X", "country": "DE",
-        "network_zone": "eu-central", "cores": cores, "memory_gb": memory, "disk_gb": 40,
-        "architecture": "x86", "cpu_type": "shared", "category": "cost_optimized",
-        "price_hourly": 0.01, "price_monthly": price, "available": available, "recommended": False,
-    }
-
-
 def make_ctx(offers, type=None, location=None):
     import argparse
 
     ctx = cli.Context(argparse.Namespace(type=type, location=location, json=False))
-    ctx._hcloud = FakeHcloud(offers)
+    ctx._providers["hetzner"] = FakeHcloud(offers)
     return ctx
 
 
@@ -143,143 +140,10 @@ def test_choose_offer_unknown_type():
         cli.choose_offer(make_ctx([offer("cx23", "fsn1")], "nope", "fsn1"), "crm")
 
 
-class FakeCloud:
-    """In-memory stand-in for Hcloud in end-to-end CLI tests."""
-
-    def __init__(self, token=None, controller_id="test"):
-        self.controller_id = controller_id
-        self.servers: dict[int, dict] = {}
-        self.foreign: list[dict] = []
-        self.images: dict[int, dict] = {}
-        self.calls: list[tuple] = []
-        self.next_id = 100
-        self.fail_snapshot = False
-        self.fail_delete = False
-        self.running_work = []
-        self.offer_list = [
-            offer("cx23", "fsn1", price=4.0),
-            offer("cx33", "fsn1", price=7.0, cores=4, memory=8.0),
-        ]
-
-    def __call__(self, token, controller_id):
-        return self
-
-    def _id(self):
-        self.next_id += 1
-        return self.next_id
-
-    def list_servers(self):
-        return [dict(s) for s in self.servers.values()]
-
-    def list_all_servers(self):
-        mine = [{"controller": self.controller_id, **s} for s in self.servers.values()]
-        return mine + [dict(s) for s in self.foreign]
-
-    def list_snapshots(self):
-        return [dict(i) for i in self.images.values()]
-
-    def offers(self):
-        return [dict(o) for o in self.offer_list]
-
-    def ensure_ssh_key(self, public_key):
-        return 1
-
-    def ensure_firewall(self, cidrs):
-        return 2
-
-    def create_server(self, name, project, server_type, image, location, user_data, ssh_key_id, firewall_id):
-        self.calls.append(("create", server_type, location, image))
-        sid = self._id()
-        self.servers[sid] = {
-            "id": sid, "name": name, "status": "running", "ip": f"192.0.2.{sid % 250}",
-            "server_type": server_type, "location": location, "project": project, "created": None,
-        }
-        return dict(self.servers[sid])
-
-    def delete_server(self, server_id):
-        self.calls.append(("delete", server_id))
-        if self.fail_delete:
-            from devbox import DevboxError
-            raise DevboxError("locked")
-        del self.servers[server_id]
-
-    def shutdown(self, server_id):
-        self.calls.append(("shutdown", server_id))
-        self.servers[server_id]["status"] = "off"
-
-    def poweron(self, server_id):
-        self.calls.append(("poweron", server_id))
-        self.servers[server_id]["status"] = "running"
-
-    def create_snapshot(self, server_id, project, description):
-        self.calls.append(("snapshot", server_id))
-        if self.fail_snapshot:
-            from devbox import DevboxError
-            raise DevboxError("boom")
-        iid = self._id()
-        self.images[iid] = {
-            "id": iid, "description": description, "status": "available", "size_gb": 2.5,
-            "disk_gb": 40, "architecture": "x86", "project": project, "created": None,
-        }
-        return dict(self.images[iid])
-
-    def delete_image(self, image_id):
-        self.calls.append(("delete_image", image_id))
-        del self.images[image_id]
-
-    def snapshot_price_per_gb_month(self):
-        return 0.012
-
-    # Most tests leave IPv4 out of costs; test_costs_ipv4_36 sets prices.
-    ipv4: dict = {}
-
-    def ipv4_prices(self):
-        return dict(self.ipv4)
-
-    # Firewalls, SSH keys and ownership, as in Hcloud.
-    resource_name = "devbox-test"
-    firewalls: list
-    keys: list
-
-    def owns(self, r):
-        return (r.get("labels") or {}) == {"managed-by": "devbox", "devbox-controller": "test"}
-
-    @staticmethod
-    def is_legacy(r):
-        labels = r.get("labels") or {}
-        return labels.get("managed-by") == "devbox" and "devbox-controller" not in labels
-
-    def version(self):
-        return "1.70.2"
-
-    def list_firewalls(self):
-        return list(getattr(self, "firewalls", []))
-
-    def list_ssh_keys(self):
-        return list(getattr(self, "keys", []))
-
-    def find_firewall(self):
-        return next((f for f in self.list_firewalls() if f["name"] == self.resource_name), None)
-
-    def find_ssh_key(self, public_key):
-        for k in self.list_ssh_keys():
-            if k["public_key"] == public_key:
-                return {"status": "owned" if self.owns(k) else "legacy", "key": k}
-        return {"status": "missing", "key": None}
-
-    def delete_firewall(self, firewall_id):
-        self.calls.append(("delete_firewall", firewall_id))
-        self.firewalls = [f for f in self.firewalls if f["id"] != firewall_id]
-
-    def delete_ssh_key(self, key_id):
-        self.calls.append(("delete_ssh_key", key_id))
-        self.keys = [k for k in self.keys if k["id"] != key_id]
-
-
 @pytest.fixture
 def cloud(monkeypatch):
     fake = FakeCloud()
-    monkeypatch.setattr(cli, "Hcloud", fake)
+    monkeypatch.setitem(providers._REGISTRY, "hetzner", fake)
     monkeypatch.setattr(cli, "ensure_local_ssh_key", lambda key: "ssh-ed25519 AAAA test")
     monkeypatch.setattr(cli, "resolve_ssh_allow", lambda entries: ["192.0.2.1/32"])
     monkeypatch.setattr(cli.Remote, "wait_ssh", lambda self, deadline, progress: None)
@@ -375,7 +239,7 @@ def test_pause_then_up_restores_snapshot_with_last_server_choice(capsys, isolate
     code, out, err = run(capsys, "up", "crm", "--json")
     assert code == 0, err
     data = json.loads(out)
-    assert data["restored_from_snapshot"]["hetzner_image_id"] == image_id
+    assert data["restored_from_snapshot"]["image_id"] == image_id
     assert data["offer"]["choice"] == "last used"
     create = [c for c in cloud.calls if c[0] == "create"][-1]
     assert create == ("create", "cx33", "fsn1", str(image_id))
@@ -586,7 +450,7 @@ def test_history_shows_servers_snapshots_and_totals(capsys, isolated, cloud):
     data = json.loads(out)
     assert len(data["servers"]) == 2
     latest, first = data["servers"]
-    assert latest["status"] == "running" and latest["restored_from_snapshot"] == data["snapshots"][0]["hetzner_image_id"]
+    assert latest["status"] == "running" and latest["restored_from_snapshot"] == data["snapshots"][0]["image_id"]
     assert first["activity"]["pause"] == 1
     assert data["total"]["servers"] == 2 and data["total"]["snapshots"] == 1
 

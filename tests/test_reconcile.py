@@ -34,7 +34,7 @@ def test_unrecorded_server_is_adopted(conn):
     orphans = db.reconcile(conn, [live(11, "crm")])
     assert orphans == []
     server = db.active_server(conn, "crm")
-    assert server["hetzner_id"] == 11
+    assert server["provider_id"] == 11
     assert server["status"] == "running"
     assert server["ip"] == "1.2.3.4"
 
@@ -60,13 +60,13 @@ def test_second_server_for_same_project_is_reported(conn):
     db.insert_server(conn, "crm", 10, "running")
     orphans = db.reconcile(conn, [live(10, "crm"), live(13, "crm")])
     assert [o["id"] for o in orphans] == [13]
-    assert db.active_server(conn, "crm")["hetzner_id"] == 10
+    assert db.active_server(conn, "crm")["provider_id"] == 10
 
 
 def test_matching_state_is_unchanged(conn):
     db.insert_server(conn, "crm", 10, "running", ip="1.2.3.4")
     assert db.reconcile(conn, [live(10, "crm")]) == []
-    assert [s["hetzner_id"] for s in db.active_servers(conn)] == [10]
+    assert [s["provider_id"] for s in db.active_servers(conn)] == [10]
 
 
 def image(id, project="crm", status="available"):
@@ -83,7 +83,7 @@ def test_snapshot_gone_in_hetzner_is_marked_deleted(conn):
 def test_unrecorded_snapshot_is_adopted(conn):
     # For example, a crash during `pause` after the snapshot was created.
     assert db.reconcile_snapshots(conn, [image(501)]) == []
-    assert db.latest_snapshot(conn, "crm")["hetzner_image_id"] == 501
+    assert db.latest_snapshot(conn, "crm")["image_id"] == 501
 
 
 def test_unknown_project_snapshot_is_reported(conn):

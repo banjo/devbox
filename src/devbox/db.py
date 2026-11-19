@@ -126,9 +126,33 @@ MIGRATIONS = [
     """
     ALTER TABLE servers ADD COLUMN previews_at_stop TEXT;
     """,
+    # Provider-neutral names. Existing rows belong to Hetzner.
+    """
+    ALTER TABLE servers RENAME COLUMN hetzner_id TO provider_id;
+    ALTER TABLE snapshots RENAME COLUMN hetzner_image_id TO image_id;
+    ALTER TABLE servers ADD COLUMN provider TEXT NOT NULL DEFAULT 'hetzner';
+    ALTER TABLE servers ADD COLUMN host TEXT;
+    ALTER TABLE snapshots ADD COLUMN provider TEXT NOT NULL DEFAULT 'hetzner';
+    """,
 ]
 
+DEFAULT_PROVIDER = "hetzner"
+
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+
+
+def row_dict(row) -> dict:
+    """A server or snapshot row as a dict for `--json`, with the pre-provider key names kept.
+
+    `provider_id` is also given as `hetzner_id` and `image_id` as `hetzner_image_id`,
+    because scripts and agents read those keys.
+    """
+    data = dict(row)
+    if "provider_id" in data:
+        data["hetzner_id"] = data["provider_id"]
+    if "image_id" in data:
+        data["hetzner_image_id"] = data["image_id"]
+    return data
 
 
 def now() -> str:
@@ -256,7 +280,12 @@ def active_server(conn: sqlite3.Connection, project: str) -> sqlite3.Row | None:
     ).fetchone()
 
 
-def active_servers(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+def active_servers(conn: sqlite3.Connection, provider: str | None = None) -> list[sqlite3.Row]:
+    """Servers that exist; only those of `provider` when given."""
+    if provider is not None:
+        return conn.execute(
+            "SELECT * FROM servers WHERE status != 'deleted' AND provider = ? ORDER BY project", (provider,)
+        ).fetchall()
     return conn.execute(
         "SELECT * FROM servers WHERE status != 'deleted' ORDER BY project"
     ).fetchall()
@@ -265,7 +294,7 @@ def active_servers(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 def insert_server(
     conn: sqlite3.Connection,
     project: str,
-    hetzner_id: int,
+    provider_id: int,
     status: str,
     ip: str | None = None,
     server_type: str | None = None,
@@ -275,14 +304,16 @@ def insert_server(
     price_monthly: float | None = None,
     snapshot_id: int | None = None,
     power: str | None = None,
+    provider: str = DEFAULT_PROVIDER,
+    host: str | None = None,
 ) -> int:
     cur = conn.execute(
         """INSERT INTO servers
-           (project, hetzner_id, ip, server_type, location, status, created_at,
-            price_hourly, price_monthly, snapshot_id, power)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (project, hetzner_id, ip, server_type, location, status, created_at or now(),
-         price_hourly, price_monthly, snapshot_id, power),
+           (project, provider_id, ip, server_type, location, status, created_at,
+            price_hourly, price_monthly, snapshot_id, power, provider, host)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (project, provider_id, ip, server_type, location, status, created_at or now(),
+         price_hourly, price_monthly, snapshot_id, power, provider, host),
     )
     return cur.lastrowid
 
@@ -310,7 +341,7 @@ def _parse(value: str) -> datetime:
 def insert_snapshot(
     conn: sqlite3.Connection,
     project: str,
-    hetzner_image_id: int,
+    image_id: int,
     server_id: int | None = None,
     server_type: str | None = None,
     location: str | None = None,
@@ -319,21 +350,27 @@ def insert_snapshot(
     disk_gb: int | None = None,
     price_per_gb_month: float | None = None,
     created_at: str | None = None,
+    provider: str = DEFAULT_PROVIDER,
 ) -> int:
     cur = conn.execute(
         """INSERT INTO snapshots
-           (project, hetzner_image_id, server_id, server_type, location, architecture,
-            size_gb, disk_gb, price_per_gb_month, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'available', ?)""",
-        (project, hetzner_image_id, server_id, server_type, location, architecture,
-         size_gb, disk_gb, price_per_gb_month, created_at or now()),
+           (project, image_id, server_id, server_type, location, architecture,
+            size_gb, disk_gb, price_per_gb_month, status, created_at, provider)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'available', ?, ?)""",
+        (project, image_id, server_id, server_type, location, architecture,
+         size_gb, disk_gb, price_per_gb_month, created_at or now(), provider),
     )
     return cur.lastrowid
 
 
-def snapshots(conn: sqlite3.Connection, project: str | None = None, include_deleted: bool = False) -> list[sqlite3.Row]:
+def snapshots(
+    conn: sqlite3.Connection, project: str | None = None, include_deleted: bool = False, provider: str | None = None
+) -> list[sqlite3.Row]:
     sql = "SELECT * FROM snapshots WHERE 1 = 1"
     args: list = []
+    if provider:
+        sql += " AND provider = ?"
+        args.append(provider)
     if project:
         sql += " AND project = ?"
         args.append(project)
@@ -353,7 +390,7 @@ def latest_snapshot(conn: sqlite3.Connection, project: str) -> sqlite3.Row | Non
 
 
 def get_snapshot_by_image(conn: sqlite3.Connection, image_id: int) -> sqlite3.Row | None:
-    return conn.execute("SELECT * FROM snapshots WHERE hetzner_image_id = ?", (image_id,)).fetchone()
+    return conn.execute("SELECT * FROM snapshots WHERE image_id = ?", (image_id,)).fetchone()
 
 
 def mark_snapshot_deleted(conn: sqlite3.Connection, snapshot_id: int) -> None:
@@ -372,11 +409,11 @@ def update_snapshot(conn: sqlite3.Connection, snapshot_id: int, **fields) -> Non
         conn.execute(f"UPDATE snapshots SET {sets} WHERE id = ?", (*fields.values(), snapshot_id))
 
 
-def reconcile_snapshots(conn: sqlite3.Connection, images: list[dict]) -> list[dict]:
-    """Match registry snapshots with labeled Hetzner snapshots. Returns unknown ones."""
+def reconcile_snapshots(conn: sqlite3.Connection, images: list[dict], provider: str = DEFAULT_PROVIDER) -> list[dict]:
+    """Match registry snapshots with the provider's labeled snapshots. Returns unknown ones."""
     by_id = {i["id"]: i for i in images}
-    for snap in snapshots(conn):
-        live = by_id.get(snap["hetzner_image_id"])
+    for snap in snapshots(conn, provider=provider):
+        live = by_id.get(snap["image_id"])
         if live is None:
             mark_snapshot_deleted(conn, snap["id"])
         elif live["size_gb"] is not None and live["size_gb"] != snap["size_gb"]:
@@ -392,6 +429,7 @@ def reconcile_snapshots(conn: sqlite3.Connection, images: list[dict]) -> list[di
             insert_snapshot(
                 conn, project, image["id"], architecture=image["architecture"],
                 size_gb=image["size_gb"], disk_gb=image["disk_gb"], created_at=image.get("created"),
+                provider=provider,
             )
         else:
             unknown.append(image)
@@ -463,7 +501,7 @@ _SERVER_FIELDS = {
     "ip", "server_type", "location", "status", "preview_port", "preview_url",
     "price_hourly", "price_monthly", "power", "setup_stage", "setup_error", "diagnostics",
     "stop_action", "stop_requested_at", "created_at", "host_key", "startup",
-    "ipv4_price_hourly", "ipv4_price_monthly", "hold_until", "previews_at_stop",
+    "ipv4_price_hourly", "ipv4_price_monthly", "hold_until", "previews_at_stop", "provider", "host",
 }
 
 
@@ -563,16 +601,18 @@ def typical_startup(conn: sqlite3.Connection, project: str, kind: str) -> float 
     return None
 
 
-def reconcile(conn: sqlite3.Connection, hetzner_servers: list[dict]) -> list[dict]:
-    """Bring the registry in line with the labeled servers that exist in Hetzner.
+def reconcile(conn: sqlite3.Connection, provider_servers: list[dict], provider: str = DEFAULT_PROVIDER) -> list[dict]:
+    """Bring the registry in line with the labeled servers that exist at the provider.
 
-    `hetzner_servers` are dicts from `hetzner.server_info`. Returns labeled servers
-    whose project is not registered, so the caller can report them.
+    `provider_servers` are dicts from the provider's server listing (see
+    `hetzner.server_info`). Only registry servers of `provider` are touched.
+    Returns labeled servers whose project is not registered, so the caller can
+    report them.
     """
-    by_id = {s["id"]: s for s in hetzner_servers}
+    by_id = {s["id"]: s for s in provider_servers}
 
-    for row in active_servers(conn):
-        live = by_id.get(row["hetzner_id"])
+    for row in active_servers(conn, provider):
+        live = by_id.get(row["provider_id"])
         if live is None:
             mark_deleted(conn, row["id"])
             continue
@@ -586,9 +626,9 @@ def reconcile(conn: sqlite3.Connection, hetzner_servers: list[dict]) -> list[dic
             changes["created_at"] = _parse(live["created"]).isoformat(timespec="seconds")
         update_server(conn, row["id"], **changes)
 
-    known_ids = {row["hetzner_id"] for row in active_servers(conn)}
+    known_ids = {row["provider_id"] for row in active_servers(conn, provider)}
     orphans = []
-    for s in hetzner_servers:
+    for s in provider_servers:
         if s["id"] in known_ids:
             continue
         project = s.get("project")
@@ -603,6 +643,7 @@ def reconcile(conn: sqlite3.Connection, hetzner_servers: list[dict]) -> list[dic
                 location=s["location"],
                 created_at=s.get("created"),
                 power=s.get("status"),
+                provider=provider,
             )
         else:
             orphans.append(s)

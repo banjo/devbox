@@ -14,13 +14,13 @@ from datetime import datetime, timedelta, timezone
 from importlib import resources
 from pathlib import Path
 
-from devbox import DevboxError, admin, autostop, billing, config, costs, databases, db, envsecrets, previews, startup, watch
-from devbox.hetzner import Hcloud, filter_offers
+from devbox import DevboxError, admin, autostop, billing, config, costs, databases, db, envsecrets, previews, providers, startup, watch
+from devbox.providers.hetzner import filter_offers
 from devbox.remote import PULL_PRUNE, Remote, git_files, git_ignored, to_script, validate_proc
 
 
 EXIT_TIMEOUT = 124
-# Hetzner server statuses in which nothing runs on the server.
+# Server statuses (Hetzner's, reported by every provider) in which nothing runs on the server.
 POWERED_DOWN = ("off", "stopping")
 # Using the server again cancels a `pause/down --at-hour-end`; looking at it doesn't.
 CANCELS_STOP = {"up", "sync", "exec", "exec_detach", "touch", "expose", "forward", "db_restore", "ssh"}
@@ -32,7 +32,7 @@ class Context:
         self.args = args
         self._cfg = None
         self._conn = None
-        self._hcloud = None
+        self._providers: dict[str, providers.Provider] = {}
         self._snapshot_price = None
         self._ipv4_prices = None
         self.snapshot_orphans: list[dict] = []
@@ -51,14 +51,27 @@ class Context:
             self._conn = db.connect(self.cfg.db_path)
         return self._conn
 
+    def provider_named(self, name: str) -> "providers.Provider":
+        if name not in self._providers:
+            self._providers[name] = providers.get(name, self.cfg)
+        return self._providers[name]
+
     @property
-    def hcloud(self) -> Hcloud:
-        if self._hcloud is None:
-            self._hcloud = Hcloud(self.cfg.hcloud_token(), self.cfg.get_controller_id())
-        return self._hcloud
+    def provider(self) -> "providers.Provider":
+        """The provider new servers are created at."""
+        return self.provider_named(providers.DEFAULT)
+
+    def provider_for(self, server) -> "providers.Provider":
+        """The provider a registered server or snapshot belongs to."""
+        return self.provider_named(server["provider"])
+
+    @property
+    def hcloud(self) -> "providers.Provider":
+        """Back-compat alias for the Hetzner provider."""
+        return self.provider_named("hetzner")
 
     def known_hosts(self, server) -> Path:
-        path = self.cfg.state_dir / "known_hosts" / f"{server['project']}-{server['hetzner_id']}"
+        path = self.cfg.state_dir / "known_hosts" / f"{server['project']}-{server['provider_id']}"
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -94,35 +107,44 @@ class Context:
     def reconcile(self) -> list[dict]:
         # One provider listing: this controller's servers are reconciled; other
         # controllers' servers are only kept for reporting, never adopted.
-        everything = self.hcloud.list_all_servers()
-        mine = [s for s in everything if s["controller"] in (None, self.hcloud.controller_id)]
-        self.foreign_servers = [s for s in everything if s["controller"] not in (None, self.hcloud.controller_id)]
-        orphans = db.reconcile(self.conn, mine)
-        self.snapshot_orphans = db.reconcile_snapshots(self.conn, self.hcloud.list_snapshots())
+        provider = self.provider
+        everything = provider.list_all_servers()
+        mine = [s for s in everything if s["controller"] in (None, provider.controller_id)]
+        self.foreign_servers = [s for s in everything if s["controller"] not in (None, provider.controller_id)]
+        orphans = db.reconcile(self.conn, mine, provider.name)
+        self.snapshot_orphans = (
+            db.reconcile_snapshots(self.conn, provider.list_snapshots(), provider.name)
+            if provider.capabilities.has_snapshots else []
+        )
         self.fill_missing_prices()
         return orphans
 
     def snapshot_price(self) -> float | None:
         if self._snapshot_price is None:
             self._snapshot_price = (
-                self.hcloud.snapshot_price_per_gb_month() or self.cfg.snapshot_price_per_gb_month
+                self.provider.snapshot_price_per_gb_month() or self.cfg.snapshot_price_per_gb_month
             )
         return self._snapshot_price
 
     def ipv4_price(self, location: str | None) -> tuple[float | None, float | None]:
         """(hourly, monthly) price of a primary IPv4 in `location`, or the config fallback."""
         if self._ipv4_prices is None:
-            self._ipv4_prices = self.hcloud.ipv4_prices()
+            self._ipv4_prices = self.provider.ipv4_prices()
         hourly, monthly = self._ipv4_prices.get(location or "", (None, None))
         if hourly is None and self.cfg.ipv4_price_monthly is not None:
             monthly = self.cfg.ipv4_price_monthly
             hourly = monthly / costs.HOURS_PER_MONTH
         return hourly, monthly
 
+    def bills(self, row) -> bool:
+        """Does the provider of this server or snapshot charge for it?"""
+        return providers.capabilities(row["provider"]).has_billing
+
     def cost_items(self, project: str | None = None) -> list[dict]:
         """Servers and snapshots, ready for `costs.summarize`."""
-        items = [costs.server_item(s) for s in db.all_servers(self.conn, project)]
-        items += [costs.snapshot_item(s) for s in db.snapshots(self.conn, project, include_deleted=True)]
+        # Providers that do not bill (own hardware) have nothing to count.
+        items = [costs.server_item(s) for s in db.all_servers(self.conn, project) if self.bills(s)]
+        items += [costs.snapshot_item(s) for s in db.snapshots(self.conn, project, include_deleted=True) if self.bills(s)]
         return items
 
     def fill_missing_prices(self) -> None:
@@ -131,10 +153,11 @@ class Context:
         Servers and snapshots are handled independently, so a snapshot is
         priced even when no server needs a price.
         """
-        missing = [s for s in db.servers_missing_price(self.conn) if s["status"] != "deleted"]
-        if missing:
+        missing = [s for s in db.servers_missing_price(self.conn)
+                   if s["status"] != "deleted" and s["provider"] == self.provider.name]
+        if missing and self.provider.capabilities.has_offers:
             try:
-                offers = self.hcloud.offers()
+                offers = self.provider.offers()
             except DevboxError:
                 offers = []
             prices = {(o["type"], o["location"]): o for o in offers}
@@ -201,7 +224,7 @@ def emit(args, data, text: str | None = None) -> None:
 
 
 def row(r) -> dict | None:
-    return dict(r) if r is not None else None
+    return db.row_dict(r) if r is not None else None
 
 
 def local_time(ts: str) -> str:
@@ -410,7 +433,8 @@ def choose_offer(ctx: Context, project: str, snapshot=None) -> dict:
             return False
         return not (snapshot["disk_gb"] and (o["disk_gb"] or 0) < snapshot["disk_gb"])
 
-    offers = ctx.hcloud.offers()
+    providers.require(ctx.provider, "can_create", "creating servers")
+    offers = ctx.provider.offers()
     if not any(o["type"] == server_type for o in offers):
         raise DevboxError(f"unknown server type '{server_type}'; see `devbox server-types`")
     match = next((o for o in offers if o["type"] == server_type and o["location"] == location), None)
@@ -440,8 +464,9 @@ def choose_offer(ctx: Context, project: str, snapshot=None) -> dict:
 
 def cmd_server_types(ctx: Context) -> int:
     a = ctx.args
+    providers.require(ctx.provider, "has_offers", "listing server types")
     offers = filter_offers(
-        ctx.hcloud.offers(),
+        ctx.provider.offers(),
         min_cores=a.min_cores,
         min_memory=a.min_memory,
         architecture=a.arch,
@@ -562,17 +587,17 @@ def cmd_up(ctx: Context) -> int:
     progress = startup.Progress(deadline)
     state = {"server_id": None, "created": False, "snapshot": None}
     with ctx.lock():
-        ctx.hcloud.deadline = deadline
+        ctx.provider.deadline = deadline
         try:
             result = bring_up(ctx, project, deadline, progress, state)
         except (DevboxError, KeyboardInterrupt) as e:
-            ctx.hcloud.deadline = None
+            ctx.provider.deadline = None
             if isinstance(e, DevboxError) and not isinstance(e, (startup.StageTimeout, startup.StageFailed)) \
                     and state["server_id"] is None and progress.stage == "prepare":
                 raise  # checks before anything was created: budget, server choice, ...
             raise startup_failure(ctx, e, state, deadline, progress, limit_label)
         finally:
-            ctx.hcloud.deadline = None
+            ctx.provider.deadline = None
     return report_up(ctx, result, deadline)
 
 
@@ -584,7 +609,7 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
     snapshot = None
     warnings: list[str] = []
     other_servers: list[str] = []
-    hc = ctx.hcloud
+    hc = ctx.provider
 
     hc.stage = "prepare"
     orphans = ctx.reconcile()
@@ -593,6 +618,8 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
 
     if server is None:
         snapshot = None if ctx.args.fresh else db.latest_snapshot(ctx.conn, name)
+        if snapshot is not None and (snapshot["provider"] != hc.name or not hc.capabilities.has_snapshots):
+            snapshot = None  # an image can only be restored at the provider that made it
         if ctx.args.require_snapshot and snapshot is None:
             raise DevboxError(f"{name} has no snapshot to resume from; use `devbox up {name}`")
         others = [s["project"] for s in db.active_servers(ctx.conn)]
@@ -602,10 +629,9 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
         warnings += check_budget(ctx)
         offer = choose_offer(ctx, name, snapshot)
         public_key = ensure_local_ssh_key(cfg.ssh_key)
-        ssh_key_id = hc.ensure_ssh_key(public_key)
-        firewall_id = hc.ensure_firewall(resolve_ssh_allow(cfg.ssh_allow))
+        access = hc.ensure_access(public_key, resolve_ssh_allow(cfg.ssh_allow))
 
-        source = f" from snapshot {snapshot['hetzner_image_id']}" if snapshot else ""
+        source = f" from snapshot {snapshot['image_id']}" if snapshot else ""
         hc.stage = "create"
         progress.step("create", f"Creating server: {describe_offer(offer)}{source}")
         host_private, host_key = generate_host_key()
@@ -615,9 +641,9 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
             f.flush()
             info = hc.create_server(
                 f"devbox-{name}", name, offer["type"],
-                str(snapshot["hetzner_image_id"]) if snapshot else cfg.image,
+                str(snapshot["image_id"]) if snapshot else cfg.image,
                 offer["location"], Path(f.name),
-                ssh_key_id=ssh_key_id, firewall_id=firewall_id,
+                ssh_key_id=access.ssh_key_id, firewall_id=access.firewall_id,
             )
         if snapshot is None:
             # A clean server has none of the previously synced files.
@@ -627,7 +653,7 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
             ip=info["ip"], server_type=info["server_type"] or offer["type"],
             location=info["location"] or offer["location"], created_at=info.get("created"),
             price_hourly=offer["price_hourly"], price_monthly=offer["price_monthly"],
-            snapshot_id=snapshot["id"] if snapshot else None,
+            snapshot_id=snapshot["id"] if snapshot else None, provider=hc.name,
         )
         ipv4_hourly, ipv4_monthly = ctx.ipv4_price(info["location"] or offer["location"])
         db.update_server(ctx.conn, server_id, host_key=host_key,
@@ -635,18 +661,18 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
         state.update(server_id=server_id, created=True, snapshot=snapshot)
         server = db.get_server(ctx.conn, server_id)
         created = True
-        progress.say(f"Server {server['hetzner_id']} created at {server['ip']}")
+        progress.say(f"Server {server['provider_id']} created at {server['ip']}")
         ctx.event(server, "restore" if snapshot else "create")
     else:
         state["server_id"] = server["id"]
         if server["setup_error"]:
-            progress.say(f"Retrying setup of server {server['hetzner_id']} (failed before at {server['setup_stage']})")
+            progress.say(f"Retrying setup of server {server['provider_id']} (failed before at {server['setup_stage']})")
 
     powered_on = False
     if server["power"] in POWERED_DOWN:
         hc.stage = "power-on"
-        progress.step("power-on", f"Powering on server {server['hetzner_id']}...")
-        hc.poweron(server["hetzner_id"])
+        progress.step("power-on", f"Powering on server {server['provider_id']}...")
+        ctx.provider_for(server).poweron(server["provider_id"])
         powered_on = True
 
     remote = ctx.remote(server)
@@ -729,7 +755,7 @@ def report_up(ctx: Context, r: dict, deadline: "startup.Deadline") -> int:
     if r["created"]:
         verb = "restored" if snapshot else "created"
     text = [
-        f"{name}: {verb} server {server['hetzner_id']} "
+        f"{name}: {verb} server {server['provider_id']} "
         f"({server['server_type']} in {server['location']}) at {server['ip']}, code synced "
         f"in {startup.duration_label(deadline.elapsed())}",
     ]
@@ -842,7 +868,7 @@ def startup_failure(ctx: Context, exc, state: dict, deadline, progress, limit_la
         "limit_seconds": deadline.limit,
         "stages": progress.stage_seconds(),
         "project": name,
-        "server_id": server["hetzner_id"] if server else None,
+        "server_id": server["provider_id"] if server else None,
         "ip": server["ip"] if server else None,
         "server_retained": bool(server),
         "billable": bool(server),
@@ -877,8 +903,8 @@ def startup_failure(ctx: Context, exc, state: dict, deadline, progress, limit_la
         diag_dir = ctx.cfg.state_dir / "diagnostics"
         diag_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        diag_path = diag_dir / f"{name}-{server['hetzner_id']}-{stamp}.log"
-        header = f"devbox up {name}: {headline}\nreason: {reason}\nserver: {server['hetzner_id']} {server['ip']}\n\n"
+        diag_path = diag_dir / f"{name}-{server['provider_id']}-{stamp}.log"
+        header = f"devbox up {name}: {headline}\nreason: {reason}\nserver: {server['provider_id']} {server['ip']}\n\n"
         diag_path.write_text(startup.redact(header + text, secret_values))
         details["diagnostics"] = str(diag_path)
     except (DevboxError, OSError) as e:
@@ -889,8 +915,9 @@ def startup_failure(ctx: Context, exc, state: dict, deadline, progress, limit_la
         if state["created"] and state["snapshot"] is None:
             cleanup = {"requested": True, "deleted": False}
             try:
-                ctx.hcloud.delete_server(server["hetzner_id"])
-                still_there = any(s["id"] == server["hetzner_id"] for s in ctx.hcloud.list_servers())
+                provider = ctx.provider_for(server)
+                provider.delete_server(server["provider_id"])
+                still_there = any(s["id"] == server["provider_id"] for s in provider.list_servers())
                 if still_there:
                     cleanup["error"] = "Hetzner still lists the server after deleting it"
                 else:
@@ -913,7 +940,7 @@ def startup_failure(ctx: Context, exc, state: dict, deadline, progress, limit_la
         ctx.event(server, "setup_failed")
 
     rate = f" (~€{server['price_hourly']:.4f}/h)" if server["price_hourly"] is not None else ""
-    lines.append(f"Server: {server['hetzner_id']} ({server['ip']})")
+    lines.append(f"Server: {server['provider_id']} ({server['ip']})")
     if deleted:
         lines.append("State: deleted (--cleanup-on-failure); Hetzner no longer lists it")
     else:
@@ -941,7 +968,7 @@ def server_summary(ctx: Context, server, snapshot=None, pruned=None) -> dict:
     snap = None
     if snapshot is not None:
         item = costs.snapshot_item(snapshot)
-        snap = {**dict(snapshot), "monthly_cost": item["price_monthly"]}
+        snap = {**db.row_dict(snapshot), "monthly_cost": item["price_monthly"]}
     return {
         "server": row(server),
         "uptime_seconds": usage["seconds"],
@@ -983,7 +1010,7 @@ def summary_lines(summary: dict) -> list[str]:
     if snap:
         size = f"{snap['size_gb']:.1f} GB" if snap["size_gb"] is not None else "size unknown"
         lines.append(
-            f"  snapshot {snap['hetzner_image_id']}: {size}, ~{costs.money(snap['monthly_cost'])}/month "
+            f"  snapshot {snap['image_id']}: {size}, ~{costs.money(snap['monthly_cost'])}/month "
             f"while kept; `devbox up {s['project']}` restores it"
         )
     for image_id in summary["deleted_snapshots"]:
@@ -1000,18 +1027,20 @@ def prune_snapshots(ctx: Context, project: str) -> list[int]:
     deleted = []
     for snap in db.snapshots(ctx.conn, project)[ctx.cfg.keep_snapshots:]:
         try:
-            ctx.hcloud.delete_image(snap["hetzner_image_id"])
+            ctx.provider_for(snap).delete_image(snap["image_id"])
         except DevboxError as e:
-            print(f"warning: could not delete old snapshot {snap['hetzner_image_id']}: {e}", file=sys.stderr)
+            print(f"warning: could not delete old snapshot {snap['image_id']}: {e}", file=sys.stderr)
             continue
         db.mark_snapshot_deleted(ctx.conn, snap["id"])
-        deleted.append(snap["hetzner_image_id"])
+        deleted.append(snap["image_id"])
     return deleted
 
 
 def snapshot_server(ctx: Context, server):
     """Shut the server down and snapshot it. On failure, try to power it back on."""
     name = server["project"]
+    provider = ctx.provider_for(server)
+    providers.require(provider, "has_snapshots", "snapshots, so it cannot pause")
     if server["power"] not in POWERED_DOWN:
         print(f"cleaning up {name} before the snapshot...", file=sys.stderr)
         try:
@@ -1019,15 +1048,15 @@ def snapshot_server(ctx: Context, server):
         except DevboxError as e:
             print(f"warning: cleanup before the snapshot failed, snapshotting as is: {e}", file=sys.stderr)
     print(f"shutting down {name} for a snapshot...", file=sys.stderr)
-    ctx.hcloud.shutdown(server["hetzner_id"])
+    provider.shutdown(server["provider_id"])
     db.update_server(ctx.conn, server["id"], power="off")
     print("creating snapshot (this can take a few minutes)...", file=sys.stderr)
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     try:
-        info = ctx.hcloud.create_snapshot(server["hetzner_id"], name, f"devbox {name} {stamp}")
+        info = provider.create_snapshot(server["provider_id"], name, f"devbox {name} {stamp}")
     except DevboxError as e:
         try:
-            ctx.hcloud.poweron(server["hetzner_id"])
+            provider.poweron(server["provider_id"])
             db.update_server(ctx.conn, server["id"], power="running")
             kept = "the server was kept and powered on again"
         except DevboxError:
@@ -1041,6 +1070,7 @@ def snapshot_server(ctx: Context, server):
         server_type=server["server_type"], location=server["location"],
         architecture=info["architecture"], size_gb=info["size_gb"], disk_gb=info["disk_gb"],
         price_per_gb_month=ctx.snapshot_price(), created_at=info.get("created"),
+        provider=provider.name,
     )
     return db.get_snapshot(ctx.conn, snap_id)
 
@@ -1048,6 +1078,8 @@ def snapshot_server(ctx: Context, server):
 def take_down(ctx: Context, server, snapshot: bool, event: str) -> dict:
     """Delete a project's server, optionally snapshotting it first. Caller holds the lock."""
     name = server["project"]
+    provider = ctx.provider_for(server)
+    providers.require(provider, "can_delete", "deleting servers")
     snap = None
     pruned: list[int] = []
     started = time.monotonic()
@@ -1056,18 +1088,18 @@ def take_down(ctx: Context, server, snapshot: bool, event: str) -> dict:
         if server["power"] in POWERED_DOWN and latest and latest["server_id"] == server["id"]:
             # An earlier pause saved this snapshot but failed to delete the
             # (already shut down) server; finish that instead of a second snapshot.
-            print(f"reusing snapshot {latest['hetzner_image_id']} from the earlier pause...", file=sys.stderr)
+            print(f"reusing snapshot {latest['image_id']} from the earlier pause...", file=sys.stderr)
             snap = latest
         else:
             snap = snapshot_server(ctx, server)
 
     try:
-        ctx.hcloud.delete_server(server["hetzner_id"])
+        provider.delete_server(server["provider_id"])
     except DevboxError as e:
         if snap is None:
             raise
         raise DevboxError(
-            f"snapshot {snap['hetzner_image_id']} is saved, but deleting server {server['hetzner_id']} failed: {e}. "
+            f"snapshot {snap['image_id']} is saved, but deleting server {server['provider_id']} failed: {e}. "
             f"The server is shut down and still billed. Run `devbox pause {name}` again to finish "
             f"(it reuses this snapshot), or `devbox up {name}` to power the server back on."
         )
@@ -1116,16 +1148,16 @@ def cmd_down(ctx: Context) -> int:
         summary = take_down(ctx, server, snapshot, "pause" if snapshot else "down")
         remaining = db.latest_snapshot(ctx.conn, name)
     summary["dumps"] = dumps
-    lines = [f"{'paused' if snapshot else 'deleted'} server {server['hetzner_id']} for {name}", *summary_lines(summary)]
+    lines = [f"{'paused' if snapshot else 'deleted'} server {server['provider_id']} for {name}", *summary_lines(summary)]
     lines += [f"  dumped {d['database']} ({human_size(d['bytes'])}) to {d['path']}" for d in dumps]
     if not snapshot and remaining:
         lines.append(
-            f"  note: snapshot {remaining['hetzner_image_id']} from {remaining['created_at'][:10]} is kept; "
+            f"  note: snapshot {remaining['image_id']} from {remaining['created_at'][:10]} is kept; "
             f"the next `devbox up {name}` restores it (use --fresh for a clean server)"
         )
     guidance = down_guidance(ctx, name, snapshot, remaining)
     lines += guidance_lines(guidance)
-    emit(ctx.args, {"project": name, "deleted": server["hetzner_id"], **summary, "next": guidance}, "\n".join(lines))
+    emit(ctx.args, {"project": name, "deleted": server["provider_id"], **summary, "next": guidance}, "\n".join(lines))
     return 0
 
 
@@ -1173,6 +1205,7 @@ def request_stop_at_hour_end(ctx: Context, name: str, action: str) -> int:
         if server is None:
             emit(ctx.args, {"project": name, "stop_action": None}, f"{name} has no server")
             return 0
+        providers.require(ctx.provider_for(server), "has_billing", "--at-hour-end (it has no billing hours)")
         db.request_stop(ctx.conn, server["id"], action)
         server = db.get_server(ctx.conn, server["id"])
     info = idle_info(ctx, server, datetime.now(timezone.utc))
@@ -1181,10 +1214,10 @@ def request_stop_at_hour_end(ctx: Context, name: str, action: str) -> int:
     if enforcement["status"] != admin.OK:
         warning = (f"nothing will carry this out: idle shutdown is not enforced ({enforcement['detail']}; "
                    f"fix: {enforcement['fix']}). The server keeps running and costing money")
-    data = {"project": name, "server": server["hetzner_id"], "stop_action": action,
+    data = {"project": name, "server": server["provider_id"], "stop_action": action,
             "paid_until": info["paid_until"], "planned_at": info["planned_at"], "warning": warning}
     lines = [
-        f"{name}: will {action} server {server['hetzner_id']} at about {clock(info['planned_at'])}, before the "
+        f"{name}: will {action} server {server['provider_id']} at about {clock(info['planned_at'])}, before the "
         f"next billing hour starts at {clock(info['paid_until'])}; until then the server stays usable",
         f"  using it (`up`, `exec`, `sync`, `touch`, ...) cancels this; a running foreground exec or "
         f"--keep-alive job postpones it to the next hour",
@@ -1241,6 +1274,8 @@ def idle_info(ctx: Context, server, now: datetime) -> dict:
     if server["stop_action"]:
         info.update(policy="requested", planned_action=server["stop_action"])
         ready = costs.parse_ts(server["stop_requested_at"])
+    elif timeout == config.HOUR_END and not ctx.bills(server):
+        return info  # billing hours do not exist here
     elif timeout == config.HOUR_END:
         info["policy"] = "hour-end"
         ready = last + config.parse_duration(ctx.cfg.min_idle)
@@ -1303,9 +1338,14 @@ def idle_check(ctx: Context) -> list[dict]:
         for server in db.active_servers(ctx.conn):
             info = idle_info(ctx, server, now)
             action = info["planned_action"]
-            entry = {"project": server["project"], "server": server["hetzner_id"], **info, "action": None}
+            entry = {"project": server["project"], "server": server["provider_id"], **info, "action": None}
             remaining = info["remaining_seconds"]
             if remaining is None or remaining > 0:
+                results.append(entry)
+                continue
+            problem = unsupported_idle_action(ctx, server, action)
+            if problem:
+                entry["skipped"] = problem
                 results.append(entry)
                 continue
             # Never interrupt work in progress: foreground `exec` commands and
@@ -1338,6 +1378,16 @@ def idle_check(ctx: Context) -> list[dict]:
                     entry["error"] = str(e)
             results.append(entry)
     return results
+
+
+def unsupported_idle_action(ctx: Context, server, action: str) -> str | None:
+    """Why the provider cannot carry out `pause` or `down`, or None."""
+    caps = ctx.provider_for(server).capabilities
+    if not caps.can_delete:
+        return f"its provider cannot delete servers, so it cannot {action}"
+    if action == "pause" and not caps.has_snapshots:
+        return "its provider has no snapshots, so it cannot pause"
+    return None
 
 
 def print_idle_check(ctx: Context, results: list[dict]) -> None:
@@ -1434,7 +1484,7 @@ def cmd_autostop_status(ctx: Context) -> int:
     servers = []
     for server in db.active_servers(ctx.conn):
         info = idle_info(ctx, server, now)
-        entry = {"project": server["project"], "server": server["hetzner_id"], **info,
+        entry = {"project": server["project"], "server": server["provider_id"], **info,
                  "eligible_at": None, "first_check": None}
         if info["remaining_seconds"] is not None:
             eligible = now + timedelta(seconds=info["remaining_seconds"])
@@ -1455,7 +1505,7 @@ def cmd_autostop_status(ctx: Context) -> int:
     data = {
         "healthy": enforcement["status"] == admin.OK and creds["status"] != admin.FAIL,
         "enforcement": enforcement, "credentials": creds,
-        "config_dir": config_dir, "state_dir": state_dir, "controller": ctx.hcloud.controller_id,
+        "config_dir": config_dir, "state_dir": state_dir, "controller": ctx.provider.controller_id,
         "entry": mine, "interval_minutes": interval if mine else None,
         "idle_timeout": ctx.cfg.idle_timeout, "idle_action": ctx.cfg.idle_action,
         "runs": runs, "servers": servers, "coverage": covered,
@@ -1467,7 +1517,7 @@ def cmd_autostop_status(ctx: Context) -> int:
     if enforcement["status"] != admin.OK and enforcement["fix"]:
         lines.append(f"       fix: {enforcement['fix']}")
     lines.append(f"[{STATUS_MARK[creds['status']]}] credentials: {creds['detail']}")
-    lines.append(f"config {config_dir}, state {state_dir}, controller {ctx.hcloud.controller_id}")
+    lines.append(f"config {config_dir}, state {state_dir}, controller {ctx.provider.controller_id}")
     lines.append(f"default timeout {ctx.cfg.idle_timeout}, then {ctx.cfg.idle_action}; per-project timeouts apply")
     if runs:
         parts = [f"last {k.removeprefix('last_')} {local(runs[k])}"
@@ -1572,7 +1622,7 @@ def cmd_status(ctx: Context) -> int:
             "server": row(server),
             "processes": None,
             "capacity": None,
-            "snapshot": {**dict(snap), "monthly_cost": costs.snapshot_item(snap)["price_monthly"]} if snap else None,
+            "snapshot": {**db.row_dict(snap), "monthly_cost": costs.snapshot_item(snap)["price_monthly"]} if snap else None,
         }
         if server:
             entry["uptime"] = uptime(server["created_at"])
@@ -1598,7 +1648,7 @@ def cmd_status(ctx: Context) -> int:
             if snap:
                 size = f"{snap['size_gb']:.1f} GB" if snap["size_gb"] is not None else "size unknown"
                 lines.append(
-                    f"{e['project']}: paused, snapshot {snap['hetzner_image_id']} from "
+                    f"{e['project']}: paused, snapshot {snap['image_id']} from "
                     f"{snap['created_at'][:16].replace('T', ' ')} ({size}, ~{costs.money(snap['monthly_cost'])}/month)"
                 )
             elif ctx.args.name:
@@ -1606,7 +1656,7 @@ def cmd_status(ctx: Context) -> int:
             continue
         lines.append(
             f"{e['project']}: {server_state(s)} {s['server_type']} {s['location']} {s['ip']} "
-            f"(id {s['hetzner_id']}, up {e['uptime']})"
+            f"(id {s['provider_id']}, up {e['uptime']})"
         )
         if s["power"] in POWERED_DOWN:
             lines.append(f"  powered off but still billed: `devbox up {e['project']}` starts it, "
@@ -1662,12 +1712,12 @@ def cmd_status(ctx: Context) -> int:
         if "processes_error" in e:
             lines.append(f"  processes: {e['processes_error']}")
         if snap:
-            lines.append(f"  snapshot {snap['hetzner_image_id']} kept (~{costs.money(snap['monthly_cost'])}/month)")
+            lines.append(f"  snapshot {snap['image_id']} kept (~{costs.money(snap['monthly_cost'])}/month)")
     for o in orphans:
         lines.append(f"unregistered devbox server {o['name']} (id {o['id']}, {o['ip']})")
     for o in ctx.snapshot_orphans:
         lines.append(f"unregistered devbox snapshot {o['id']} ({o['description']})")
-    controller = ctx.hcloud.controller_id
+    controller = ctx.provider.controller_id
     foreign = ctx.foreign_servers
     if not lines:
         lines.append(f"no devbox servers for controller {controller}")
@@ -1755,12 +1805,12 @@ def cmd_snapshot_list(ctx: Context) -> int:
     data = []
     for s in snaps:
         item = costs.snapshot_item(s)
-        data.append({**dict(s), "monthly_cost": item["price_monthly"], "cost_so_far": costs.server_usage(item)["cost"]})
+        data.append({**db.row_dict(s), "monthly_cost": item["price_monthly"], "cost_so_far": costs.server_usage(item)["cost"]})
     lines = [f"{'IMAGE':<10} {'PROJECT':<16} {'CREATED':<16} {'SIZE':>7} {'FROM':<12} {'€/MONTH':>8} {'SO FAR':>8}"]
     for d in data:
         size = f"{d['size_gb']:.1f}G" if d["size_gb"] is not None else "?"
         lines.append(
-            f"{d['hetzner_image_id']:<10} {d['project']:<16} {d['created_at'][:16].replace('T', ' '):<16} "
+            f"{d['image_id']:<10} {d['project']:<16} {d['created_at'][:16].replace('T', ' '):<16} "
             f"{size:>7} {(d['server_type'] or '?'):<12} {costs.money(d['monthly_cost']):>8} {costs.money(d['cost_so_far']):>8}"
         )
     for o in ctx.snapshot_orphans:
@@ -1777,7 +1827,7 @@ def cmd_snapshot_delete(ctx: Context) -> int:
         snap = db.get_snapshot_by_image(ctx.conn, image_id)
         if snap is None or snap["status"] == "deleted":
             raise DevboxError(f"no devbox snapshot {image_id}; see `devbox snapshot list`")
-        ctx.hcloud.delete_image(image_id)
+        ctx.provider_for(snap).delete_image(image_id)
         db.mark_snapshot_deleted(ctx.conn, snap["id"])
     emit(ctx.args, {"deleted": image_id, "project": snap["project"]}, f"deleted snapshot {image_id} of {snap['project']}")
     return 0
@@ -1858,7 +1908,7 @@ def cmd_history(ctx: Context) -> int:
         for sn in data["snapshots"]:
             size = f"{sn['size_gb']:.1f}G" if sn["size_gb"] is not None else "?"
             lines.append(
-                f"{sn['hetzner_image_id']:<10} {sn['project']:<14} {sn['created_at'][:16].replace('T', ' '):<16} "
+                f"{sn['image_id']:<10} {sn['project']:<14} {sn['created_at'][:16].replace('T', ' '):<16} "
                 f"{size:>6} {sn['status']:<9} {costs.money(sn['cost']):>7}"
             )
     t = data["total"]

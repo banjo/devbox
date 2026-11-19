@@ -23,7 +23,7 @@ import math
 import re
 from datetime import date, datetime, timedelta, timezone
 
-from devbox import DevboxError
+from devbox import DevboxError, db
 
 CURRENCY = "EUR"
 HOURS_PER_MONTH = 730
@@ -35,7 +35,7 @@ MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
 
 
 def server_item(row) -> dict:
-    return {**dict(row), "kind": "server"}
+    return {**db.row_dict(row), "kind": "server"}
 
 
 def snapshot_item(row) -> dict:
@@ -46,7 +46,8 @@ def snapshot_item(row) -> dict:
         "id": f"snapshot-{row['id']}",
         "kind": "snapshot",
         "project": row["project"],
-        "hetzner_id": row["hetzner_image_id"],
+        "provider_id": row["image_id"],
+        "hetzner_id": row["image_id"],
         "server_type": "snapshot",
         "location": "-",
         "created_at": row["created_at"],
@@ -280,7 +281,7 @@ def summarize(items, since=None, until=None, by: str = "project", now: datetime 
         elif by == "type":
             add("snapshot" if kind == "snapshot" else f"{item['server_type']} {item['location']}", kind, usage)
         else:
-            add(f"{item['project']}#{'snapshot-' if kind == 'snapshot' else ''}{item['hetzner_id']}", kind, usage)
+            add(f"{item['project']}#{'snapshot-' if kind == 'snapshot' else ''}{item['provider_id']}", kind, usage)
 
     ordered = sorted(groups.values(), key=lambda g: g["key"])
     # Round so that the rows add up exactly to the rounded totals.

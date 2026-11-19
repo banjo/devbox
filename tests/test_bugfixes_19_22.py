@@ -132,7 +132,7 @@ NOW = datetime(2026, 12, 1, tzinfo=timezone.utc)
 
 
 def item(created, deleted, hourly=0.01, monthly=5.0):
-    return dict(id=1, hetzner_id=101, project="app", created_at=created, deleted_at=deleted,
+    return dict(id=1, provider_id=101, project="app", created_at=created, deleted_at=deleted,
                 price_hourly=hourly, price_monthly=monthly, server_type="cx23", location="fsn1")
 
 
