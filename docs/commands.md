@@ -15,6 +15,14 @@ devbox server-types [filters]             server types that can be ordered now, 
 devbox up NAME [--type T --location L]    reuse the server, or create one (from the latest snapshot
                                           if there is one; --fresh for a clean image), sync code
 devbox resume NAME                        like up, but only from a snapshot
+devbox up NAME --host H [--cpus N --memory S]
+                                          run the project in an Incus container on your own host H
+                                          (see [Own hosts](hosts.md)); pause stops it, down deletes it
+devbox host add NAME --ssh USER@HOST [--key PATH] [--fingerprint FP | --yes]
+                                          register an own host and pin its SSH host key
+devbox host list                          hosts and their workspaces
+devbox host bootstrap NAME [--yes]        show (then apply) what a host needs: Incus, firewall rules
+devbox host remove NAME [--force]         forget a host (--force deletes its workspaces first; never the machine)
     up/resume options: --startup-timeout 5m, --cleanup-on-failure, --fresh, --over-budget,
                        --additional (create a server even if max_servers are running; once)
 devbox sync NAME [--watch]                copy local code to the server (keep syncing on save with --watch)

@@ -44,6 +44,18 @@
 
 Previews are described in [Previews](previews.md).
 
+## Providers and own hosts
+
+Where a server comes from is a provider (`devbox/providers/`), and commands ask its capabilities
+(create, delete, snapshots, billing, workspaces) instead of its name. Hetzner can do all of those but
+workspaces. The `ssh` provider is the opposite: it cannot create, delete or snapshot machines and does
+not bill. It runs each project as an Incus container on a machine you registered (`devbox host add`),
+see [Own hosts](hosts.md). Those rows have `servers.provider = 'ssh'` and `servers.host = <host name>`;
+`provider_id` is the container name. `up`, `pause` and `down` are orchestrators: they do the host step
+when the provider has one, then the workspace step, and skip what a capability rules out. Workspace
+connections reuse `Remote` through an SSH jump host (`ProxyCommand` with the host's pinned key), so
+`exec`, `sync`, `forward` and the rest are the same code for both kinds.
+
 ## Several servers
 
 Each project has at most one server, and several projects can have one at the same time. How many

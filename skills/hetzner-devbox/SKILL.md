@@ -41,6 +41,15 @@ Do **not** use it for reading or editing code, Git, or small checks such as lint
 
 1. `devbox project list`. If the project is missing, find its local folder and run `devbox project add NAME --path PATH`.
 
+### Own hosts (Incus workspaces)
+
+If the user has registered a host of their own (`devbox host list`), `devbox up NAME --host HOST` runs the project in an isolated Incus container there. It costs nothing, so the rules about asking before creating a server, picking the cheapest type, budgets and the paid hour do not apply to it; the commands are the same (`exec`, `sync`, `expose`, ...).
+
+- Use a host only when the user names one or says to use their own machine; otherwise follow the Hetzner procedure. Never add or remove hosts, and never run `devbox host bootstrap --yes`, without the user's approval. `devbox host bootstrap NAME` without `--yes` only prints a plan (Incus install, firewall rules) and is safe to show. When adding a host, show the user the fingerprint `host add` prints and let them confirm it (`--fingerprint SHA256:...` after they compared it); never pass `--yes` for them.
+- `pause` stops the container and keeps its files; `up` starts it again (processes and previews need starting again). `down` deletes the container and everything in it, so ask first and dump registered databases as for servers.
+- Limits: `--cpus N --memory 4GiB` on `up`. `status` shows host, workspace and limits. There is no idle shutdown and no cost on own hosts. Several projects on one host can use the same port.
+- devbox only touches containers it created (labelled `user.devbox.*`). If `up` says a container exists but was not created by devbox, do not work around it; tell the user.
+
 ### Choosing a server
 
 Hetzner often runs out of server types in some locations, so pick from what is available right now instead of assuming a type.

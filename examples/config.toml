@@ -50,3 +50,9 @@ max_servers = 1
 # Edit, Zone > DNS > Edit. Without preview_domain, URLs are random trycloudflare.com.
 # preview_domain = "example.com"
 # cloudflare_token_file = "~/.config/devbox/cloudflare-token"
+
+# Workspaces on your own hosts (`devbox up NAME --host HOST`): Incus image and the
+# default limits of each container; --cpus and --memory override them per run.
+# incus_image = "ubuntu/24.04"
+# incus_cpus = 2
+# incus_memory = "4GiB"
