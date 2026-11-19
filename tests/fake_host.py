@@ -25,6 +25,10 @@ class FakeHost:
         self.inputs: list[tuple[str, str]] = []
         self.next_ip = 2
         self.exec_fail: dict[str, int] = {}  # substring of an exec script -> exit code
+        self.exec_out: dict[str, str] = {}  # substring of an exec script -> stdout
+        self.version = "6.0.0"
+        self.images: list[dict] = []  # as `incus image list --format json`
+        self.launched_from: dict[str, str] = {}
 
     def add_container(self, name, labels=True, status="Running", controller=None, project=None):
         config = {}
@@ -63,14 +67,37 @@ class FakeHost:
             names = [a for a in args[1:] if a.startswith("^")]
             found = [c for c in self.containers.values() if not names or f"^{c['name']}$" == names[0]]
             return done(json.dumps(found))
-        name = next((a for a in args[1:] if a.startswith("devbox-")), None)
+        if verb == "version":
+            return done(f"Client version: {self.version}\nServer version: {self.version}\n")
+        if verb == "image":
+            if args[1] == "list":
+                return done(json.dumps(self.images))
+            if args[1] == "delete":
+                self.images = [i for i in self.images if i["fingerprint"] != args[2]]
+                return done()
+        if verb == "publish":
+            alias = args[args.index("--alias") + 1]
+            props = dict(a.split("=", 1) for a in args[2:] if "=" in a)
+            self.images = [i for i in self.images if alias not in [x["name"] for x in i["aliases"]]]
+            self.images.append({"fingerprint": f"fp{len(self.images)}{alias[-6:]}", "aliases": [{"name": alias}],
+                                "properties": props, "size": 1000})
+            return done()
+        name = next((a for a in args[1:] if a.startswith("devbox-") and not a.startswith("devbox-base-")), None)
         if verb == "launch":
             self.add_container(name, labels=False)
             c = self.containers[name]
-            for opt in (a for a in args if "=" in a and not a.startswith("images:")):
-                k, v = opt.split("=", 1)
-                c["config"][k] = v
-                c["expanded_config"][k] = v
+            self.launched_from[name] = args[1]
+            c["devices"], c["expanded_devices"] = {}, {}
+            for i, opt in enumerate(args):
+                if "=" in opt and not opt.startswith("images:") and args[i - 1] != "-d":
+                    k, v = opt.split("=", 1)
+                    c["config"][k] = v
+                    c["expanded_config"][k] = v
+                elif args[i - 1] == "-d":
+                    dev, _, kv = opt.partition(",")
+                    k, v = kv.split("=", 1)
+                    c["devices"][dev] = {k: v}
+                    c["expanded_devices"][dev] = {"type": "nic", k: v}
             return done()
         if verb == "exec":
             script = args[args.index("bash") + 2]
@@ -78,6 +105,9 @@ class FakeHost:
             for needle, code in self.exec_fail.items():
                 if needle in script:
                     return done(err="failed", code=code)
+            for needle, out in self.exec_out.items():
+                if needle in script:
+                    return done(out)
             return done()
         c = self.containers.get(name)
         if verb == "start":
@@ -86,6 +116,10 @@ class FakeHost:
             c["status"] = "Stopped"
         elif verb == "delete":
             del self.containers[name]
+        elif verb == "config" and args[1] == "device":
+            k, v = args[5].split("=", 1)
+            c.setdefault("devices", {}).setdefault(args[4], {})[k] = v
+            c.setdefault("expanded_devices", {}).setdefault(args[4], {})[k] = v
         elif verb == "config":
             k, v = args[3].split("=", 1)
             c["config"][k] = v
@@ -93,4 +127,5 @@ class FakeHost:
         return done()
 
     def mutating(self):
-        return [c for c in self.calls if c[0] in ("launch", "start", "stop", "delete", "exec", "config")]
+        return [c for c in self.calls if c[0] in ("launch", "start", "stop", "delete", "exec", "config", "publish")
+                or c[:2] == ["image", "delete"]]

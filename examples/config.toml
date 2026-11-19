@@ -56,3 +56,9 @@ max_servers = 1
 # incus_image = "ubuntu/24.04"
 # incus_cpus = 2
 # incus_memory = "4GiB"
+# Keep a provisioned base image on each host: the first `up` on a host installs everything and
+# publishes it, later workspaces start from it (rebuilt when devbox's setup or Incus changes).
+# incus_image_cache = true
+# Port isolation (Incus security.port_isolation) on new workspaces: they cannot reach each other
+# over the host's bridge. `up --isolate` / `--no-isolate` decides per workspace.
+# incus_isolate = false

@@ -46,7 +46,7 @@ def doctor(ctx, resolve_ssh_allow) -> list[dict]:
     if db.list_hosts(ctx.conn):
         checks += ctx.ssh.check_connection(cfg)[0]
     if not usable:
-        return checks + registry_checks(ctx)
+        return checks + registry_checks(ctx) + host_leftover_checks(ctx)
 
     pub = cfg.ssh_key.with_name(cfg.ssh_key.name + ".pub")
     if not cfg.ssh_key.exists() or not pub.exists():
@@ -66,12 +66,13 @@ def doctor(ctx, resolve_ssh_allow) -> list[dict]:
     except DevboxError as e:
         add(check("leftovers", WARN, f"could not check: {e}"))
     else:
-        cloud = [c for c in plan if c["kind"] != "local file"]
+        cloud = [c for c in plan if c["kind"] != "local file" and c["kind"] not in HOST_KINDS]
         if cloud:
             add(check("leftovers", WARN, f"{len(cloud)} unused devbox resource(s) in {ctx.provider.display_name} or Cloudflare",
                       "see `devbox cleanup`"))
         else:
             add(check("leftovers", OK, "no unused devbox resources"))
+        checks += host_leftover_checks(ctx, [c for c in plan if c["kind"] in HOST_KINDS])
         for note in notes:
             add(check("leftovers", WARN, note))
 
@@ -79,6 +80,62 @@ def doctor(ctx, resolve_ssh_allow) -> list[dict]:
     budget = cfg.monthly_budget
     add(check("budget", OK, f"{costs.money(budget)} per month ({cfg.budget_action})" if budget else "no monthly budget set"))
     return checks
+
+
+HOST_KINDS = ("workspace container", "base image")
+
+
+def host_leftover_checks(ctx, plan: list[dict] | None = None) -> list[dict]:
+    """Unused devbox containers and base images on registered hosts, as doctor checks."""
+    if not db.list_hosts(ctx.conn):
+        return []
+    notes: list[str] = []
+    if plan is None:
+        plan = host_leftovers(ctx, notes)
+    checks = [check("host leftovers", WARN, note) for note in notes]
+    found = [p for p in plan if p["kind"] in HOST_KINDS]
+    if found:
+        what = ", ".join(f"{p['kind']} {p['name']} on {p['host']}" for p in found)
+        checks.append(check("host leftovers", WARN, f"{len(found)} unused devbox item(s) on your hosts: {what}",
+                            "see `devbox cleanup`"))
+    elif not notes:
+        checks.append(check("host leftovers", OK, "no unused devbox containers or images on your hosts"))
+    return checks
+
+
+def host_leftovers(ctx, notes: list[str]) -> list[dict]:
+    """devbox-labelled containers on registered hosts that no registered workspace uses, and base images that
+    the current setup no longer matches. Only lists; foreign devbox installs' containers are only noted."""
+    from devbox import incus
+
+    plan: list[dict] = []
+    used = {(s["host"], s["provider_id"]) for s in db.active_servers(ctx.conn) if s["host"]}
+    for row in db.list_hosts(ctx.conn):
+        name = row["name"]
+        try:
+            inc = ctx.incus(ctx.ssh.host(name))
+            ours = inc.list_workspaces()
+            foreign = inc.foreign_workspaces()
+            images = inc.base_images()
+            current = incus.base_alias(ctx.cfg.incus_image, inc.version()) if ctx.cfg.incus_image_cache else None
+        except DevboxError as e:
+            notes.append(f"host {name} not checked for unused containers: {e}")
+            continue
+        for c in ours:
+            if (name, c["name"]) not in used:
+                project = (c.get("config") or {}).get(incus.PROJECT) or "?"
+                plan.append({"kind": "workspace container", "id": c["name"], "name": c["name"], "host": name,
+                             "reason": f"devbox container on host {name} that no workspace in the registry uses "
+                                       f"(project {project}, {str(c.get('status', '')).lower() or 'unknown state'})"})
+        for img in images:
+            if img["alias"] != current:
+                plan.append({"kind": "base image", "id": img["fingerprint"], "name": img["alias"], "host": name,
+                             "reason": f"outdated cached base image on host {name}"
+                                       if current else f"cached base image on host {name} (incus_image_cache is off)"})
+        if foreign:
+            notes.append(f"host {name} also has devbox container(s) of another devbox install "
+                         f"({', '.join(c['name'] for c in foreign)}); they are not touched from here")
+    return plan
 
 
 def cloudflare_check(cfg) -> dict:
@@ -186,6 +243,9 @@ def cleanup_plan(ctx, notes: list[str] | None = None) -> list[dict]:
     """
     notes = notes if notes is not None else []
     plan: list[dict] = []
+    plan += host_leftovers(ctx, notes)
+    if ctx.hosts_only():
+        return plan + local_leftovers(ctx, notes)
     orphans = ctx.reconcile()
     for s in orphans:
         plan.append({"kind": "server", "id": s["id"], "name": s["name"],
@@ -197,15 +257,20 @@ def cleanup_plan(ctx, notes: list[str] | None = None) -> list[dict]:
     pub = ctx.cfg.ssh_key.with_name(ctx.cfg.ssh_key.name + ".pub")
     local_key = pub.read_text().strip() if pub.exists() else None
     plan += ctx.provider.leftovers(local_key, notes)
+    return plan + local_leftovers(ctx, notes)
 
-    active = {(s["project"], str(s["provider_id"])) for s in db.active_servers(ctx.conn)}
+
+def local_leftovers(ctx, notes: list[str]) -> list[dict]:
+    plan: list[dict] = []
+    active = {f"{s['project']}-{s['provider_id']}" for s in db.active_servers(ctx.conn)}
     known_hosts = ctx.cfg.state_dir / "known_hosts"
     if known_hosts.is_dir():
+        host_files = {f"host-{r['name']}" for r in db.list_hosts(ctx.conn)}  # pinned keys of registered hosts
         for f in sorted(known_hosts.iterdir()):
-            project, _, server_id = f.name.rpartition("-")
-            if (project, server_id) not in active:
-                plan.append({"kind": "local file", "id": str(f), "name": f.name,
-                             "reason": "SSH host keys of a server that no longer exists"})
+            if f.name in host_files or f.name in active:
+                continue
+            plan.append({"kind": "local file", "id": str(f), "name": f.name,
+                         "reason": "SSH host keys of a server that no longer exists"})
     projects = {p["name"] for p in db.list_projects(ctx.conn)}
     plan += cloudflare_leftovers(ctx, projects, notes)
     manifests = ctx.cfg.state_dir / "manifests"
@@ -253,6 +318,12 @@ def run_cleanup(ctx, plan: list[dict]) -> list[dict]:
                 ctx.provider.delete_image(item["id"])
             elif item["kind"] in ("firewall", "ssh-key"):
                 ctx.provider.delete_resource(item["kind"], item["id"])
+            elif item["kind"] in HOST_KINDS:
+                inc = ctx.incus(ctx.ssh.ensure_host(item["host"]))
+                if item["kind"] == "base image":
+                    inc.delete_base_image(item["id"])
+                else:
+                    inc.delete(item["id"])
             elif item["kind"] == "local file":
                 Path(item["id"]).unlink(missing_ok=True)
             elif item["kind"] == "dns record":

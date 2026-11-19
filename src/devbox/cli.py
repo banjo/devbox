@@ -645,8 +645,8 @@ def cmd_up(ctx: Context) -> int:
     active = db.active_server(ctx.conn, name)
     if ctx.args.host or (active is not None and ctx.is_workspace(active)):
         return cmd_up_workspace(ctx, project, ctx.args.host)
-    if ctx.args.cpus or ctx.args.memory:
-        raise DevboxError("--cpus and --memory only apply to workspaces on your own hosts (`up NAME --host HOST`)")
+    if ctx.args.cpus or ctx.args.memory or ctx.args.isolate is not None:
+        raise DevboxError("--cpus, --memory and --isolate only apply to workspaces on your own hosts (`up NAME --host HOST`)")
     limit_label, limit = startup_limit(ctx, project)
     deadline = startup.Deadline(limit)
     progress = startup.Progress(deadline)
@@ -816,6 +816,7 @@ def report_up(ctx: Context, r: dict, deadline: "startup.Deadline") -> int:
         "cancelled_stop": r["cancelled_stop"],
         "other_servers": r["other_servers"],
         "next": up_guidance(ctx, name, project["notes"], server, r["state"]),
+        **({"image_cache": r["image_cache"]} if "image_cache" in r else {}),
     }
     verb = "powered on" if r["powered_on"] else "reusing"
     if r["created"]:
@@ -837,6 +838,9 @@ def report_up(ctx: Context, r: dict, deadline: "startup.Deadline") -> int:
         text.append(f"  {offer['choice']}: {describe_offer(offer)}")
     if r["created"] or r["powered_on"]:
         text.append("  startup: " + stage_summary(r["stages"]))
+    if r.get("image_cache") in ("hit", "published"):
+        text.append("  base image: " + ("started from the cached image of this host" if r["image_cache"] == "hit"
+                                        else "published for later workspaces on this host"))
     if r["created"] and snapshot:
         text.append(f"  from snapshot taken {snapshot['created_at'][:16].replace('T', ' ')}")
     if r["cancelled_stop"]:
@@ -2491,9 +2495,27 @@ def preview_dict(r) -> dict:
         | {"protected": bool(r["protected"])}
 
 
+def preview_owners(ctx: Context) -> dict[str, set[str]]:
+    """Hostname labels claimed by every registered project (see previews.label_owners)."""
+    opened: dict[str, list[str]] = {}
+    for s in db.active_servers(ctx.conn):
+        opened.setdefault(s["project"], []).extend(r["name"] for r in db.previews(ctx.conn, s["id"]))
+    return previews.label_owners([p["name"] for p in db.list_projects(ctx.conn)], opened)
+
+
+def check_hostname_unclaimed(ctx: Context, project: str, preview: str) -> None:
+    other = previews.claimed_by_other(project, preview, preview_owners(ctx))
+    if other:
+        raise DevboxError(
+            f"the hostname label '{previews.label(project, preview)}' is also what project '{other}' uses "
+            f"(`<project>` or `<project>-<preview>`); use another preview name for {project} so every workspace "
+            "keeps its own stable URL")
+
+
 def write_preview_env(ctx: Context, server) -> dict[str, str]:
     """Tell the app its preview URLs (previews.ENV_FILE); rewritten from scratch every time."""
-    values = previews.env(server["project"], ctx.cfg.preview_domain, db.previews(ctx.conn, server["id"]))
+    values = previews.env(server["project"], ctx.cfg.preview_domain, db.previews(ctx.conn, server["id"]),
+                          preview_owners(ctx) if ctx.cfg.preview_domain else None)
     ctx.remote(server).write_file(previews.ENV_FILE, previews.env_script(values), mode="644")
     return values
 
@@ -2552,6 +2574,7 @@ def cmd_expose(ctx: Context) -> int:
     if domain:
         # Refuse a hostname with someone else's DNS record before creating anything for it.
         host = previews.hostname(name, preview, domain)
+        check_hostname_unclaimed(ctx, name, preview)
         tunnel = NamedTunnel(ctx, name, host, create=False)
         tunnel.cf.check_hostname(tunnel.zone["id"], host, tunnel.id)
 
@@ -2669,9 +2692,15 @@ def cmd_host_add(ctx: Context) -> int:
         ctx.ssh.shell(host).run("true", timeout=30)
     except DevboxError as e:
         note = f"added, but the host did not accept a login yet: {e}"
-    data = {"name": a.name, "ssh": a.ssh, "fingerprint": print_fp, "host_key_type": host.key_type, "warning": note}
+    steps = ([f"fix SSH access to {a.ssh} (the host key is pinned, the login failed), then `devbox host list`"] if note else
+             [f"`devbox host bootstrap {a.name}` shows what the host needs for workspaces (nothing changes without --yes)",
+              f"then `devbox up PROJECT --host {a.name}` starts a project in its own container there"])
+    data = {"name": a.name, "ssh": a.ssh, "fingerprint": print_fp, "host_key_type": host.key_type, "warning": note,
+            "reachable": note is None, "next": {"steps": steps}}
     text = [f"added host {a.name} ({a.ssh}), pinned {host.key_type} {print_fp}"]
-    text.append(note and f"warning: {note}" or f"  reachable; next: `devbox host bootstrap {a.name}` checks Incus there")
+    if note:
+        text.append(f"warning: {note}")
+    text += guidance_lines(data["next"])
     emit(a, data, "\n".join(text))
     return 0
 
@@ -2708,34 +2737,61 @@ def cmd_host_remove(ctx: Context) -> int:
                 ctx.known_hosts(w).unlink(missing_ok=True)
                 ctx.manifest(w["project"]).unlink(missing_ok=True)
                 removed.append(w["project"])
+        images = []
+        try:  # the cached base images are devbox's own; they are of no use without the registry entry
+            inc = ctx.incus(ctx.ssh.ensure_host(name))
+            for img in inc.base_images():
+                inc.delete_base_image(img["fingerprint"])
+                images.append(img["alias"])
+        except DevboxError as e:
+            print(f"warning: could not remove the cached base image from host {name}: {e}", file=sys.stderr)
         db.remove_host(ctx.conn, name)
         (ctx.cfg.state_dir / "known_hosts" / f"host-{name}").unlink(missing_ok=True)
-    emit(ctx.args, {"host": name, "deleted_workspaces": removed},
+    emit(ctx.args, {"host": name, "deleted_workspaces": removed, "deleted_base_images": images},
          f"removed host {name} from devbox" + (f"; deleted workspaces {', '.join(removed)}" if removed else "")
+         + (f"; deleted cached base image {', '.join(images)}" if images else "")
          + " (the machine was not touched)")
     return 0
 
 
+def bootstrap_next(name: str, plan: "hosts.Plan", applied: bool, zabbly: bool) -> dict:
+    if plan.blockers:
+        return {"steps": [f"fix what is blocked above, then run `devbox host bootstrap {name}` again"]}
+    if plan.steps:
+        flag = " --zabbly" if zabbly else ""
+        return {"steps": [f"check the plan, then `devbox host bootstrap {name}{flag} --yes` applies it"]}
+    steps = [f"`devbox up PROJECT --host {name}` starts a project in its own container on {name}"]
+    if applied or plan.notes:
+        steps.append(f"`devbox host list` shows the hosts and their workspaces")
+    return {"steps": steps}
+
+
 def cmd_host_bootstrap(ctx: Context) -> int:
     name = ctx.args.name
+    zabbly = ctx.args.zabbly
     host = ctx.ssh.host(name)
     shell = ctx.ssh.shell(host)
-    plan = hosts.make_plan(name, hosts.collect_facts(shell))
+    plan = hosts.make_plan(name, hosts.collect_facts(shell), zabbly=zabbly)
     if ctx.args.yes and not plan.nothing_to_do and not plan.blockers:
         for line in plan.lines():
             print(line, file=sys.stderr)
         facts = hosts.apply_plan(shell, plan, say=lambda m: print(f"{m}...", file=sys.stderr))
-        after = hosts.make_plan(name, facts)
-        emit(ctx.args, {"applied": True, "plan": plan.as_dict(), "after": after.as_dict()},
-             "\n".join(["applied", *after.lines()]))
+        after = hosts.make_plan(name, facts, zabbly=zabbly)
+        nxt = bootstrap_next(name, after, True, zabbly)
+        emit(ctx.args, {"applied": True, "plan": plan.as_dict(), "after": after.as_dict(), "next": nxt},
+             "\n".join(["applied", *after.lines(), *guidance_lines(nxt)]))
         return 1 if after.blockers or after.steps else 0
-    data = {"applied": False, **plan.as_dict()}
+    nxt = bootstrap_next(name, plan, False, zabbly)
+    data = {"applied": False, **plan.as_dict(), "next": nxt}
     lines = plan.lines()
     if plan.blockers:
-        emit(ctx.args, data, "\n".join(lines))
+        emit(ctx.args, data, "\n".join(lines + guidance_lines(nxt)))
         return 1
     if not plan.nothing_to_do:
-        lines.append(f"nothing was changed; run `devbox host bootstrap {name} --yes` to apply this plan")
+        lines.append(f"nothing was changed; run `devbox host bootstrap {name}{' --zabbly' if zabbly else ''} --yes` "
+                     "to apply this plan")
+    else:
+        lines += guidance_lines(nxt)
     emit(ctx.args, data, "\n".join(lines))
     return 0
 
@@ -2745,8 +2801,8 @@ def workspace_limits(ctx: Context, server=None) -> tuple[int, str]:
     return a.cpus or ctx.cfg.incus_cpus, a.memory or ctx.cfg.incus_memory
 
 
-def limits_label(cpus, memory) -> str:
-    return f"incus container, {cpus} cpu, {memory}"
+def limits_label(cpus, memory, isolated: bool = False) -> str:
+    return f"incus container, {cpus} cpu, {memory}" + (", isolated" if isolated else "")
 
 
 def cmd_up_workspace(ctx: Context, project, host_name: str | None) -> int:
@@ -2793,17 +2849,29 @@ def bring_up_workspace(ctx: Context, project, host_name: str | None, deadline: "
     if container is not None and (container.get("config") or {}).get(incus.PROJECT) != name:
         raise DevboxError(f"container {cname} on host {host_name} belongs to another project; devbox does not reuse it")
     cpus, memory = workspace_limits(ctx)
-    label = limits_label(cpus, memory)
+    isolate = ctx.args.isolate if ctx.args.isolate is not None else (
+        incus.Incus.isolated(container) if container is not None else cfg.incus_isolate)
+    label = limits_label(cpus, memory, isolate)
     created = False
     powered_on = False
+    image_cache = "off"
+    cache_alias = None
+    if cfg.incus_image_cache:
+        cache_alias = incus.base_alias(cfg.incus_image, inc.version())
 
     if server is None:
         progress.step("create", f"Creating workspace {cname} on host {host_name}: {cpus} cpu, {memory}")
         if container is None:
-            inc.create(cname, name, cfg.incus_image, cpus, memory)
+            base = cache_alias if cache_alias and inc.has_base(cache_alias) else None
+            if base:
+                image_cache = "hit"
+                progress.say("Starting from the cached base image")
+            inc.create(cname, name, cfg.incus_image, cpus, memory, isolate=isolate, base=base)
         else:
             progress.say(f"Reusing container {cname} left by an earlier run")
             inc.set_limits(cname, ctx.args.cpus, ctx.args.memory)
+            if ctx.args.isolate is not None:
+                inc.set_isolation(cname, isolate)
         ctx.manifest(name).unlink(missing_ok=True)  # a new container has none of the synced files
         server_id = db.insert_server(
             ctx.conn, name, cname, "creating", power="running", server_type=label, location=host_name,
@@ -2826,9 +2894,13 @@ def bring_up_workspace(ctx: Context, project, host_name: str | None, deadline: "
             powered_on = True
         if ctx.args.cpus or ctx.args.memory:
             inc.set_limits(cname, ctx.args.cpus, ctx.args.memory)
-            if (ctx.args.cpus or ctx.args.memory) and label != server["server_type"]:
-                db.update_server(ctx.conn, server["id"], server_type=label)
-                progress.say(f"Limits changed: {cpus} cpu, {memory}")
+        if ctx.args.isolate is not None and ctx.args.isolate != inc.isolated(container):
+            inc.set_isolation(cname, isolate)
+            warnings.append(f"network isolation {'on' if isolate else 'off'} for {cname}; it applies after the "
+                            f"container restarts (`devbox pause {name}`, then `devbox up {name}`)")
+        if (ctx.args.cpus or ctx.args.memory or ctx.args.isolate is not None) and label != server["server_type"]:
+            db.update_server(ctx.conn, server["id"], server_type=label)
+            progress.say(f"Workspace settings changed: {label.removeprefix('incus container, ')}")
 
     ip = inc.wait_ipv4(cname, deadline.bound("ssh", 60))
     db.update_server(ctx.conn, server["id"], ip=ip, power="running")
@@ -2840,8 +2912,14 @@ def bring_up_workspace(ctx: Context, project, host_name: str | None, deadline: "
         host_private, host_public = generate_host_key()
         public_key = ensure_local_ssh_key(cfg.ssh_key)
         db.update_server(ctx.conn, server["id"], host_key=host_public)
-        inc.provision(cname, public_key, host_private, host_public, say=progress.say,
-                      bound=lambda: deadline.bound("cloud-init", 900))
+        publish_as = cache_alias if cache_alias and image_cache != "hit" and not inc.has_base(cache_alias) else None
+        provisioned = inc.provision(cname, public_key, host_private, host_public, say=progress.say,
+                                    bound=lambda: deadline.bound("cloud-init", 900), publish_as=publish_as)
+        if provisioned["published"]:
+            image_cache = "published"
+        if provisioned["workaround"]:
+            warnings.append(f"Docker needed the runc 1.2.3 workaround on this host's Incus; "
+                            f"`devbox host bootstrap {host_name} --zabbly` plans a newer Incus")
         server = db.get_server(ctx.conn, server["id"])
     remote = ctx.remote(server)
     remote.wait_ssh(deadline, progress)
@@ -2871,7 +2949,7 @@ def bring_up_workspace(ctx: Context, project, host_name: str | None, deadline: "
         "project": project, "server": db.active_server(ctx.conn, name), "created": created,
         "powered_on": powered_on, "snapshot": None, "offer": None, "warnings": warnings,
         "secrets_written": secrets_written, "cancelled_stop": cancelled_stop, "stages": stages,
-        "preview_env": preview_env, "state": state_name, "other_servers": [],
+        "preview_env": preview_env, "state": state_name, "other_servers": [], "image_cache": image_cache,
     }
 
 
@@ -3107,6 +3185,9 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
                        help="run the project in a container on this own host (see `devbox host add`)")
         p.add_argument("--cpus", type=int, metavar="N", help="CPU limit of a new or existing workspace (with --host)")
         p.add_argument("--memory", metavar="SIZE", help="memory limit of a workspace, e.g. 4GiB (with --host)")
+        p.add_argument("--isolate", action=argparse.BooleanOptionalAction, default=None,
+                       help="block traffic to other isolated workspaces on the host's bridge (with --host; "
+                            "default: incus_isolate in config, off)")
         p.add_argument("--additional", "--force", dest="additional", action="store_true",
                        help="create a server even if max_servers are already running (this run only)")
         p.add_argument("--over-budget", action="store_true", help="create even if the monthly budget is used up")
@@ -3128,6 +3209,9 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
     p = add_sub(host_sub, "bootstrap", cmd_host_bootstrap, "show, then with --yes apply, what a host needs to run workspaces")
     p.add_argument("name", help="host name")
     p.add_argument("--yes", action="store_true", help="apply the plan (install and initialise Incus, firewall rules)")
+    p.add_argument("--zabbly", action="store_true",
+                   help="plan Incus from the Zabbly repository (install, or upgrade an old archive version); "
+                        "applied only together with --yes")
     p = add_sub(host_sub, "remove", cmd_host_remove, "forget a host (the machine is never touched)")
     p.add_argument("name", help="host name")
     p.add_argument("--force", action="store_true", help="delete the workspaces on the host first")
