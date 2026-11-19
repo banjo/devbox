@@ -27,7 +27,7 @@ OLD_INCUS_BELOW = (6, 1)
 ZABBLY_URL = "https://pkgs.zabbly.com/incus/stable"
 ZABBLY_KEY_URL = "https://pkgs.zabbly.com/key.asc"
 # Fingerprint of the Zabbly archive signing key (the key is checked against it before it is trusted).
-ZABBLY_KEY_FPR = "4EFC590696CB15B87C73A3AD82CC8797C838DCFD"
+ZABBLY_KEY_FPR = "4EFC 5906 96CB 15B8 7C73 A3AD 82CC 8797 C838 DCFD".replace(" ", "")
 ZABBLY_KEYRING = "/etc/apt/keyrings/zabbly.asc"
 ZABBLY_SOURCES = "/etc/apt/sources.list.d/zabbly-incus-stable.sources"
 ZABBLY_SUITES = {"bookworm", "trixie", "jammy", "noble", "resolute"}
