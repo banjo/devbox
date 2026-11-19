@@ -27,7 +27,8 @@ costs around €0.01 an hour, and every server is capped at its monthly price. R
 `devbox server-types` to see the current prices.
 
 > [!NOTE]
-> devbox is early software. Hetzner Cloud is the only supported provider for now; see [#35](https://github.com/banjo/devbox/issues/35) and the [backlog](https://github.com/banjo/devbox/issues/41).
+> devbox is early software. Hetzner Cloud is the only provider that creates servers for now; machines you
+> own can run projects as Incus containers ([Own hosts](docs/hosts.md)); see [#35](https://github.com/banjo/devbox/issues/35) and the [backlog](https://github.com/banjo/devbox/issues/41).
 
 ## Highlights
 
@@ -41,6 +42,8 @@ costs around €0.01 an hour, and every server is capped at its monthly price. R
 - 🗄️ Dump and restore project databases (Postgres, SQLite)
 - 💤 Pauses idle servers to a snapshot, without stopping work that is still running; `touch --for 2h`
   holds a server while you test it
+- 🏠 Optionally run each project as an isolated Incus container on a machine you own (`devbox up --host`),
+  free and with the same commands
 - 🤖 `--json` on every command, made to be driven by an agent
 
 ## Getting started
@@ -73,6 +76,7 @@ See [Installation](docs/installation.md) for the full setup, including the agent
 - [How it works](docs/how-it-works.md): state, labels, server choice, sync and startup
 - [Development loop](docs/development-loop.md): watch mode, pulling files, port forwarding, secrets
 - [Previews](docs/previews.md): public URLs, stable domains and password protection
+- [Own hosts](docs/hosts.md): run projects as Incus containers on a machine you own
 - [Databases](docs/databases.md): dumping and restoring Postgres and SQLite
 - [Snapshots](docs/snapshots.md): pause and resume
 - [Idle shutdown](docs/idle-shutdown.md): what counts as activity, and `devbox autostop`

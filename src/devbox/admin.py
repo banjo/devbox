@@ -43,6 +43,8 @@ def doctor(ctx, resolve_ssh_allow) -> list[dict]:
     provider = ctx.provider
     found, usable = provider.check_connection(cfg)
     checks += found
+    if db.list_hosts(ctx.conn):
+        checks += ctx.ssh.check_connection(cfg)[0]
     if not usable:
         return checks + registry_checks(ctx)
 

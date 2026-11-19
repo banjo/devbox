@@ -20,6 +20,8 @@ class Capabilities:
     has_snapshots: bool = False  # machine images (`pause`, restore on `up`, `snapshot ...`)
     has_billing: bool = False  # bills by time: costs, billing hours, `--at-hour-end`
     has_offers: bool = False  # lists orderable server types and prices (`server-types`)
+    # The unit of work is a container on a machine devbox does not manage (`pause` stops it, `down` deletes it).
+    workspaces: bool = False
 
 
 @dataclass(frozen=True)

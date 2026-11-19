@@ -14,12 +14,14 @@ from datetime import datetime, timedelta, timezone
 from importlib import resources
 from pathlib import Path
 
-from devbox import DevboxError, admin, autostop, billing, config, costs, databases, db, envsecrets, previews, providers, startup, watch
+from devbox import (DevboxError, admin, autostop, billing, config, costs, databases, db, envsecrets, hosts, incus,
+                    previews, providers, startup, watch)
 from devbox.providers.hetzner import filter_offers
 from devbox.remote import PULL_PRUNE, Remote, git_files, git_ignored, to_script, validate_proc
 
 
 EXIT_TIMEOUT = 124
+SSH_PROVIDER = "ssh"
 # Server statuses (Hetzner's, reported by every provider) in which nothing runs on the server.
 POWERED_DOWN = ("off", "stopping")
 # Using the server again cancels a `pause/down --at-hour-end`; looking at it doesn't.
@@ -53,7 +55,10 @@ class Context:
 
     def provider_named(self, name: str) -> "providers.Provider":
         if name not in self._providers:
-            self._providers[name] = providers.get(name, self.cfg)
+            provider = providers.get(name, self.cfg)
+            if name == SSH_PROVIDER:
+                provider._conn_factory = lambda: self.conn  # one registry connection per command
+            self._providers[name] = provider
         return self._providers[name]
 
     @property
@@ -70,6 +75,17 @@ class Context:
         """Back-compat alias for the Hetzner provider."""
         return self.provider_named("hetzner")
 
+    def is_workspace(self, server) -> bool:
+        """Is this server a container on an own host (not a machine devbox manages)?"""
+        return providers.capabilities(server["provider"]).workspaces
+
+    @property
+    def ssh(self) -> "providers.SshProvider":
+        return self.provider_named(SSH_PROVIDER)
+
+    def incus(self, host: "hosts.Host") -> "incus.Incus":
+        return incus.Incus(self.ssh.shell(host), self.cfg.get_controller_id())
+
     def known_hosts(self, server) -> Path:
         path = self.cfg.state_dir / "known_hosts" / f"{server['project']}-{server['provider_id']}"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -83,7 +99,8 @@ class Context:
         known_hosts = self.known_hosts(server)
         if server["host_key"]:
             known_hosts.write_text(f"{server['ip']} {server['host_key']}\n")
-        return Remote(server["ip"], self.cfg.ssh_key, known_hosts, pinned=bool(server["host_key"]))
+        jump = self.ssh.host(server["host"]).jump(self.cfg.state_dir) if self.is_workspace(server) else None
+        return Remote(server["ip"], self.cfg.ssh_key, known_hosts, pinned=bool(server["host_key"]), jump=jump)
 
     def running_server(self, project: str):
         db.require_project(self.conn, project)
@@ -97,6 +114,8 @@ class Context:
                     f"`devbox up {project}` retries it, `devbox down {project}` deletes it"
                 )
             raise DevboxError(f"server for '{project}' is still being set up; run `devbox up {project}` again")
+        if server["power"] in POWERED_DOWN and self.is_workspace(server):
+            raise DevboxError(f"the workspace for '{project}' is paused; `devbox up {project}` starts it again")
         if server["power"] in POWERED_DOWN:
             raise DevboxError(
                 f"the server for '{project}' is powered off (and still billed); "
@@ -107,6 +126,8 @@ class Context:
     def reconcile(self) -> list[dict]:
         # One provider listing: this controller's servers are reconciled; other
         # controllers' servers are only kept for reporting, never adopted.
+        if self.hosts_only():
+            return []  # only own hosts are in use: nothing to ask Hetzner about
         provider = self.provider
         everything = provider.list_all_servers()
         mine = [s for s in everything if s["controller"] in (None, provider.controller_id)]
@@ -118,6 +139,43 @@ class Context:
         )
         self.fill_missing_prices()
         return orphans
+
+    def hosts_only(self) -> bool:
+        """Own hosts are registered and there is no Hetzner token: nothing to ask Hetzner about."""
+        try:
+            token = self.cfg.hcloud_token()
+        except DevboxError:
+            return False  # an unreadable token file is reported by the first Hetzner call
+        return not token and bool(db.list_hosts(self.conn))
+
+    def reconcile_host(self, host_name: str) -> list[str]:
+        """Bring the registry's workspaces on one host in line with its containers.
+
+        Returns notes. A host that cannot be reached leaves the registry as it is.
+        """
+        notes = []
+        servers = db.servers_on_host(self.conn, host_name)
+        if not servers:
+            return notes
+        try:
+            host = self.ssh.host(host_name)
+            live = {c["name"]: c for c in self.incus(host).list_workspaces()}
+        except DevboxError as e:
+            return [f"host {host_name} could not be checked: {e}"]
+        for row_ in servers:
+            container = live.get(row_["provider_id"])
+            if container is None:
+                if row_["status"] == "running":
+                    db.mark_deleted(self.conn, row_["id"])
+                    notes.append(f"workspace {row_['provider_id']} no longer exists on host {host_name}; "
+                                 f"forgot it (`devbox up {row_['project']} --host {host_name}` creates a new one)")
+                continue
+            changes = {"power": "off" if container.get("status") == "Stopped" else "running"}
+            ip = incus.Incus.ipv4(container)
+            if ip and ip != row_["ip"]:
+                changes["ip"] = ip
+            db.update_server(self.conn, row_["id"], **changes)
+        return notes
 
     def snapshot_price(self) -> float | None:
         if self._snapshot_price is None:
@@ -168,6 +226,8 @@ class Context:
                         self.conn, s["id"], price_hourly=o["price_hourly"], price_monthly=o["price_monthly"]
                     )
         for s in db.servers_missing_ipv4_price(self.conn):
+            if not self.bills(s):
+                continue
             hourly, monthly = self.ipv4_price(s["location"])
             if hourly is None:
                 continue
@@ -582,6 +642,11 @@ def check_server_limit(ctx: Context, name: str, others: list[str]) -> None:
 def cmd_up(ctx: Context) -> int:
     name = ctx.args.name
     project = db.require_project(ctx.conn, name)
+    active = db.active_server(ctx.conn, name)
+    if ctx.args.host or (active is not None and ctx.is_workspace(active)):
+        return cmd_up_workspace(ctx, project, ctx.args.host)
+    if ctx.args.cpus or ctx.args.memory:
+        raise DevboxError("--cpus and --memory only apply to workspaces on your own hosts (`up NAME --host HOST`)")
     limit_label, limit = startup_limit(ctx, project)
     deadline = startup.Deadline(limit)
     progress = startup.Progress(deadline)
@@ -622,7 +687,8 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
             snapshot = None  # an image can only be restored at the provider that made it
         if ctx.args.require_snapshot and snapshot is None:
             raise DevboxError(f"{name} has no snapshot to resume from; use `devbox up {name}`")
-        others = [s["project"] for s in db.active_servers(ctx.conn)]
+        # Own hardware is not billed and does not count towards max_servers.
+        others = [s["project"] for s in db.active_servers(ctx.conn) if ctx.bills(s)]
         others += [o["name"] for o in orphans]
         check_server_limit(ctx, name, others)
         other_servers = others
@@ -731,7 +797,7 @@ def bring_up(ctx: Context, project, deadline: "startup.Deadline", progress: "sta
 def report_up(ctx: Context, r: dict, deadline: "startup.Deadline") -> int:
     project, server, snapshot, offer = r["project"], r["server"], r["snapshot"], r["offer"]
     name = project["name"]
-    if project_idle_timeout(ctx, project)[1] is not None:
+    if project_idle_timeout(ctx, project)[1] is not None and not ctx.is_workspace(server):
         _, warning = idle_scheduler_warning(ctx)
         if warning:
             r["warnings"].append(warning)
@@ -754,11 +820,19 @@ def report_up(ctx: Context, r: dict, deadline: "startup.Deadline") -> int:
     verb = "powered on" if r["powered_on"] else "reusing"
     if r["created"]:
         verb = "restored" if snapshot else "created"
-    text = [
-        f"{name}: {verb} server {server['provider_id']} "
-        f"({server['server_type']} in {server['location']}) at {server['ip']}, code synced "
-        f"in {startup.duration_label(deadline.elapsed())}",
-    ]
+    if ctx.is_workspace(server):
+        verb = "started" if r["powered_on"] else ("created" if r["created"] else "reusing")
+        text = [
+            f"{name}: {verb} workspace {server['provider_id']} on host {server['host']} "
+            f"({server['server_type']}) at {server['ip']}, code synced "
+            f"in {startup.duration_label(deadline.elapsed())}",
+        ]
+    else:
+        text = [
+            f"{name}: {verb} server {server['provider_id']} "
+            f"({server['server_type']} in {server['location']}) at {server['ip']}, code synced "
+            f"in {startup.duration_label(deadline.elapsed())}",
+        ]
     if offer:
         text.append(f"  {offer['choice']}: {describe_offer(offer)}")
     if r["created"] or r["powered_on"]:
@@ -1136,15 +1210,25 @@ def cmd_down(ctx: Context) -> int:
         dumps = []
         if not snapshot and not getattr(ctx.args, "dump", False):
             refuse_unsaved_databases(ctx, server)
+        workspace = ctx.is_workspace(server)
         if getattr(ctx.args, "dump", False):
-            if server["status"] != "running":
-                raise DevboxError(f"server for {name} is not running; cannot dump databases")
+            if server["status"] != "running" or (workspace and server["power"] in POWERED_DOWN):
+                raise DevboxError(f"{'workspace' if workspace else 'server'} for {name} is not running; "
+                                  f"cannot dump databases" + (f" (`devbox up {name}` starts it)" if workspace else ""))
             dbs = db.list_databases(ctx.conn, name)
             if not dbs:
                 raise DevboxError(f"{name} has no databases to dump; see `devbox db add`")
             for database in dbs:
                 print(f"dumping {database['name']}...", file=sys.stderr)
                 dumps.append(dump_database(ctx, server, name, database))
+        if workspace:
+            summary = take_down_workspace(ctx, server, snapshot, "pause" if snapshot else "down")
+            summary["dumps"] = dumps
+            lines = workspace_down_lines(ctx, server, snapshot, dumps)
+            summary["next"] = workspace_down_guidance(name, snapshot)
+            emit(ctx.args, {"project": name, "deleted": None if snapshot else server["provider_id"], **summary},
+                 "\n".join(lines + guidance_lines(summary["next"])))
+            return 0
         summary = take_down(ctx, server, snapshot, "pause" if snapshot else "down")
         remaining = db.latest_snapshot(ctx.conn, name)
     summary["dumps"] = dumps
@@ -1271,6 +1355,8 @@ def idle_info(ctx: Context, server, now: datetime) -> dict:
         "missed_boundary": None,
         "hold_until": hold.isoformat(timespec="seconds") if hold else None,
     }
+    if not ctx.provider_for(server).capabilities.can_delete:
+        return info  # own hardware: devbox never stops or deletes workspaces by itself
     if server["stop_action"]:
         info.update(policy="requested", planned_action=server["stop_action"])
         ready = costs.parse_ts(server["stop_requested_at"])
@@ -1607,6 +1693,9 @@ def capacity_line(c: dict) -> str:
 
 def cmd_status(ctx: Context) -> int:
     orphans = ctx.reconcile()
+    host_notes = []
+    for host_row in db.list_hosts(ctx.conn):
+        host_notes += ctx.reconcile_host(host_row["name"])
     if ctx.args.name:
         projects = [db.require_project(ctx.conn, ctx.args.name)]
     else:
@@ -1654,11 +1743,25 @@ def cmd_status(ctx: Context) -> int:
             elif ctx.args.name:
                 lines.append(f"{e['project']}: no server")
             continue
-        lines.append(
-            f"{e['project']}: {server_state(s)} {s['server_type']} {s['location']} {s['ip']} "
-            f"(id {s['provider_id']}, up {e['uptime']})"
-        )
-        if s["power"] in POWERED_DOWN:
+        if ctx.is_workspace(s):
+            state = "paused" if s["power"] in POWERED_DOWN else server_state(s)
+            lines.append(f"{e['project']}: {state} workspace {s['provider_id']} on host {s['host']} "
+                         f"({s['server_type']}) {s['ip'] or 'no address'} (up {e['uptime']})")
+            if s["status"] == "creating" and s["setup_error"]:
+                lines.append(f"  {s['setup_error'].splitlines()[0]}")
+                lines.append(f"  `devbox up {e['project']}` retries setup, `devbox down {e['project']}` deletes it")
+            elif state == "paused":
+                lines.append(f"  stopped, files kept: `devbox up {e['project']}` starts it, "
+                             f"`devbox down {e['project']}` deletes it")
+            lines.append("  cost: none (own hardware)")
+        else:
+            lines.append(
+                f"{e['project']}: {server_state(s)} {s['server_type']} {s['location']} {s['ip']} "
+                f"(id {s['provider_id']}, up {e['uptime']})"
+            )
+        if ctx.is_workspace(s):
+            pass
+        elif s["power"] in POWERED_DOWN:
             lines.append(f"  powered off but still billed: `devbox up {e['project']}` starts it, "
                          f"`devbox pause {e['project']}` removes it")
         elif s["status"] == "creating" and s["setup_error"]:
@@ -1666,7 +1769,8 @@ def cmd_status(ctx: Context) -> int:
             if s["diagnostics"]:
                 lines.append(f"  diagnostics: {s['diagnostics']}")
             lines.append(f"  still billed: `devbox up {e['project']}` retries setup, `devbox down {e['project']}` deletes it")
-        lines.append(f"  cost: {cost_line(e['usage'], s)}")
+        if not ctx.is_workspace(s):
+            lines.append(f"  cost: {cost_line(e['usage'], s)}")
         if e.get("capacity"):
             lines.append(f"  capacity: {capacity_line(e['capacity'])}")
         idle = e["idle"]
@@ -1725,7 +1829,7 @@ def cmd_status(ctx: Context) -> int:
         lines.append("other controllers' devbox servers in this Hetzner project (not managed from here):")
         for s in foreign:
             lines.append(f"  {s['name']} (id {s['id']}, {s['status']}, controller {s['controller']}, project {s['project'] or '?'})")
-    elif not ctx.args.name:
+    elif not ctx.args.name and not ctx.hosts_only():
         lines.append("no devbox servers from other controllers in this Hetzner project")
 
     idle_enforcement = None
@@ -1733,6 +1837,7 @@ def cmd_status(ctx: Context) -> int:
         idle_enforcement, warning = idle_scheduler_warning(ctx)
         if warning:
             lines.append(f"warning: {warning}")
+    lines += [f"note: {n}" for n in host_notes]
     scope = f" for {ctx.args.name}" if ctx.args.name else ""
     month_line = f"this month{scope}: {costs.money(month['total'])}"
     if budget and not ctx.args.name:
@@ -2531,6 +2636,309 @@ def cmd_ssh(ctx: Context) -> int:
     os.execvp(cmd[0], cmd)
 
 
+# Own hosts and workspaces (Incus containers)
+
+
+def cmd_host_add(ctx: Context) -> int:
+    a = ctx.args
+    hosts.validate_host_name(a.name)
+    hosts.validate_ssh_target(a.ssh)
+    if db.get_host(ctx.conn, a.name):
+        raise DevboxError(f"host '{a.name}' already exists; `devbox host remove {a.name}` first to change it")
+    key = Path(a.key).expanduser().resolve() if a.key else None
+    if key is not None and not key.is_file():
+        raise DevboxError(f"SSH key {key} does not exist")
+    host_key = hosts.scan_host_key(a.ssh)
+    print_fp = hosts.fingerprint(host_key)
+    if a.fingerprint:
+        if a.fingerprint != print_fp:
+            raise DevboxError(f"{a.ssh} presented {print_fp}, not the expected {a.fingerprint}; nothing was pinned")
+    elif not a.yes:
+        text = f"{a.ssh} presents host key {host_key.split()[0]} {print_fp}"
+        if not sys.stdin.isatty() or a.json:
+            raise DevboxError(
+                f"{text}. Compare it with the key on the machine (`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`), "
+                f"then run again with --fingerprint {print_fp} (or --yes to pin it as shown)")
+        print(text, file=sys.stderr)
+        if input("Pin this host key? [y/N] ").strip().lower() not in ("y", "yes"):
+            raise DevboxError("host key not confirmed; nothing was added")
+    db.add_host(ctx.conn, a.name, a.ssh, str(key) if key else None, host_key, print_fp)
+    host = hosts.Host.from_row(db.get_host(ctx.conn, a.name))
+    note = None
+    try:
+        ctx.ssh.shell(host).run("true", timeout=30)
+    except DevboxError as e:
+        note = f"added, but the host did not accept a login yet: {e}"
+    data = {"name": a.name, "ssh": a.ssh, "fingerprint": print_fp, "host_key_type": host.key_type, "warning": note}
+    text = [f"added host {a.name} ({a.ssh}), pinned {host.key_type} {print_fp}"]
+    text.append(note and f"warning: {note}" or f"  reachable; next: `devbox host bootstrap {a.name}` checks Incus there")
+    emit(a, data, "\n".join(text))
+    return 0
+
+
+def cmd_host_list(ctx: Context) -> int:
+    rows = []
+    for r in db.list_hosts(ctx.conn):
+        rows.append({"name": r["name"], "ssh": r["ssh"], "key": r["key"], "fingerprint": r["fingerprint"],
+                     "workspaces": [s["project"] for s in db.servers_on_host(ctx.conn, r["name"])]})
+    lines = [f"{r['name']:<16} {r['ssh']:<30} {r['fingerprint']}  workspaces: {', '.join(r['workspaces']) or 'none'}"
+             for r in rows]
+    emit(ctx.args, rows, "\n".join(lines) or "no hosts; add one with `devbox host add NAME --ssh USER@HOST`")
+    return 0
+
+
+def cmd_host_remove(ctx: Context) -> int:
+    name = ctx.args.name
+    with ctx.lock():
+        if db.get_host(ctx.conn, name) is None:
+            raise DevboxError(f"unknown host '{name}'")
+        workspaces = db.servers_on_host(ctx.conn, name)
+        removed = []
+        if workspaces:
+            projects = ", ".join(w["project"] for w in workspaces)
+            if not ctx.args.force:
+                raise DevboxError(
+                    f"host {name} still has workspaces ({projects}): `devbox down PROJECT` removes each, or "
+                    f"--force deletes them all now (the machine itself is never touched)")
+            incus_ = ctx.incus(ctx.ssh.ensure_host(name))
+            for w in workspaces:
+                incus_.delete(w["provider_id"])
+                ctx.event(w, "down")
+                db.mark_deleted(ctx.conn, w["id"])
+                ctx.known_hosts(w).unlink(missing_ok=True)
+                ctx.manifest(w["project"]).unlink(missing_ok=True)
+                removed.append(w["project"])
+        db.remove_host(ctx.conn, name)
+        (ctx.cfg.state_dir / "known_hosts" / f"host-{name}").unlink(missing_ok=True)
+    emit(ctx.args, {"host": name, "deleted_workspaces": removed},
+         f"removed host {name} from devbox" + (f"; deleted workspaces {', '.join(removed)}" if removed else "")
+         + " (the machine was not touched)")
+    return 0
+
+
+def cmd_host_bootstrap(ctx: Context) -> int:
+    name = ctx.args.name
+    host = ctx.ssh.host(name)
+    shell = ctx.ssh.shell(host)
+    plan = hosts.make_plan(name, hosts.collect_facts(shell))
+    if ctx.args.yes and not plan.nothing_to_do and not plan.blockers:
+        for line in plan.lines():
+            print(line, file=sys.stderr)
+        facts = hosts.apply_plan(shell, plan, say=lambda m: print(f"{m}...", file=sys.stderr))
+        after = hosts.make_plan(name, facts)
+        emit(ctx.args, {"applied": True, "plan": plan.as_dict(), "after": after.as_dict()},
+             "\n".join(["applied", *after.lines()]))
+        return 1 if after.blockers or after.steps else 0
+    data = {"applied": False, **plan.as_dict()}
+    lines = plan.lines()
+    if plan.blockers:
+        emit(ctx.args, data, "\n".join(lines))
+        return 1
+    if not plan.nothing_to_do:
+        lines.append(f"nothing was changed; run `devbox host bootstrap {name} --yes` to apply this plan")
+    emit(ctx.args, data, "\n".join(lines))
+    return 0
+
+
+def workspace_limits(ctx: Context, server=None) -> tuple[int, str]:
+    a = ctx.args
+    return a.cpus or ctx.cfg.incus_cpus, a.memory or ctx.cfg.incus_memory
+
+
+def limits_label(cpus, memory) -> str:
+    return f"incus container, {cpus} cpu, {memory}"
+
+
+def cmd_up_workspace(ctx: Context, project, host_name: str | None) -> int:
+    if ctx.args.require_snapshot:
+        raise DevboxError("`resume` restores a Hetzner snapshot; workspaces on your own hosts are paused with `pause` "
+                          "and started again with `up`")
+    if ctx.args.memory and not config.MEMORY_RE.match(ctx.args.memory):
+        raise DevboxError(f"invalid --memory '{ctx.args.memory}': use a size like 4GiB or 512MiB")
+    limit_label, limit = startup_limit(ctx, project)
+    deadline = startup.Deadline(limit)
+    progress = startup.Progress(deadline)
+    state = {"server_id": None, "created": False, "snapshot": None}
+    with ctx.lock():
+        try:
+            result = bring_up_workspace(ctx, project, host_name, deadline, progress, state)
+        except (DevboxError, KeyboardInterrupt) as e:
+            if isinstance(e, DevboxError) and not isinstance(e, (startup.StageTimeout, startup.StageFailed)) \
+                    and state["server_id"] is None:
+                raise
+            raise workspace_failure(ctx, e, state, deadline, progress, limit_label)
+    return report_up(ctx, result, deadline)
+
+
+def bring_up_workspace(ctx: Context, project, host_name: str | None, deadline: "startup.Deadline",
+                       progress: "startup.Progress", state: dict) -> dict:
+    """`up` for a workspace: check the host, create or start the container, set it up, sync. Caller holds the lock."""
+    name = project["name"]
+    cfg = ctx.cfg
+    warnings: list[str] = []
+    progress.step("prepare", "Checking host...")
+    server = db.active_server(ctx.conn, name)
+    if server is not None:
+        if not ctx.is_workspace(server):
+            raise DevboxError(f"{name} has a {server['provider']} server; `devbox down {name}` before using --host")
+        if host_name and host_name != server["host"]:
+            raise DevboxError(f"{name} already runs on host {server['host']}; `devbox down {name}` first to move it")
+        host_name = server["host"]
+    host = ctx.ssh.ensure_host(host_name)
+    inc = ctx.incus(host)
+    warnings += ctx.reconcile_host(host_name)
+    server = db.active_server(ctx.conn, name)
+    cname = incus.container_name(name)
+    container = inc.get(cname)
+    if container is not None and (container.get("config") or {}).get(incus.PROJECT) != name:
+        raise DevboxError(f"container {cname} on host {host_name} belongs to another project; devbox does not reuse it")
+    cpus, memory = workspace_limits(ctx)
+    label = limits_label(cpus, memory)
+    created = False
+    powered_on = False
+
+    if server is None:
+        progress.step("create", f"Creating workspace {cname} on host {host_name}: {cpus} cpu, {memory}")
+        if container is None:
+            inc.create(cname, name, cfg.incus_image, cpus, memory)
+        else:
+            progress.say(f"Reusing container {cname} left by an earlier run")
+            inc.set_limits(cname, ctx.args.cpus, ctx.args.memory)
+        ctx.manifest(name).unlink(missing_ok=True)  # a new container has none of the synced files
+        server_id = db.insert_server(
+            ctx.conn, name, cname, "creating", power="running", server_type=label, location=host_name,
+            provider=SSH_PROVIDER, host=host_name)
+        state.update(server_id=server_id, created=True)
+        server = db.get_server(ctx.conn, server_id)
+        created = True
+        ctx.event(server, "create")
+        progress.say(f"Workspace {cname} created")
+    else:
+        state["server_id"] = server["id"]
+        if container is None:
+            raise DevboxError(f"workspace {cname} is gone from host {host_name}; `devbox down {name}` clears it, "
+                              f"then `devbox up {name} --host {host_name}` creates a new one")
+        if server["setup_error"]:
+            progress.say(f"Retrying setup of workspace {cname} (failed before at {server['setup_stage']})")
+        if container.get("status") != "Running":
+            progress.step("power-on", f"Starting workspace {cname}...")
+            inc.start(cname)
+            powered_on = True
+        if ctx.args.cpus or ctx.args.memory:
+            inc.set_limits(cname, ctx.args.cpus, ctx.args.memory)
+            if (ctx.args.cpus or ctx.args.memory) and label != server["server_type"]:
+                db.update_server(ctx.conn, server["id"], server_type=label)
+                progress.say(f"Limits changed: {cpus} cpu, {memory}")
+
+    ip = inc.wait_ipv4(cname, deadline.bound("ssh", 60))
+    db.update_server(ctx.conn, server["id"], ip=ip, power="running")
+    server = db.get_server(ctx.conn, server["id"])
+
+    needs_setup = server["status"] != "running"
+    if needs_setup:
+        progress.step("cloud-init", "Setting up the workspace (sshd, docker, mise, cloudflared)...")
+        host_private, host_public = generate_host_key()
+        public_key = ensure_local_ssh_key(cfg.ssh_key)
+        db.update_server(ctx.conn, server["id"], host_key=host_public)
+        inc.provision(cname, public_key, host_private, host_public, say=progress.say,
+                      bound=lambda: deadline.bound("cloud-init", 900))
+        server = db.get_server(ctx.conn, server["id"])
+    remote = ctx.remote(server)
+    remote.wait_ssh(deadline, progress)
+    if needs_setup:
+        remote.verify_tools(deadline, progress)
+    db.update_server(ctx.conn, server["id"], status="running", power="running", setup_stage=None, setup_error=None)
+
+    progress.step("sync", "Syncing code...")
+    sync = remote.sync(project["path"], ctx.manifest(name), timeout=deadline.bound("sync", deadline.remaining()))
+    if sync["warning"]:
+        warnings.append(sync["warning"])
+    cancelled_stop = db.get_server(ctx.conn, server["id"])["stop_action"]
+    ctx.event(server, "up")
+    ctx.event(server, "sync")
+    progress.step("secrets", "Writing secrets...") if secret_store(ctx, name).load() else None
+    deadline.check("secrets")
+    secrets_written = push_secrets(ctx, server, name)
+    preview_env = write_preview_env(ctx, server)
+    progress.say("Ready")
+    stages = progress.stage_seconds()
+    state_name = "new" if created or needs_setup else ("powered-on" if powered_on else "running")
+    if created or powered_on or needs_setup:
+        kind = "create" if created or needs_setup else "power-on"
+        db.update_server(ctx.conn, server["id"], startup=json.dumps(
+            {"kind": kind, "seconds": round(deadline.elapsed(), 1), "stages": stages}))
+    return {
+        "project": project, "server": db.active_server(ctx.conn, name), "created": created,
+        "powered_on": powered_on, "snapshot": None, "offer": None, "warnings": warnings,
+        "secrets_written": secrets_written, "cancelled_stop": cancelled_stop, "stages": stages,
+        "preview_env": preview_env, "state": state_name, "other_servers": [],
+    }
+
+
+def workspace_failure(ctx: Context, exc, state: dict, deadline, progress, limit_label: str) -> DevboxError:
+    """Record a failed or interrupted workspace `up` and explain; the container is kept so `up` can retry."""
+    interrupted = isinstance(exc, KeyboardInterrupt)
+    timed_out = isinstance(exc, startup.StageTimeout)
+    stage = getattr(exc, "stage", None) or progress.stage
+    name = ctx.args.name
+    reason = startup.redact("interrupted (Ctrl-C)" if interrupted else str(exc), project_secret_values(name))
+    code = "interrupted" if interrupted else ("startup_timeout" if timed_out else "startup_failed")
+    exit_code = startup.EXIT_INTERRUPTED if interrupted else (startup.EXIT_TIMEOUT if timed_out else 1)
+    server = db.get_server(ctx.conn, state["server_id"]) if state["server_id"] else None
+    what = "timed out" if timed_out else ("interrupted" if interrupted else "failed")
+    lines = [f"Startup {what} during {stage} after {startup.duration_label(deadline.elapsed())}"
+             + (f" (limit: {limit_label})" if timed_out else ""), f"  reason: {reason}", "", f"Project: {name}"]
+    if server is not None:
+        if server["status"] != "running":
+            db.update_server(ctx.conn, server["id"], setup_stage=stage, setup_error=reason[:500])
+        ctx.event(server, "setup_failed")
+        lines += [f"Workspace: {server['provider_id']} on host {server['host']} (kept)", "",
+                  f"Retry startup: devbox up {name}", f"Delete workspace: devbox down {name}"]
+    else:
+        lines.append("Workspace: none was created")
+    details = {"code": code, "stage": stage, "elapsed_seconds": round(deadline.elapsed(), 1),
+               "limit_seconds": deadline.limit, "stages": progress.stage_seconds(), "project": name,
+               "server_id": server["provider_id"] if server else None, "server_retained": bool(server),
+               "billable": False}
+    return DevboxError("\n".join(lines), code=code, exit_code=exit_code, details=details)
+
+
+def take_down_workspace(ctx: Context, server, pause: bool, event: str) -> dict:
+    """Stop (pause) or delete a workspace container. Never touches containers devbox did not create."""
+    name = server["project"]
+    inc = ctx.incus(ctx.ssh.ensure_host(server["host"]))
+    if pause:
+        inc.stop(server["provider_id"])
+        db.update_server(ctx.conn, server["id"], power="off")
+        ctx.event(server, event)
+    else:
+        inc.delete(server["provider_id"])
+        ctx.event(server, event)
+        db.mark_deleted(ctx.conn, server["id"])
+        ctx.known_hosts(server).unlink(missing_ok=True)
+        ctx.manifest(name).unlink(missing_ok=True)
+    return {"server": row(db.get_server(ctx.conn, server["id"])), "host": server["host"],
+            "workspace": server["provider_id"], "paused": pause}
+
+
+def workspace_down_lines(ctx: Context, server, pause: bool, dumps: list) -> list[str]:
+    ws, host = server["provider_id"], server["host"]
+    if pause:
+        lines = [f"paused workspace {ws} on host {host}: container stopped, files and volumes kept"]
+    else:
+        lines = [f"deleted workspace {ws} on host {host}; its files, Docker volumes and databases are gone"]
+    return lines + [f"  dumped {d['database']} ({human_size(d['bytes'])}) to {d['path']}" for d in dumps]
+
+
+def workspace_down_guidance(name: str, paused: bool) -> dict:
+    return {
+        "steps": [f"if you learned anything about running {name}, update the notes: "
+                  f"`devbox project notes {name} --set-file -`"],
+        "tell_user": (f"{name} is paused; `devbox up {name}` starts it again with its files" if paused else
+                      f"{name} is deleted; `devbox up {name} --host HOST` creates a clean workspace"),
+    }
+
+
 DESCRIPTION = "Disposable dev servers for coding agents, on your own Hetzner Cloud account."
 DOCS_URL = "https://github.com/banjo/devbox/tree/main/docs"
 EXAMPLE_CONFIG_URL = "https://github.com/banjo/devbox/blob/main/examples/config.toml"
@@ -2538,6 +2946,7 @@ EXAMPLE_CONFIG_URL = "https://github.com/banjo/devbox/blob/main/examples/config.
 COMMAND_GROUPS = [
     ("Projects", ["project"]),
     ("Servers", ["server-types", "up", "resume", "status", "pause", "down", "touch"]),
+    ("Own hosts", ["host"]),
     ("Code and commands", ["sync", "pull", "exec", "ps", "logs", "stop", "forward", "ssh"]),
     ("Previews", ["expose", "unexpose"]),
     ("Data", ["secrets", "db", "snapshot"]),
@@ -2694,6 +3103,10 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
         project_arg(p)
         p.add_argument("--type", help="server type for a new server (default: last used)")
         p.add_argument("--location", help="location for a new server (default: last used)")
+        p.add_argument("--host", metavar="HOST",
+                       help="run the project in a container on this own host (see `devbox host add`)")
+        p.add_argument("--cpus", type=int, metavar="N", help="CPU limit of a new or existing workspace (with --host)")
+        p.add_argument("--memory", metavar="SIZE", help="memory limit of a workspace, e.g. 4GiB (with --host)")
         p.add_argument("--additional", "--force", dest="additional", action="store_true",
                        help="create a server even if max_servers are already running (this run only)")
         p.add_argument("--over-budget", action="store_true", help="create even if the monthly budget is used up")
@@ -2704,17 +3117,32 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
         if not require_snapshot:
             p.add_argument("--fresh", action="store_true", help="ignore snapshots and start from a clean image")
 
+    host_sub = subcommands("host", "own machines that run projects as Incus containers", "host_command")
+    p = add_sub(host_sub, "add", cmd_host_add, "register a machine reachable over SSH and pin its host key")
+    p.add_argument("name", help="host name")
+    p.add_argument("--ssh", required=True, metavar="USER@HOST", help="SSH target (a name from your ssh config works)")
+    p.add_argument("--key", metavar="PATH", help="identity file for the host (default: your ssh config and agent)")
+    p.add_argument("--fingerprint", metavar="SHA256:...", help="pin the host key only if it has this fingerprint")
+    p.add_argument("--yes", action="store_true", help="pin the host key shown without asking")
+    add_sub(host_sub, "list", cmd_host_list, "list hosts and the workspaces on them")
+    p = add_sub(host_sub, "bootstrap", cmd_host_bootstrap, "show, then with --yes apply, what a host needs to run workspaces")
+    p.add_argument("name", help="host name")
+    p.add_argument("--yes", action="store_true", help="apply the plan (install and initialise Incus, firewall rules)")
+    p = add_sub(host_sub, "remove", cmd_host_remove, "forget a host (the machine is never touched)")
+    p.add_argument("name", help="host name")
+    p.add_argument("--force", action="store_true", help="delete the workspaces on the host first")
+
     p = add("status", cmd_status, "show servers, processes, capacity headroom, preview URLs and cost so far")
     project_arg(p, optional=True)
 
-    p = add("pause", cmd_down, "snapshot the server, then delete it; `up` restores it")
+    p = add("pause", cmd_down, "snapshot the server, then delete it; `up` restores it (own hosts: stop the container)")
     project_arg(p)
     p.add_argument("--dump", action="store_true", help="also dump all project databases locally first")
     p.add_argument("--at-hour-end", action="store_true",
                    help="keep the server until just before its next billing hour, then pause it (needs autostop)")
     p.set_defaults(snapshot=True)
 
-    p = add("down", cmd_down, "delete the server")
+    p = add("down", cmd_down, "delete the server (own hosts: the container)")
     project_arg(p)
     p.add_argument("--snapshot", action="store_true", help="snapshot the server first (same as pause)")
     p.add_argument("--dump", action="store_true", help="dump all project databases locally first")
