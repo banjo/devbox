@@ -15,13 +15,17 @@ devbox server-types [filters]             server types that can be ordered now, 
 devbox up NAME [--type T --location L]    reuse the server, or create one (from the latest snapshot
                                           if there is one; --fresh for a clean image), sync code
 devbox resume NAME                        like up, but only from a snapshot
-devbox up NAME --host H [--cpus N --memory S]
+devbox up NAME --host H [--cpus N --memory S] [--isolate | --no-isolate]
                                           run the project in an Incus container on your own host H
-                                          (see [Own hosts](hosts.md)); pause stops it, down deletes it
+                                          (see [Own hosts](hosts.md), [Workspaces](workspaces.md)); pause stops
+                                          it, down deletes it; --isolate blocks traffic to other isolated
+                                          workspaces on the host
 devbox host add NAME --ssh USER@HOST [--key PATH] [--fingerprint FP | --yes]
                                           register an own host and pin its SSH host key
 devbox host list                          hosts and their workspaces
-devbox host bootstrap NAME [--yes]        show (then apply) what a host needs: Incus, firewall rules
+devbox host bootstrap NAME [--zabbly] [--yes]
+                                          show (then apply) what a host needs: Incus (its version is reported;
+                                          --zabbly plans a current Incus from the Zabbly repository), firewall rules
 devbox host remove NAME [--force]         forget a host (--force deletes its workspaces first; never the machine)
     up/resume options: --startup-timeout 5m, --cleanup-on-failure, --fresh, --over-budget,
                        --additional (create a server even if max_servers are running; once)
@@ -63,7 +67,8 @@ devbox autostop status                    whether idle shutdown really runs, and
 devbox snapshot list [NAME]               snapshots with size and cost
 devbox snapshot delete IMAGE_ID           delete a snapshot
 devbox doctor                             check config, tools, token, SSH key, firewall, leftovers, scheduling
-devbox cleanup [--yes]                    list (or delete) unused devbox resources and stale local files
+devbox cleanup [--yes]                    list (or delete) unused devbox resources, stale local files, and unused
+                                          devbox containers and old base images on your hosts
 devbox history [NAME] [--limit N]         past servers and snapshots with dates, cost and activity
 devbox costs [--month M | --days N | --since D] [--until D] [--project P] [--by project|month|day|type|server]
                                           estimated server + snapshot cost for a period

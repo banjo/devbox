@@ -9,10 +9,16 @@
 - `devbox cleanup` lists what devbox created that is no longer used: labeled servers and snapshots
   that aren't in the registry, devbox firewalls not attached to any server (including the old
   `devbox` firewall), devbox SSH keys other than the one in use, preview tunnels and their DNS
-  records of removed projects (with `preview_domain`), and stale local host-key and sync files. Only resources labeled `managed-by=devbox` without another install's controller label are
+  records of removed projects (with `preview_domain`), stale local host-key and sync files, and, on every
+  registered own host, devbox containers that no workspace in the registry uses and cached base images that
+  the current setup no longer matches (both listed with the host name; deleted only with `--yes`).
+  Containers of other devbox installs on a host, and containers without devbox's labels, are never listed
+  for deletion (other installs' containers are mentioned in a note). Only resources labeled `managed-by=devbox` without another install's controller label are
   considered (including snapshots made by older versions). The SSH key devbox uses is never listed;
   if it can't tell which key is in use (for example the local key is also registered by someone
   else), it skips SSH keys and says why. Nothing is deleted without `--yes`.
+- `doctor` also reports unused devbox containers and images on registered hosts (`host leftovers`), and
+  works with only own hosts registered and no Hetzner token.
 - `devbox history` lists every server (newest first) with type, location, run time, cost, activity
   how long its startup took, and whether it was restored from or paused into a snapshot, plus all snapshots and the overall
   total. It works offline from the registry.

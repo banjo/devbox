@@ -6,7 +6,7 @@
 </h1>
 
 <p align="center">
-  Disposable dev servers for coding agents, on your own cloud account, for about a cent an hour. Hetzner Cloud today.
+  Disposable dev environments for coding agents: servers in your own Hetzner Cloud account for about a cent an hour, or isolated containers on a machine you own for free.
 </p>
 
 <p align="center">
@@ -14,12 +14,13 @@
   <a href="docs/commands.md"><b>Commands</b></a> ·
   <a href="docs/how-it-works.md"><b>How it works</b></a> ·
   <a href="docs/costs.md"><b>Costs</b></a> ·
-  <a href="skills/hetzner-devbox/SKILL.md"><b>Agent skill</b></a>
+  <a href="skills/devbox/SKILL.md"><b>Agent skill</b></a>
 </p>
 
-Your agent edits code on your machine. devbox starts a real server in your own cloud project,
-copies the code there, and runs builds, tests, databases and dev servers on it. Your laptop stays
-light, and when the work is done the server is paused or deleted.
+Your agent edits code on your machine. devbox starts a real server in your own cloud project, or an
+isolated container on a machine you own, copies the code there, and runs builds, tests, databases
+and dev servers on it. Your laptop stays light, and when the work is done the server is paused or
+deleted.
 
 There is no platform in between and no subscription. The servers, snapshots and API token are yours,
 and you pay the provider's hourly price directly. On Hetzner Cloud, a small `cx` server with 2 vCPUs and 4 GB of memory
@@ -27,8 +28,9 @@ costs around €0.01 an hour, and every server is capped at its monthly price. R
 `devbox server-types` to see the current prices.
 
 > [!NOTE]
-> devbox is early software. Hetzner Cloud is the only provider that creates servers for now; machines you
-> own can run projects as Incus containers ([Own hosts](docs/hosts.md)); see [#35](https://github.com/banjo/devbox/issues/35) and the [backlog](https://github.com/banjo/devbox/issues/41).
+> devbox is early software. Hetzner Cloud is the only provider that creates servers for now. Any machine
+> you reach over SSH can run projects as unprivileged Incus containers instead ([Own hosts](docs/hosts.md),
+> [Workspaces](docs/workspaces.md)). See [#35](https://github.com/banjo/devbox/issues/35) and the [backlog](https://github.com/banjo/devbox/issues/41).
 
 ## Highlights
 
@@ -42,8 +44,8 @@ costs around €0.01 an hour, and every server is capped at its monthly price. R
 - 🗄️ Dump and restore project databases (Postgres, SQLite)
 - 💤 Pauses idle servers to a snapshot, without stopping work that is still running; `touch --for 2h`
   holds a server while you test it
-- 🏠 Optionally run each project as an isolated Incus container on a machine you own (`devbox up --host`),
-  free and with the same commands
+- 🏠 Or run each project as an isolated Incus container on a machine you own (`devbox up --host`): free,
+  with CPU and memory limits, the same commands, its own stable preview URL, and several at once on one host
 - 🤖 `--json` on every command, made to be driven by an agent
 
 ## Getting started
@@ -76,7 +78,8 @@ See [Installation](docs/installation.md) for the full setup, including the agent
 - [How it works](docs/how-it-works.md): state, labels, server choice, sync and startup
 - [Development loop](docs/development-loop.md): watch mode, pulling files, port forwarding, secrets
 - [Previews](docs/previews.md): public URLs, stable domains and password protection
-- [Own hosts](docs/hosts.md): run projects as Incus containers on a machine you own
+- [Own hosts](docs/hosts.md): register a machine, `bootstrap` it (Incus, firewall, newer Incus)
+- [Workspaces](docs/workspaces.md): projects as Incus containers: limits, previews, image cache, isolation
 - [Databases](docs/databases.md): dumping and restoring Postgres and SQLite
 - [Snapshots](docs/snapshots.md): pause and resume
 - [Idle shutdown](docs/idle-shutdown.md): what counts as activity, and `devbox autostop`

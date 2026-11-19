@@ -39,6 +39,16 @@
   restart it after `expose` (quick tunnels). `up --json` and `expose --json` list them under
   `preview_env`.
 
+## Workspaces on own hosts
+
+Previews work the same for [workspaces](workspaces.md#previews): cloudflared runs in the container, every
+workspace can use the same port, and the preview environment file is written inside the container.
+With `preview_domain` each project's hostnames are `<project>.<domain>` and `<project>-<preview>.<domain>`.
+Two projects can produce the same label (`a-b` with its default preview, and `a` with `--name b`);
+`expose` refuses the second one, and `up` does not announce a stable `DEVBOX_PREVIEW_URL` whose label another
+project owns. A project or preview name that would end in a dash cannot be a hostname either and is
+refused by `expose`.
+
 ## Recipes
 
 Vite only answers host names it knows. Allow the preview's instead of every host:
