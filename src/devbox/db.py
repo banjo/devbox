@@ -134,6 +134,17 @@ MIGRATIONS = [
     ALTER TABLE servers ADD COLUMN host TEXT;
     ALTER TABLE snapshots ADD COLUMN provider TEXT NOT NULL DEFAULT 'hetzner';
     """,
+    # Own hardware: machines devbox reaches over SSH and runs workspaces on (`devbox host add`).
+    """
+    CREATE TABLE hosts (
+      name         TEXT PRIMARY KEY,
+      ssh          TEXT NOT NULL,
+      key          TEXT,
+      host_key     TEXT NOT NULL,
+      fingerprint  TEXT NOT NULL,
+      created_at   TEXT NOT NULL
+    );
+    """,
 ]
 
 DEFAULT_PROVIDER = "hetzner"
@@ -648,6 +659,37 @@ def reconcile(conn: sqlite3.Connection, provider_servers: list[dict], provider: 
         else:
             orphans.append(s)
     return orphans
+
+
+# Hosts (own machines that run workspaces)
+
+
+def add_host(conn: sqlite3.Connection, name: str, ssh: str, key: str | None, host_key: str, fingerprint: str) -> None:
+    if get_host(conn, name):
+        raise DevboxError(f"host '{name}' already exists; `devbox host remove {name}` first to change it")
+    conn.execute(
+        "INSERT INTO hosts (name, ssh, key, host_key, fingerprint, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (name, ssh, key, host_key, fingerprint, now()),
+    )
+
+
+def get_host(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM hosts WHERE name = ?", (name,)).fetchone()
+
+
+def list_hosts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM hosts ORDER BY name").fetchall()
+
+
+def remove_host(conn: sqlite3.Connection, name: str) -> None:
+    conn.execute("DELETE FROM hosts WHERE name = ?", (name,))
+
+
+def servers_on_host(conn: sqlite3.Connection, host: str) -> list[sqlite3.Row]:
+    """Workspaces (registry servers that are not deleted) placed on a host."""
+    return conn.execute(
+        "SELECT * FROM servers WHERE host = ? AND status != 'deleted' ORDER BY project", (host,)
+    ).fetchall()
 
 
 # Databases (for `devbox db dump/restore`)

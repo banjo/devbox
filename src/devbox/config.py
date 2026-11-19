@@ -84,6 +84,10 @@ class Config:
     # Stable preview URLs: a named Cloudflare tunnel per project on this domain
     # (a zone in the Cloudflare account of the token). Unset: random quick-tunnel URLs.
     preview_domain: str | None = None
+    # Workspaces on own hosts (Incus containers): image and default limits for `up --host`.
+    incus_image: str = "ubuntu/24.04"
+    incus_cpus: int = 2
+    incus_memory: str = "4GiB"
     cloudflare_token_file: Path | None = None
     state_dir: Path = field(default_factory=state_dir)
 
@@ -130,10 +134,11 @@ class Config:
 _PATH_KEYS = {"hcloud_token_file", "ssh_key", "cloudflare_token_file"}
 _STR_KEYS = {
     "server_type", "location", "image", "controller_id", "idle_timeout", "idle_action", "budget_action",
-    "startup_timeout", "min_idle", "billing_margin", "preview_domain",
+    "startup_timeout", "min_idle", "billing_margin", "preview_domain", "incus_image", "incus_memory",
 }
 _FLOAT_KEYS = {"snapshot_price_per_gb_month", "ipv4_price_monthly", "monthly_budget"}
 CONTROLLER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
+MEMORY_RE = re.compile(r"^[1-9][0-9]*(MiB|GiB|TiB|MB|GB|TB)$")
 DOMAIN_RE = re.compile(r"^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 
 
@@ -169,6 +174,10 @@ def load(path: Path | None = None) -> Config:
             if not isinstance(value, int) or value < 1:
                 raise DevboxError(f"{path}: keep_snapshots must be a whole number of at least 1")
             cfg.keep_snapshots = value
+        elif key == "incus_cpus":
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise DevboxError(f"{path}: incus_cpus must be a whole number of at least 1")
+            cfg.incus_cpus = value
         elif key == "max_servers":
             cfg.max_servers = parse_max_servers(value, path)
         elif key == "ssh_allow":
@@ -199,6 +208,8 @@ def load(path: Path | None = None) -> Config:
         raise DevboxError(f"{path}: idle_action must be 'pause' or 'down'")
     if cfg.budget_action not in ("warn", "block"):
         raise DevboxError(f"{path}: budget_action must be 'warn' or 'block'")
+    if not MEMORY_RE.match(cfg.incus_memory):
+        raise DevboxError(f"{path}: incus_memory must be a size like 4GiB or 512MiB")
     if cfg.preview_domain is not None:
         cfg.preview_domain = cfg.preview_domain.strip().lower().strip(".")
         if not DOMAIN_RE.match(cfg.preview_domain):

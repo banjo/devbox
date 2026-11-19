@@ -175,10 +175,44 @@ def read_manifest(path: Path) -> set[str]:
         return set()
 
 
+@dataclass(frozen=True)
+class Jump:
+    """An SSH jump host: the target is only reachable through this machine (own hardware).
+
+    The jump host's key is pinned in its own known_hosts file, under an alias, so that it does
+    not matter how the target address is spelled.
+    """
+
+    target: str  # user@host, as given to `devbox host add`
+    known_hosts: Path
+    host_key_alias: str
+    key_type: str  # of the pinned key, e.g. ssh-ed25519
+    key: Path | None = None  # identity file; None leaves the choice to the user's ssh config and agent
+    connect_timeout: int = 10
+
+    def proxy_command(self) -> str:
+        cmd = ["ssh"]
+        if self.key is not None:
+            cmd += ["-i", str(self.key), "-o", "IdentitiesOnly=yes"]
+        cmd += [
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=yes",
+            "-o", f"HostKeyAlias={self.host_key_alias}",
+            "-o", f"HostKeyAlgorithms={self.key_type}",
+            "-o", f"UserKnownHostsFile={self.known_hosts}",
+            "-o", f"ConnectTimeout={self.connect_timeout}",
+            "-o", "LogLevel=ERROR",
+            "-W", "%h:%p", self.target,
+        ]
+        return shlex.join(cmd)
+
+
 class Remote:
-    def __init__(self, ip: str, key: Path, known_hosts: Path, pinned: bool = False):
+    def __init__(self, ip: str, key: Path, known_hosts: Path, pinned: bool = False, jump: Jump | None = None):
         if not ip:
             raise DevboxError("server has no IPv4 address")
+        # Set for workspaces on own hosts: every connection goes through this machine.
+        self.jump = jump
         self.ip = ip
         self.key = key
         self.known_hosts = known_hosts
@@ -196,6 +230,7 @@ class Remote:
             "-o", f"ConnectTimeout={connect_timeout}",
             "-o", "ServerAliveInterval=30",
             "-o", "LogLevel=ERROR",
+            *(("-o", f"ProxyCommand={self.jump.proxy_command()}") if self.jump else ()),
         ]
 
     def ssh_cmd(self, remote: str | None = None, tty: bool = False, connect_timeout: int = 10) -> list[str]:
