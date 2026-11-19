@@ -194,3 +194,11 @@ def test_every_command_line_that_reaches_the_workspace_goes_through_the_jump(tmp
 def test_jump_without_identity_leaves_key_choice_to_ssh_config(tmp_path):
     j = Jump("dev@mini", tmp_path / "kh", "devbox-host-mini", "ssh-ed25519")
     assert "-i" not in shlex.split(j.proxy_command())
+
+
+def test_ssh_failure_through_a_jump_host_hints_at_a_deleted_workspace(tmp_path):
+    direct = Remote("1.2.3.4", Path("/k"), tmp_path / "kh")
+    assert direct.ssh_failure("boom") == "ssh to 1.2.3.4 failed: boom"
+    via = Remote("10.0.0.5", Path("/k"), tmp_path / "kh", jump=jump(tmp_path))
+    text = via.ssh_failure("")
+    assert text.startswith("ssh to 10.0.0.5 failed (through host dev@mini;") and "`devbox status`" in text

@@ -388,12 +388,14 @@ class Incus:
     # --- provisioning ---
 
     def provision(self, name: str, public_key: str, host_private: str, host_public: str,
-                  say=lambda m: None, bound=lambda: 900, publish_as: str | None = None) -> dict:
+                  say=lambda m: None, bound=lambda: 900, publish_as: str | None = None,
+                  publish_ok=lambda: True) -> dict:
         """Install what a Hetzner server gets from cloud-init, plus sshd access for devbox. Idempotent.
 
         With `publish_as`, the container is published as the host's base image once the shared setup is
         done and before anything specific to this workspace (keys) is written. A failure to publish only
-        costs the cache, never the workspace. Returns {"workaround": bool, "published": bool}.
+        costs the cache, never the workspace, and `publish_ok()` lets the caller skip it when the startup
+        deadline leaves too little time (publishing takes about 30 s). Returns {"workaround": bool, "published": bool}.
         """
         say("Checking container network...")
         if self.exec(name, NETWORK_CHECK, check=False, timeout=60).returncode != 0:
@@ -418,7 +420,9 @@ class Incus:
             say("Docker needed the runc 1.2.3 workaround on this Incus version; "
                 f"`devbox host bootstrap {self.shell.host.name} --zabbly` plans a newer Incus")
         published = False
-        if publish_as:
+        if publish_as and not publish_ok():
+            say("Skipping the base image: too little startup time left (the next `up` on this host publishes it)")
+        elif publish_as:
             try:
                 self.publish_base(name, publish_as, say)
                 published = True

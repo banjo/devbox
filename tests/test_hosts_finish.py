@@ -542,3 +542,13 @@ def test_the_base_image_is_published_uncompressed(capsys, world):
     assert run(capsys, "up", "crm", "--host", "mini")[0] == 0
     publish = next(c for c in world.calls if c[0] == "publish")
     assert publish[publish.index("--compression") + 1] == "none"
+
+
+def test_publishing_is_skipped_when_the_startup_deadline_leaves_too_little_time(capsys, world, monkeypatch):
+    add_host(capsys, world)
+    monkeypatch.setattr(cli, "PUBLISH_MIN_SECONDS", 10 ** 6)
+    code, out, err = run(capsys, "up", "crm", "--host", "mini", "--json")
+    assert code == 0 and json.loads(out)["image_cache"] == "off" and world.images == []
+    assert "Skipping the base image" in err and world.containers["devbox-crm"]["status"] == "Running"
+    monkeypatch.setattr(cli, "PUBLISH_MIN_SECONDS", 0)
+    assert json.loads(run(capsys, "up", "blog", "--host", "mini", "--json")[1])["image_cache"] == "published"

@@ -281,11 +281,19 @@ class Remote:
             raise DevboxError(f"remote command timed out after {timeout}s")
         if proc.returncode == 255 and raise_on_255:
             detail = (proc.stderr or "").strip() if capture else ""
-            raise DevboxError(f"ssh to {self.ip} failed{': ' + detail if detail else ''}")
+            raise DevboxError(self.ssh_failure(detail))
         if check and proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip() if capture else ""
             raise DevboxError(f"remote command failed (exit {proc.returncode}){': ' + detail if detail else ''}")
         return proc
+
+    def ssh_failure(self, detail: str) -> str:
+        """The error for a failed SSH connection; a workspace behind a jump host may simply be gone."""
+        text = f"ssh to {self.ip} failed{': ' + detail if detail else ''}"
+        if self.jump is not None:
+            text += (f" (through host {self.jump.target}; if the workspace was deleted on the host or the host is "
+                     "down, `devbox status` checks and `devbox down` clears the registry entry)")
+        return text
 
     def exec(self, script: str, timeout: float | None = None, capture: bool = False) -> ExecResult:
         """Run a foreground command in the app folder.
@@ -327,7 +335,7 @@ class Remote:
         if proc.returncode == 255 and not timed_out:
             detail = (proc.stderr or "").strip() if capture else ""
             if result is None:
-                raise DevboxError(f"ssh to {self.ip} failed{': ' + detail if detail else ''}")
+                raise DevboxError(self.ssh_failure(detail))
             if not self.scope_gone(unit):
                 after = "will be stopped at the deadline" if secs else f"keeps running until it ends (stop it with `systemctl stop {unit}.scope` on the server)"
                 raise DevboxError(

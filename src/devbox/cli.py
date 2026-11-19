@@ -27,6 +27,7 @@ POWERED_DOWN = ("off", "stopping")
 # Using the server again cancels a `pause/down --at-hour-end`; looking at it doesn't.
 CANCELS_STOP = {"up", "sync", "exec", "exec_detach", "touch", "expose", "forward", "db_restore", "ssh"}
 DEFAULT_WAIT_TIMEOUT = "2m"
+PUBLISH_MIN_SECONDS = 90  # publishing the base image needs about 30 s; leave room for the rest of `up`
 
 
 class Context:
@@ -2915,7 +2916,8 @@ def bring_up_workspace(ctx: Context, project, host_name: str | None, deadline: "
         db.update_server(ctx.conn, server["id"], host_key=host_public)
         publish_as = cache_alias if cache_alias and image_cache != "hit" and not inc.has_base(cache_alias) else None
         provisioned = inc.provision(cname, public_key, host_private, host_public, say=progress.say,
-                                    bound=lambda: deadline.bound("cloud-init", 900), publish_as=publish_as)
+                                    bound=lambda: deadline.bound("cloud-init", 900), publish_as=publish_as,
+                                    publish_ok=lambda: deadline.remaining() >= PUBLISH_MIN_SECONDS)
         if provisioned["published"]:
             image_cache = "published"
         if provisioned["workaround"]:
