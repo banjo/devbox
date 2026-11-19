@@ -1993,12 +1993,13 @@ def cmd_history(ctx: Context) -> int:
     if data["servers"]:
         lines.append(f"{'STARTED':<16} {'PROJECT':<14} {'SERVER':<16} {'RAN':>7} {'COST':>7}  ACTIVITY")
     for e in data["servers"]:
-        where = f"{e['server_type']} {e['location']}"
+        workspace = not providers.capabilities(e["provider"]).has_billing
+        where = f"host {e['location']}" if workspace else f"{e['server_type']} {e['location']}"
         counts = e["activity"]
         activity = ", ".join(
             f"{counts[k]} {label}{'s' if counts[k] != 1 else ''}" for k, label in ACTIVITY_LABELS if counts.get(k)
         )
-        notes = []
+        notes = [e["server_type"].removeprefix("incus container, ")] if workspace and e["server_type"] else []
         if e["restored_from_snapshot"]:
             notes.append(f"from snapshot {e['restored_from_snapshot']}")
         if e["startup"]:
@@ -2010,7 +2011,7 @@ def cmd_history(ctx: Context) -> int:
         tail = activity + (f" [{'; '.join(notes)}]" if notes else "")
         lines.append(
             f"{e['created_at'][:16].replace('T', ' '):<16} {e['project']:<14} {where:<16} "
-            f"{costs.duration(e['seconds']):>7} {costs.money(e['cost']):>7}  {tail}"
+            f"{costs.duration(e['seconds']):>7} {'free' if workspace else costs.money(e['cost']):>7}  {tail}"
         )
     if data["snapshots"]:
         lines.append("")

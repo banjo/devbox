@@ -552,3 +552,11 @@ def test_publishing_is_skipped_when_the_startup_deadline_leaves_too_little_time(
     assert "Skipping the base image" in err and world.containers["devbox-crm"]["status"] == "Running"
     monkeypatch.setattr(cli, "PUBLISH_MIN_SECONDS", 0)
     assert json.loads(run(capsys, "up", "blog", "--host", "mini", "--json")[1])["image_cache"] == "published"
+
+
+def test_history_shows_workspaces_as_free_on_their_host(capsys, world):
+    add_host(capsys, world)
+    assert run(capsys, "up", "crm", "--host", "mini", "--cpus", "3", "--memory", "6GiB")[0] == 0
+    out = run(capsys, "history")[1]
+    row = next(line for line in out.splitlines() if "crm" in line)
+    assert "host mini" in row and "free" in row and "€?" not in row and "3 cpu, 6GiB" in row
