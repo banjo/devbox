@@ -39,7 +39,10 @@
   status to a file on the server (`/run/devbox-exec-*.rc`). If the connection drops while the command runs
   (ssh exits 255), `exec` asks the server again every few seconds until it answers, waits for a command that
   is still running, and then exits with the command's real exit code (up to 10 minutes of retries with
-  `--timeout`, 5 without). Output that was sent while the connection was down is lost. If the server does
+  `--timeout`, 5 without). Output that was sent while the connection was down is lost, and a command
+  that writes to the lost connection after it dropped is killed by SIGPIPE, which `exec` then reports as exit
+  141. The cleanup call after the command is best effort: a connection that is down again at that point
+  never turns a finished command into a failure. If the server does
   not answer in that time, `exec` says so and exits with 125 (`code: exec_result_unknown`): the command may
   have finished, its status is unknown, and the message names the file that holds it. Containers started in the background (`docker compose up -d`, `docker run -d`) belong to
   Docker, not the scope, and keep running. Without `--timeout`, a foreground command keeps running

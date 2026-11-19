@@ -138,7 +138,8 @@ class ScopeServer:
     `rc`: the exit status the scope wrote to its result file (None: none was written).
     """
 
-    def __init__(self, returncode, result=None, active=False, reachable=True, rc=None, down_for=0, running_for=0):
+    def __init__(self, returncode, result=None, active=False, reachable=True, rc=None, down_for=0, running_for=0,
+                 started=True):
         self.returncode = returncode
         self.result = result
         self.active = active
@@ -146,6 +147,7 @@ class ScopeServer:
         self.rc = rc
         self.down_for = down_for
         self.running_for = running_for
+        self.started = started
         self.calls = []
 
     def __call__(self, remote_cmd, *a, **kw):
@@ -164,7 +166,9 @@ class ScopeServer:
             if self.running_for > 0:
                 self.running_for -= 1
                 active = True
-            out = f"active={'yes' if active else 'no'}\nresult={self.result or ''}\nrc={'' if self.rc is None else self.rc}\n"
+            out = f"active={'yes' if active else 'no'}\nresult={self.result or ''}\n"
+            if self.started:
+                out += f"started=yes\nrc={'' if self.rc is None else self.rc}\n"
             return subprocess.CompletedProcess([], 0, out, "")
         if "is-active" in remote_cmd:
             return subprocess.CompletedProcess([], 0 if self.active else 3, "", "")
@@ -262,7 +266,8 @@ def test_exec_runs_in_a_scope_that_records_the_exit_status():
     r._ssh = server
     r.exec("echo hi")
     cmd = server.calls[0]
-    assert "echo $rc > /run/devbox-exec-" in cmd and cmd.count(".rc") == 1
+    assert "echo started > /run/devbox-exec-" in cmd and "echo $rc > /run/devbox-exec-" in cmd
+    assert "-mmin +1440 -delete" in cmd  # stale status files of earlier dropped connections
 
 
 def test_exec_dropped_connection_returns_the_real_exit_code_when_the_host_is_back(monkeypatch):
@@ -321,3 +326,34 @@ def test_exec_timeout_after_a_dropped_connection_is_still_a_timeout(monkeypatch)
     clock = FakeClock()
     result = remote_with(monkeypatch, server).exec("sleep 99", timeout=2, sleep=clock.sleep, clock=clock)
     assert result.timed_out
+
+
+def test_exec_that_never_started_is_reported_as_a_failed_connection_not_a_killed_command(monkeypatch):
+    # ssh could not connect at all (blackhole): the scope does not exist and there is no status file.
+    from devbox import DevboxError
+
+    server = ScopeServer(255, result="success", started=False, down_for=3)
+    clock = FakeClock()
+    with pytest.raises(DevboxError, match="ssh to 192.0.2.1 failed: the command did not start") as e:
+        remote_with(monkeypatch, server).exec("rm -rf build", sleep=clock.sleep, clock=clock)
+    assert "killed" not in str(e.value) and e.value.exit_code == 1
+
+
+def test_exec_that_finished_is_not_turned_into_a_failure_by_the_cleanup_call(monkeypatch):
+    # The issue: the command ran, ssh returned its exit status, but the connection was blocked again when
+    # the follow-up call (reset-failed) was made.
+    from devbox import DevboxError
+
+    r = Remote("192.0.2.1", Path("/key"), Path("/kh"))
+    calls = []
+
+    def fake_ssh(remote_cmd, capture=True, check=True, timeout=120, *a, **kw):
+        calls.append(remote_cmd)
+        if "systemd-run --scope" in remote_cmd:
+            return subprocess.CompletedProcess([], 7, "done\n", "")
+        raise DevboxError("ssh to 192.0.2.1 failed: Connection timed out during banner exchange")
+
+    monkeypatch.setattr(r, "_ssh", fake_ssh)
+    result = r.exec("sleep 15; echo done", capture=True)
+    assert result == ExecResult(7, "done\n", "", timed_out=False)
+    assert any("reset-failed" in c for c in calls)  # it tried

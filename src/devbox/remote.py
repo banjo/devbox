@@ -321,8 +321,10 @@ class Remote:
         # No --collect: a scope stopped by RuntimeMaxSec stays loaded as failed
         # with Result=timeout until reset-failed, so it can be checked below.
         limits = f"-p RuntimeMaxSec={secs}s -p TimeoutStopSec={EXEC_KILL_AFTER}s " if secs else ""
-        inner = f"bash -lc {shlex.quote(script)}; rc=$?; echo $rc > {rc_file}; exit $rc"
+        inner = f"echo started > {rc_file}; bash -lc {shlex.quote(script)}; rc=$?; echo $rc > {rc_file}; exit $rc"
         remote = (
+            # Status files left behind by a connection that was down at cleanup time: a day old, never needed again.
+            f"find {EXEC_RESULT_DIR} -maxdepth 1 -name 'devbox-exec-*.rc' -mmin +1440 -delete 2>/dev/null; "
             f"cd {APP_DIR} && systemd-run --scope --quiet --unit {unit} {limits}"
             f"--setenv=HOME=/root bash -c {shlex.quote(inner)}"
         )
@@ -353,14 +355,27 @@ class Remote:
                 returncode = state["rc"]
             elif returncode == 255 and not timed_out:
                 self.clear_scope(unit, rc_file)
+                if not state["started"]:
+                    # No scope, no status file: the connection never got as far as running the command.
+                    raise DevboxError(self.ssh_failure("the command did not start on the server"))
                 raise DevboxError(f"the command was killed on the server (systemd result: {state['result']})")
-            elif timed_out and not self.scope_gone(unit):
-                self.stop_scope(unit)
+            elif timed_out:
+                try:
+                    if not self.scope_gone(unit):
+                        self.stop_scope(unit)
+                except DevboxError:
+                    pass  # systemd has already stopped it at the deadline; this only makes sure
         self.clear_scope(unit, rc_file)
         return ExecResult(returncode, proc.stdout, proc.stderr, timed_out=timed_out)
 
     def clear_scope(self, unit: str, rc_file: str) -> None:
-        self._ssh(f"systemctl reset-failed {unit}.scope 2>/dev/null; rm -f {rc_file}; true", check=False, timeout=30)
+        """Best effort: the command already has its result, so a connection that is down again must not turn a
+        finished command into a failure (the status file lives in /run and goes away on reboot)."""
+        try:
+            self._ssh(f"systemctl reset-failed {unit}.scope 2>/dev/null; rm -f {rc_file}; true", check=False,
+                      timeout=30)
+        except DevboxError:
+            pass
 
     def exec_outcome(self, unit: str, rc_file: str, budget: float, secs: int | None, sleep, clock) -> dict:
         """What the server says about an exec scope after the connection ended: {"result", "rc"}.
@@ -392,12 +407,12 @@ class Remote:
             sleep(max(0.0, min(EXEC_RETRY_PAUSE, until - clock())))
 
     def scope_state(self, unit: str, rc_file: str) -> dict | None:
-        """One read of an exec scope: {"active": bool, "result": str, "rc": int | None}; None if unreadable.
+        """One read of an exec scope: {"active", "result", "rc" (int | None), "started"}; None if unreadable.
         Raises DevboxError when the server cannot be reached."""
         proc = self._ssh(
             f"a=no; systemctl is-active --quiet {unit}.scope && a=yes; echo active=$a; "
             f"echo result=$(systemctl show -p Result --value {unit}.scope 2>/dev/null); "
-            f"echo rc=$(cat {rc_file} 2>/dev/null)", check=False, timeout=30)
+            f"if [ -e {rc_file} ]; then echo started=yes; echo rc=$(cat {rc_file}); fi", check=False, timeout=30)
         if proc.returncode != 0:
             return None
         values = dict(line.split("=", 1) for line in (proc.stdout or "").splitlines() if "=" in line)
@@ -405,7 +420,7 @@ class Remote:
             return None
         rc = values.get("rc", "").strip()
         return {"active": values["active"].strip() == "yes", "result": values.get("result", "").strip() or None,
-                "rc": int(rc) if rc.lstrip("-").isdigit() else None}
+                "rc": int(rc) if rc.lstrip("-").isdigit() else None, "started": values.get("started") == "yes"}
 
     def stop_scope(self, unit: str) -> bool:
         self._ssh(f"systemctl kill --signal=SIGKILL {unit}.scope 2>/dev/null; true", check=False, timeout=30)
