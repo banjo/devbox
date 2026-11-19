@@ -175,7 +175,7 @@ def old_database(path):
     conn = sqlite3.connect(path, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    old = [m for m in db.MIGRATIONS[:-1]]
+    old = [m for m in db.MIGRATIONS[:-2]]  # the last one adds hosts
     for i, sql in enumerate(old, start=1):
         for statement in db._split(sql):
             conn.execute(statement)
