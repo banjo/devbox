@@ -54,14 +54,42 @@ def auth_unit(name: str) -> str:
     return AUTH_UNIT_PREFIX + name
 
 
+LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
+
+
+def label(project: str, name: str) -> str:
+    """The DNS label of a preview: the project for the default preview, `<project>-<name>` for named ones."""
+    return project if name == DEFAULT else f"{project}-{name}"
+
+
 def hostname(project: str, name: str, domain: str) -> str:
-    label = project if name == DEFAULT else f"{project}-{name}"
-    if len(label) > 63:
-        raise DevboxError(f"hostname label '{label}' is longer than 63 characters; use a shorter preview name")
-    return f"{label}.{domain}"
+    host_label = label(project, name)
+    if len(host_label) > 63:
+        raise DevboxError(f"hostname label '{host_label}' is longer than 63 characters; use a shorter preview name")
+    if not LABEL_RE.match(host_label):
+        raise DevboxError(f"'{host_label}' is not a valid hostname label (it ends with a dash); "
+                          "use a preview name without a trailing dash")
+    return f"{host_label}.{domain}"
 
 
-def env(project: str, domain: str | None, rows) -> dict[str, str]:
+def label_owners(projects, previews_by_project: dict[str, list[str]]) -> dict[str, set[str]]:
+    """Which projects can claim each hostname label: every project's default preview, plus the labels of the
+    named previews it has open. Two projects can produce the same label (`a-b` default, `a` + preview `b`)."""
+    owners: dict[str, set[str]] = {}
+    for project in projects:
+        owners.setdefault(label(project, DEFAULT), set()).add(project)
+        for name in previews_by_project.get(project, []):
+            owners.setdefault(label(project, name), set()).add(project)
+    return owners
+
+
+def claimed_by_other(project: str, name: str, owners: dict[str, set[str]]) -> str | None:
+    """Another project that already owns the label this preview would use, if any."""
+    others = owners.get(label(project, name), set()) - {project}
+    return sorted(others)[0] if others else None
+
+
+def env(project: str, domain: str | None, rows, owners: dict[str, set[str]] | None = None) -> dict[str, str]:
     """Environment variables telling the app its preview URLs.
 
     With a domain the default preview's URL is known before anything is exposed.
@@ -77,7 +105,12 @@ def env(project: str, domain: str | None, rows) -> dict[str, str]:
 
     if domain:
         values["DEVBOX_PREVIEW_DOMAIN"] = domain
-        add(DEFAULT, f"https://{hostname(project, DEFAULT, domain)}")
+        # A label that another project owns is not announced: the app would be told someone else's URL.
+        if not (owners and claimed_by_other(project, DEFAULT, owners)):
+            try:
+                add(DEFAULT, f"https://{hostname(project, DEFAULT, domain)}")
+            except DevboxError:
+                pass  # no valid hostname for this project name; `expose` explains
     for r in sorted(rows, key=lambda r: r["name"]):
         add(r["name"], r["url"])
     return values

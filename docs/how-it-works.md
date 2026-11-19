@@ -23,8 +23,8 @@
   cloud-init has installed it, `up` keeps waiting rather than trust another key. The private host
   key passes through Hetzner's user data. Servers created by older versions keep trust-on-first-use
   until they are replaced.
-- Servers run Ubuntu with Docker + Compose, `mise`, `cloudflared`, `git` and build tools. Everything
-  runs as root in `/srv/app`.
+- Servers (and workspaces) run Ubuntu with Docker + Compose, `mise`, `cloudflared`, `git` and build tools.
+  Everything runs as root in `/srv/app`.
 - Sync sends exactly the files Git sees in the working tree: tracked files plus untracked files that
   are not ignored, using Git's own ignore rules (so `!.env.example` style exceptions work). Ignored
   files on the server, such as `node_modules` and `.env`, are left alone. A file that was synced
@@ -55,6 +55,20 @@ see [Own hosts](hosts.md). Those rows have `servers.provider = 'ssh'` and `serve
 when the provider has one, then the workspace step, and skip what a capability rules out. Workspace
 connections reuse `Remote` through an SSH jump host (`ProxyCommand` with the host's pinned key), so
 `exec`, `sync`, `forward` and the rest are the same code for both kinds.
+
+What differs per kind, by capability and not by name:
+
+| | Hetzner server | Workspace on an own host |
+| --- | --- | --- |
+| machine | created, billed, snapshotted, deleted by devbox | never touched |
+| isolation | the whole server | unprivileged Incus container (own files, processes, network, limits) |
+| `pause` / `down` | snapshot + delete / delete | `incus stop` / delete the container |
+| base setup | cloud-init at first boot | the same `cloud-init.yaml`, run in the container; cached as a host image |
+| previews | cloudflared on the server | cloudflared in the container, so every workspace has its own tunnel and port space |
+| cost, idle shutdown | tracked / enforced | none (`status` says own hardware) |
+
+Both kinds run `/srv/app` as root inside their own machine or container. Containers are unprivileged,
+so root in a workspace is not root on the host. See [Workspaces](workspaces.md).
 
 ## Several servers
 

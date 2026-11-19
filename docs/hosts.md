@@ -1,19 +1,23 @@
-# Own hosts and Incus workspaces
+# Own hosts
 
-A host is a machine you already own (a mini PC, a home server, a VM) that devbox reaches over SSH.
-On it, every project runs in its own unprivileged [Incus](https://linuxcontainers.org/incus/) system
-container, a **workspace**. devbox never creates, powers off, snapshots or deletes the machine, and
-it costs nothing: there is no billing, so `costs`, billing hours and `--at-hour-end` do not apply.
+A host is a machine you already own (a mini PC, a home server, a VM) that devbox reaches over SSH. On
+it, every project runs in its own unprivileged [Incus](https://linuxcontainers.org/incus/) system
+container, a **workspace** ([Workspaces](workspaces.md)). devbox never creates, powers off, snapshots
+or deletes the machine, and it costs nothing: there is no billing, so `costs`, billing hours and
+`--at-hour-end` do not apply.
 
 Hetzner servers keep working exactly as before. Choose per project with `--host`.
 
 ```text
 devbox host add NAME --ssh USER@HOST [--key PATH]   register a host and pin its SSH host key
-devbox host bootstrap NAME [--yes]                  show (then apply) what the host needs
+devbox host bootstrap NAME [--zabbly] [--yes]       show (then apply) what the host needs
 devbox host list                                    hosts and the workspaces on them
 devbox host remove NAME [--force]                   forget a host; the machine is never touched
-devbox up PROJECT --host NAME [--cpus N --memory SIZE]
+devbox up PROJECT --host NAME [--cpus N --memory SIZE] [--isolate]
 ```
+
+Every command takes `--json`. `host add` and `host bootstrap` end with `next:` lines saying what to do
+next (`next.steps` in `--json`), so an agent can follow them.
 
 ## Add a host
 
@@ -38,76 +42,70 @@ agent decide.
 
 `devbox host bootstrap NAME` inspects the host read-only and prints a plan. Nothing changes until
 `--yes`, the same pattern as `autostop enable`. It is idempotent: when everything is in place it says
-`nothing to do`.
+`nothing to do`. The plan always names the Incus version it found.
 
 What it checks and may do:
 
 1. **Incus**: installs the `incus` package from the Ubuntu/Debian archive (`apt-get`, needs
    `sudo -n`) and runs `incus admin init --minimal` (bridge `incusbr0`, `dir` storage) when it is
    missing or uninitialised.
-2. **Docker + UFW**: on a host with Docker, `FORWARD` is `DROP`, and UFW blocks the Incus bridge
+2. **A newer Incus (`--zabbly`)**: the archive ships Incus 6.0.x on Ubuntu 24.04. On it, current
+   Docker (docker-ce with runc 1.5) cannot start containers inside a workspace
+   (`open sysctl net.ipv4.ip_unprivileged_port_start ... permission denied`). The plan flags versions
+   older than 6.1 and says so. With `--zabbly`, the plan instead adds the
+   [Zabbly](https://github.com/zabbly/incus) package repository
+   (`https://pkgs.zabbly.com/incus/stable`, suites `bookworm`, `trixie`, `jammy`, `noble`, `resolute`)
+   and installs, or upgrades to, its `incus` package. The signing key is downloaded to
+   `/etc/apt/keyrings/zabbly.asc` and compared with the published fingerprint
+   (`4EFC 5906 96CB 15B8 7C73 A3AD 82CC 8797 C838 DCFD`) before it is trusted; a different key is deleted
+   and the step fails. This is never done automatically: it needs `--zabbly` **and** `--yes`, and
+   `--yes` alone leaves Incus as it is. An upgrade restarts the Incus daemon on the host; the plan says
+   how many containers are running. A host whose Incus is already new enough is left alone. Checked on a
+   Hetzner server: Incus 6.0.0 from the archive fails with runc 1.5.3 and needs the fallback; after
+   `--zabbly --yes` (about 50 s, running containers kept running) Incus 7.6 starts Docker containers with
+   the stock runc and no workaround. The Zabbly package also sets `kernel.keys.maxkeys=2000` (below).
+   Without it, provisioning keeps its fallback: if Docker cannot start containers it registers runc
+   1.2.3 as Docker's default runtime in that workspace, and `up` warns that a newer Incus avoids this.
+3. **Docker + UFW**: on a host with Docker, `FORWARD` is `DROP`, and UFW blocks the Incus bridge
    as well, so containers get no IPv4 and no internet. If UFW is active, bootstrap adds only the
    missing ones of `ufw allow in on incusbr0`, `ufw route allow in on incusbr0` and
    `ufw route allow out on incusbr0`. It never edits Docker's own rules. If `FORWARD` is `DROP` but
-   UFW is not active, it reports the problem and leaves the firewall to you (`manual:` line).
-3. **Access**: the SSH user needs to be in the `incus-admin` group or have passwordless `sudo -n`.
+   UFW is not active, bootstrap only reports it (a `manual:` line with the rules to add): the host's
+   firewall is yours, and `--zabbly` or `--yes` never change that.
+4. **Kernel key quota** (report only): all unprivileged containers on a host share one kernel key quota
+   (`kernel.keys.maxkeys`, 200 by default). A workspace uses 15 to 30 keys depending on what runs in it;
+   when the quota is used up Docker fails with `unable to create session key: disk quota exceeded`
+   (seen on a host with 12 workspaces). The plan prints a `manual:` line when the value is below 1000;
+   devbox does not change kernel settings. The Zabbly Incus package raises it to 2000, and
+   `echo 'kernel.keys.maxkeys = 2000' | sudo tee /etc/sysctl.d/99-devbox-incus.conf && sudo sysctl --system`
+   does the same for the archive package.
+5. **Access**: the SSH user needs to be in the `incus-admin` group or have passwordless `sudo -n`.
    devbox uses the group when it can and `sudo -n incus` otherwise. If neither works, bootstrap
-   says so and changes nothing. It never writes global files on the host.
+   says so and changes nothing. It never writes global files on the host except the Zabbly repository
+   files above, and only when asked.
 
-## Workspaces
+`host remove` forgets the host. It refuses while workspaces exist; `--force` deletes the workspaces
+devbox created, and devbox's cached base image ([Workspaces](workspaces.md#base-image-cache)). It never
+touches the machine itself. If the machine can no longer be reached, `--force` still forgets the host and
+its workspaces in the registry (with a warning; any containers stay on the machine).
 
-`devbox up PROJECT --host NAME` is an orchestrator: it first checks that the host answers with its
-pinned key (the "provider" step, which for own hosts only verifies reachability), then does the
-workspace step:
+## A Hetzner server as a host
 
-- creates the container `devbox-PROJECT` from `images:ubuntu/24.04` with `limits.cpu`,
-  `limits.memory` and `security.nesting=true` (so Docker works inside), plus the labels
-  `user.devbox.managed=true`, `user.devbox.controller=<this install's id>` and
-  `user.devbox.project=PROJECT`;
-- sets it up like a Hetzner server does: sshd with root login by key (your devbox key), Docker with
-  Compose, mise, cloudflared, rsync, git, `/srv/app` and `/etc/profile.d/devbox.sh`, taking the
-  steps from the same `cloud-init.yaml` as Hetzner servers. If Docker cannot start containers
-  inside the container (newer runc on older Incus), it registers runc 1.2.3 as Docker's default
-  runtime;
-- pins the container's own host key, as for Hetzner servers, and syncs the code.
+A server devbox created can also be registered as a host (`host add NAME --ssh root@IP --key ~/.ssh/devbox`),
+so one project runs on the server directly and others in containers on the same machine. Two things to know:
 
-The first `up` takes about a minute on a fast connection; `pause` and `up` afterwards take seconds.
-Limits default to `incus_cpus = 2` and `incus_memory = "4GiB"` in the config (and `incus_image`);
-`--cpus` and `--memory` override them, also on an existing workspace.
+- Such a server has Docker, so its `FORWARD` policy is `DROP` and UFW is not active: containers get DNS but
+  no other connectivity. Bootstrap prints the `manual:` rules (`iptables -I DOCKER-USER ...`); they were
+  checked to restore the network, and `up` fails after about a minute with a pointer to them instead of
+  waiting for a timeout.
+- `down` and `pause` of that server refuse while workspaces are registered on the same address, because
+  deleting or snapshotting the machine would destroy or freeze them. Remove the workspaces first.
 
-Everything else works through the same code as for Hetzner servers, only with an SSH jump through
-the host (`ProxyCommand`, pinned host key) in front: `exec`, `exec --detach`, `ps`, `logs`, `stop`,
-`sync`, `pull`, `forward`, `ssh`, `db`, `secrets`, `expose`. Previews use cloudflared inside the
-container (outbound only). Two workspaces on a host can both listen on the same port, such as
-5173, because each has its own network namespace.
+## Where things are
 
-| Command | On an own host |
-| --- | --- |
-| `up` | create or start the container, set it up, sync code |
-| `pause` | `incus stop`: the container and its files and volumes are kept |
-| `up` after `pause` | `incus start`, files are still there; processes and previews must be started again |
-| `down` | delete the container with its files, volumes and databases (same warnings as for servers: `--dump` / `--no-dump`) |
-| `status` | host, workspace name, limits, address, cost `none (own hardware)` |
-| `idle-check` | leaves workspaces alone (no idle shutdown on own hardware) |
-| `pause --at-hour-end` | refused: there are no billing hours |
-
-### Safety
-
-devbox only starts, stops, changes, runs commands in or deletes containers that carry **both**
-labels with this install's controller id. A container with the name `devbox-PROJECT` that lacks them
-makes `up` stop with an error. `host remove` refuses while workspaces exist; `--force` deletes the
-workspaces (containers devbox created) and never the machine. Containers of other devbox installs on
-the same host are not touched.
-
-### Limits and `max_servers`
-
-`max_servers` limits billed servers. Workspaces on your own hosts do not count toward it, and
-`--additional` is not needed for them.
-
-### Known limits
-
-- One workspace per project, on one host; moving a project means `down`, then `up --host OTHER`.
-- Containers can reach each other over `incusbr0`; there is no network isolation between workspaces.
-- No Incus snapshot on `pause` and no machine snapshot; `pause` is stop-and-keep.
-- The first `up` installs everything from the network; there is no cached image yet.
-- `host bootstrap` only knows `apt`; on other systems install Incus yourself.
+- Containers: `incus list` on the host shows `devbox-PROJECT`, labelled `user.devbox.managed=true`,
+  `user.devbox.controller=<id>` and `user.devbox.project=PROJECT`.
+- The cached base image: alias `devbox-base-<hash>`, properties `user.devbox.base=true` and the
+  controller id.
+- `devbox cleanup` and `devbox doctor` list containers and images of this devbox that the registry no
+  longer knows ([Housekeeping](housekeeping.md)).

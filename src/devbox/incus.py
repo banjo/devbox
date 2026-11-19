@@ -5,6 +5,7 @@ Everything here runs through a `HostShell` (SSH to the host). Containers carry t
 changes, runs commands in or deletes containers that have both, with its own controller id.
 """
 
+import hashlib
 import json
 import re
 import shlex
@@ -18,13 +19,22 @@ from devbox.hosts import HostShell
 MANAGED = "user.devbox.managed"
 CONTROLLER = "user.devbox.controller"
 PROJECT = "user.devbox.project"
+BASE_PROP = "user.devbox.base"
 NAME_PREFIX = "devbox-"
 CONTAINER_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 IMAGE_REMOTE = "images:"
+BASE_PREFIX = "devbox-base-"  # alias of the cached, provisioned base image
+BASE_CACHE_FORMAT = "1"  # bump when the way base images are made changes
+PORT_ISOLATION = "security.port_isolation"
+NIC = "eth0"
+WORKAROUND_MARKER = "devbox: runc workaround registered"
 
 
 def container_name(project: str) -> str:
     name = NAME_PREFIX + project
+    if name.endswith("-"):
+        raise DevboxError(f"project name '{project}' ends with a dash, which Incus does not accept in a container "
+                          f"name ({name}); register the project under another name")
     if not CONTAINER_NAME_RE.match(name):
         raise DevboxError(f"project name '{project}' is too long for a container name ({name})")
     return name
@@ -98,8 +108,11 @@ SSHD_SETUP = (
     "{ apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server; } || exit 1; "
     "systemctl enable ssh >/dev/null 2>&1; true"
 )
+# DNS alone proves little: on a host with Docker (FORWARD policy DROP) the bridge still answers DNS while every
+# forwarded connection is dropped. Also open a TCP connection to github.com (IPv4 only), which setup needs.
 NETWORK_CHECK = (
-    "for i in 1 2 3 4 5 6; do getent hosts archive.ubuntu.com >/dev/null && exit 0; sleep 5; done; exit 1"
+    "for i in 1 2 3 4; do getent hosts archive.ubuntu.com >/dev/null && "
+    "timeout 8 bash -c 'exec 3<>/dev/tcp/github.com/443' 2>/dev/null && exit 0; sleep 4; done; exit 1"
 )
 
 
@@ -109,8 +122,10 @@ NETWORK_CHECK = (
 DOCKER_CHECK = r'''
 command -v docker >/dev/null || exit 1
 systemctl is-active --quiet docker || systemctl start docker
-check() { timeout 120 docker run --rm hello-world >/dev/null 2>&1; }
-if check; then docker rmi hello-world >/dev/null 2>&1; exit 0; fi
+log=$(mktemp)
+# Docker may still be settling right after the container started (cached image): try a few times.
+check() { for i in 1 2 3; do timeout 120 docker run --rm hello-world >"$log" 2>&1 && return 0; sleep 3; done; return 1; }
+if check; then docker rmi hello-world >/dev/null 2>&1; rm -f "$log"; exit 0; fi
 arch=$(dpkg --print-architecture)
 curl -fsSL --connect-timeout 20 --max-time 120 --retry 2 -o /usr/local/bin/runc-compat \
   "https://github.com/opencontainers/runc/releases/download/v1.2.3/runc.$arch" || exit 1
@@ -125,10 +140,35 @@ json.dump(data, open(path, "w"), indent=2)
 PY
 systemctl restart docker
 sleep 3
-check || { echo "docker cannot start containers inside this container" >&2; exit 1; }
+check || { echo "docker cannot start containers inside this container: $(tail -n 3 "$log" | tr '\n' ' ')" >&2; exit 1; }
+rm -f "$log"
 docker rmi hello-world >/dev/null 2>&1
+echo "devbox: runc workaround registered"
 exit 0
 '''
+
+
+def base_fingerprint(image: str, incus_version: str) -> str:
+    """Identifies what a provisioned base image contains.
+
+    It changes when the setup files or scripts change, the source image changes, or the host's Incus
+    changes (a cached image may carry the runc workaround that a newer Incus does not need).
+    """
+    parts = [BASE_CACHE_FORMAT, image, incus_version, resources.files("devbox").joinpath("cloud-init.yaml").read_text(),
+             SSHD_SETUP, NETWORK_CHECK, DOCKER_CHECK]
+    return hashlib.sha256("\0".join(parts).encode()).hexdigest()[:12]
+
+
+def base_alias(image: str, incus_version: str) -> str:
+    return BASE_PREFIX + base_fingerprint(image, incus_version)
+
+
+# Run in the base container just before it is published: nothing that belongs to one workspace may be in the image.
+BASE_CLEAN = (
+    "rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub /root/.ssh/authorized_keys; "
+    "apt-get clean; rm -rf /var/lib/apt/lists/*; truncate -s 0 /etc/machine-id; rm -f /var/lib/dbus/machine-id; "
+    "docker image prune -af >/dev/null 2>&1; sync; true"
+)
 
 
 class Incus:
@@ -227,14 +267,32 @@ class Incus:
         config = container.get("expanded_config") or container.get("config") or {}
         return {"cpus": config.get("limits.cpu"), "memory": config.get("limits.memory")}
 
-    def create(self, name: str, project: str, image: str, cpus: int, memory: str) -> None:
+    def create(self, name: str, project: str, image: str, cpus: int, memory: str, isolate: bool = False,
+               base: str | None = None) -> None:
+        """Launch the container, from the cached base image `base` (a local alias) when there is one."""
         if self.get(name) is not None:
             raise DevboxError(f"container {name} already exists on host {self.shell.host.name}")
-        self.run([
-            "launch", f"{IMAGE_REMOTE}{image}", name,
-            "-c", f"limits.cpu={cpus}", "-c", f"limits.memory={memory}", "-c", "security.nesting=true",
-            "-c", f"{MANAGED}=true", "-c", f"{CONTROLLER}={self.controller_id}", "-c", f"{PROJECT}={project}",
-        ], timeout=600)
+        source = base or f"{IMAGE_REMOTE}{image}"
+        args = ["launch", source, name,
+                "-c", f"limits.cpu={cpus}", "-c", f"limits.memory={memory}", "-c", "security.nesting=true",
+                "-c", f"{MANAGED}=true", "-c", f"{CONTROLLER}={self.controller_id}", "-c", f"{PROJECT}={project}"]
+        if isolate:
+            args += ["-d", f"{NIC},{PORT_ISOLATION}=true"]
+        self.run(args, timeout=600)
+
+    @staticmethod
+    def isolated(container: dict) -> bool:
+        nic = (container.get("expanded_devices") or container.get("devices") or {}).get(NIC) or {}
+        return nic.get(PORT_ISOLATION) == "true"
+
+    def set_isolation(self, name: str, isolate: bool) -> None:
+        """Turn port isolation of the container's NIC on or off (takes effect on the next start if the NIC is not hot-pluggable)."""
+        c = self.require(name)
+        value = "true" if isolate else "false"
+        if NIC in (c.get("devices") or {}):
+            self.run(["config", "device", "set", name, NIC, f"{PORT_ISOLATION}={value}"])
+        else:
+            self.run(["config", "device", "override", name, NIC, f"{PORT_ISOLATION}={value}"])
 
     def set_limits(self, name: str, cpus: int | None, memory: str | None) -> None:
         self.require(name)
@@ -276,16 +334,81 @@ class Incus:
         self.require(name)
         return self.run(["exec", name, "--", "bash", "-c", script], input=input, timeout=timeout, check=check)
 
+    # --- cached base image ---
+
+    def version(self) -> str:
+        """The Incus server version on the host (empty if it cannot be read)."""
+        out = self.run(["version"], timeout=30, check=False).stdout or ""
+        m = re.search(r"Server version:\s*(\S+)", out)
+        return m[1] if m else ""
+
+    def _images(self) -> list[dict]:
+        proc = self.run(["image", "list", "--format", "json"], timeout=60)
+        try:
+            return json.loads(proc.stdout or "[]")
+        except ValueError:
+            raise DevboxError(f"unreadable `incus image list` output on host {self.shell.host.name}")
+
+    def base_images(self) -> list[dict]:
+        """Base images this controller published: [{"alias", "fingerprint", "size"}]."""
+        found = []
+        for img in self._images():
+            props = img.get("properties") or {}
+            if props.get(BASE_PROP) != "true" or props.get(CONTROLLER) != self.controller_id:
+                continue
+            for a in img.get("aliases") or []:
+                if a.get("name", "").startswith(BASE_PREFIX):
+                    found.append({"alias": a["name"], "fingerprint": img.get("fingerprint", ""),
+                                  "size": img.get("size")})
+        return found
+
+    def has_base(self, alias: str) -> bool:
+        return any(i["alias"] == alias for i in self.base_images())
+
+    def publish_base(self, name: str, alias: str, say=lambda m: None) -> None:
+        """Publish the (provisioned, not yet personalised) container as the host's base image.
+
+        The container is cleaned of host keys and machine id, stopped for the publish and started again.
+        Older base images of this controller are deleted afterwards.
+        """
+        self.exec(name, BASE_CLEAN, timeout=120)
+        say("Publishing the base image for later workspaces...")
+        self.run(["stop", name], timeout=180)
+        try:
+            # Uncompressed: publishing takes half the time and launching from the image a third (measured on a
+            # 1.4 GB workspace on dir storage: 26 s vs 56 s to publish, 3 s vs 11 s to launch).
+            self.run(["publish", name, "--alias", alias, "--reuse", "--compression", "none", f"{BASE_PROP}=true",
+                      f"{CONTROLLER}={self.controller_id}"], timeout=900)
+        finally:
+            self.run(["start", name], timeout=180)
+        for old in self.base_images():
+            if old["alias"] != alias:
+                self.run(["image", "delete", old["fingerprint"]], check=False)
+
+    def delete_base_image(self, fingerprint: str) -> None:
+        mine = {i["fingerprint"] for i in self.base_images()}
+        if fingerprint not in mine:
+            raise DevboxError(f"image {fingerprint[:12]} is not a base image of this devbox; devbox does not touch it")
+        self.run(["image", "delete", fingerprint])
+
     # --- provisioning ---
 
     def provision(self, name: str, public_key: str, host_private: str, host_public: str,
-                  say=lambda m: None, bound=lambda: 900) -> None:
-        """Install what a Hetzner server gets from cloud-init, plus sshd access for devbox. Idempotent."""
+                  say=lambda m: None, bound=lambda: 900, publish_as: str | None = None,
+                  publish_ok=lambda: True) -> dict:
+        """Install what a Hetzner server gets from cloud-init, plus sshd access for devbox. Idempotent.
+
+        With `publish_as`, the container is published as the host's base image once the shared setup is
+        done and before anything specific to this workspace (keys) is written. A failure to publish only
+        costs the cache, never the workspace, and `publish_ok()` lets the caller skip it when the startup
+        deadline leaves too little time (publishing takes about 30 s). Returns {"workaround": bool, "published": bool}.
+        """
         say("Checking container network...")
         if self.exec(name, NETWORK_CHECK, check=False, timeout=60).returncode != 0:
             raise DevboxError(
-                f"container {name} cannot resolve names (no internet from the container); if the host runs "
-                f"Docker or UFW, `devbox host bootstrap {self.shell.host.name}` fixes the firewall")
+                f"container {name} has no internet (DNS or a TCP connection to github.com failed); if the host runs "
+                f"Docker or UFW, `devbox host bootstrap {self.shell.host.name}` shows the firewall rules it needs "
+                "(a `manual:` line when UFW is not active)")
         files, commands = cloud_init_steps()
         say("Installing base files...")
         for f in files:
@@ -298,7 +421,29 @@ class Incus:
             say(f"Setup step {i}/{len(commands)}...")
             self.exec(name, command, timeout=bound())
         say("Checking that Docker can run containers...")
-        self.exec(name, DOCKER_CHECK, timeout=bound())
+        try:
+            checked = self.exec(name, DOCKER_CHECK, timeout=bound())
+        except DevboxError as e:
+            if "disk quota exceeded" in str(e):
+                raise DevboxError(
+                    f"{e}\nThe host's kernel key quota is used up (kernel.keys.maxkeys, shared by all workspaces); "
+                    f"`devbox host bootstrap {self.shell.host.name}` shows the fix, or `devbox down` workspaces "
+                    "you no longer need") from e
+            raise
+        workaround = WORKAROUND_MARKER in (checked.stdout or "")
+        if workaround:
+            say("Docker needed the runc 1.2.3 workaround on this Incus version; "
+                f"`devbox host bootstrap {self.shell.host.name} --zabbly` plans a newer Incus")
+        published = False
+        if publish_as and not publish_ok():
+            say("Skipping the base image: too little startup time left (the next `up` on this host publishes it)")
+        elif publish_as:
+            try:
+                self.publish_base(name, publish_as, say)
+                published = True
+            except DevboxError as e:
+                say(f"Could not publish the base image (workspaces still work, later ones just take longer): {e}")
+                self.run(["start", name], timeout=180, check=False)
         say("Installing SSH keys...")
         self.exec(name, "mkdir -p /root/.ssh && chmod 700 /root/.ssh && cat > /root/.ssh/authorized_keys "
                         "&& chmod 600 /root/.ssh/authorized_keys", input=public_key.strip() + "\n")
@@ -306,4 +451,8 @@ class Incus:
                         "umask 077; cat > /etc/ssh/ssh_host_ed25519_key", input=host_private.rstrip("\n") + "\n")
         self.exec(name, "chmod 600 /etc/ssh/ssh_host_ed25519_key; cat > /etc/ssh/ssh_host_ed25519_key.pub "
                         "&& chmod 644 /etc/ssh/ssh_host_ed25519_key.pub", input=host_public.strip() + " devbox-host\n")
-        self.exec(name, "systemctl restart ssh && systemctl is-active --quiet ssh")
+        # sshd could not start without host keys after the container's boot (cached image) and may have hit
+        # systemd's start limit; reset that before restarting.
+        self.exec(name, "systemctl reset-failed ssh.service ssh.socket 2>/dev/null; "
+                        "systemctl restart ssh && systemctl is-active --quiet ssh")
+        return {"workaround": workaround, "published": published}

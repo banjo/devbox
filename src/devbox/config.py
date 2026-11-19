@@ -88,6 +88,10 @@ class Config:
     incus_image: str = "ubuntu/24.04"
     incus_cpus: int = 2
     incus_memory: str = "4GiB"
+    # Cache the provisioned base image on each host so later workspaces start from it.
+    incus_image_cache: bool = True
+    # Port isolation on new workspaces' NICs (they cannot reach each other over the bridge).
+    incus_isolate: bool = False
     cloudflare_token_file: Path | None = None
     state_dir: Path = field(default_factory=state_dir)
 
@@ -178,6 +182,10 @@ def load(path: Path | None = None) -> Config:
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise DevboxError(f"{path}: incus_cpus must be a whole number of at least 1")
             cfg.incus_cpus = value
+        elif key in ("incus_image_cache", "incus_isolate"):
+            if not isinstance(value, bool):
+                raise DevboxError(f"{path}: {key} must be true or false")
+            setattr(cfg, key, value)
         elif key == "max_servers":
             cfg.max_servers = parse_max_servers(value, path)
         elif key == "ssh_allow":

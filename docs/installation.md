@@ -26,18 +26,21 @@ On the machine where the agent runs:
    uv tool install -e .
    ```
 
-5. Install the skill by linking `skills/hetzner-devbox` into your agent's skills folder, for
+5. Install the skill by linking `skills/devbox` into your agent's skills folder, for
    example:
 
    ```sh
    # Hermes
    mkdir -p ~/.hermes/skills/devops
-   ln -s "$PWD/skills/hetzner-devbox" ~/.hermes/skills/devops/hetzner-devbox
+   ln -s "$PWD/skills/devbox" ~/.hermes/skills/devops/devbox
 
    # Agents that read ~/.agents/skills
    mkdir -p ~/.agents/skills
-   ln -s "$PWD/skills/hetzner-devbox" ~/.agents/skills/hetzner-devbox
+   ln -s "$PWD/skills/devbox" ~/.agents/skills/devbox
    ```
+
+   The skill used to be called `hetzner-devbox`. `skills/hetzner-devbox` stays as a short pointer to
+   `skills/devbox`, so an existing link keeps working; relink to `skills/devbox` when convenient.
 
 6. Check it works: `devbox doctor` checks the config, local tools, `hcloud`, the token, the SSH key
    and firewall, leftover resources, whether `idle-check` is scheduled and, with `preview_domain`,

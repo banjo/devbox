@@ -21,6 +21,16 @@ HOST_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,30}$")
 SSH_TARGET_RE = re.compile(r"^[A-Za-z0-9._-]+@[A-Za-z0-9._:\[\]-]+$")
 KEY_TYPES = ("ssh-ed25519", "ecdsa-sha2-nistp256", "ssh-rsa")
 BRIDGE = "incusbr0"
+# Incus releases before this one are what Debian/Ubuntu archives ship (6.0.x); on them Docker with a newer
+# runc cannot start containers inside a workspace (devbox falls back to runc 1.2.3 there).
+OLD_INCUS_BELOW = (6, 1)
+ZABBLY_URL = "https://pkgs.zabbly.com/incus/stable"
+ZABBLY_KEY_URL = "https://pkgs.zabbly.com/key.asc"
+# Fingerprint of the Zabbly archive signing key (the key is checked against it before it is trusted).
+ZABBLY_KEY_FPR = "4EFC 5906 96CB 15B8 7C73 A3AD 82CC 8797 C838 DCFD".replace(" ", "")
+ZABBLY_KEYRING = "/etc/apt/keyrings/zabbly.asc"
+ZABBLY_SOURCES = "/etc/apt/sources.list.d/zabbly-incus-stable.sources"
+ZABBLY_SUITES = {"bookworm", "trixie", "jammy", "noble", "resolute"}
 
 
 def validate_host_name(name: str) -> None:
@@ -165,6 +175,10 @@ FACTS_MARKER = "== ufw status"
 FACTS_SCRIPT = f"""
 . /etc/os-release 2>/dev/null
 echo "os=${{ID:-unknown}}-${{VERSION_ID:-}}"
+echo "codename=${{VERSION_CODENAME:-}}"
+echo "keys_maxkeys=$(cat /proc/sys/kernel/keys/maxkeys 2>/dev/null)"
+echo "arch=$(dpkg --print-architecture 2>/dev/null)"
+[ -e {ZABBLY_SOURCES} ] && echo zabbly_repo=1 || echo zabbly_repo=0
 echo "user=$(id -un)"
 id -nG | tr ' ' '\\n' | grep -qx incus-admin && echo in_incus_admin=1 || echo in_incus_admin=0
 sudo -n true >/dev/null 2>&1 && echo sudo=1 || echo sudo=0
@@ -179,6 +193,7 @@ if command -v incus >/dev/null; then
   else INC=''; echo incus_access=none; fi
   if [ -n "$INC" ]; then
     echo "storage_pools=$($INC storage list --format csv </dev/null 2>/dev/null | wc -l)"
+    echo "running_containers=$($INC list --format csv -c s </dev/null 2>/dev/null | grep -c RUNNING)"
     $INC network list --format csv </dev/null 2>/dev/null | cut -d, -f1 | grep -qx {BRIDGE} && echo bridge=1 || echo bridge=0
   fi
 else
@@ -189,6 +204,12 @@ echo "{FACTS_MARKER}"
 sudo -n ufw status 2>/dev/null </dev/null
 true
 """
+
+# Every workspace's root is the same host uid, so all of them share one kernel key quota (200 keys by default).
+# systemd and every Docker container in a workspace use some; when it runs out, Docker fails with
+# "unable to create session key: disk quota exceeded". Incus's production setup guide recommends 2000.
+KEYS_RECOMMENDED = 2000
+KEYS_LOW_BELOW = 1000
 
 UFW_RULES = {
     "in": ["ufw", "allow", "in", "on", BRIDGE],
@@ -262,7 +283,35 @@ class Plan:
         return out
 
 
-def make_plan(host: str, facts: dict) -> Plan:
+def parse_version(text: str) -> tuple[int, ...] | None:
+    m = re.match(r"^(\d+)\.(\d+)", text.strip())
+    return (int(m[1]), int(m[2])) if m else None
+
+
+def is_old_incus(version: str) -> bool:
+    parsed = parse_version(version)
+    return parsed is not None and parsed < OLD_INCUS_BELOW
+
+
+def zabbly_commands(facts: dict) -> list[str]:
+    """Add the Zabbly repository: fetch the key, verify its fingerprint, write the sources file, update."""
+    sources = "\n".join([
+        "Enabled: yes", "Types: deb", f"URIs: {ZABBLY_URL}", f"Suites: {facts.get('codename')}", "Components: main",
+        f"Architectures: {facts.get('arch')}", f"Signed-By: {ZABBLY_KEYRING}"]) + "\n"
+    verify = (f"fp=$(gpg --homedir \"$(mktemp -d)\" --show-keys --with-colons {ZABBLY_KEYRING} 2>/dev/null "
+              f"| awk -F: '$1==\"fpr\"{{print $10; exit}}'); [ \"$fp\" = {ZABBLY_KEY_FPR} ] || "
+              f"{{ sudo -n rm -f {ZABBLY_KEYRING}; echo \"Zabbly key fingerprint mismatch ($fp)\" >&2; exit 1; }}")
+    return [
+        "sudo -n install -d -m 0755 /etc/apt/keyrings",
+        f"sudo -n curl -fsSL {ZABBLY_KEY_URL} -o {ZABBLY_KEYRING}",
+        verify,
+        f"printf %s {shlex.quote(sources)} | sudo -n tee {ZABBLY_SOURCES} >/dev/null",
+        "sudo -n apt-get update",
+    ]
+
+
+def make_plan(host: str, facts: dict, zabbly: bool = False) -> Plan:
+    """What bootstrap would change. `zabbly` asks for Incus from the Zabbly repository (never implied)."""
     plan = Plan(host, facts)
     sudo = facts.get("sudo") == "1"
     installed = facts.get("incus_installed") == "1"
@@ -271,7 +320,41 @@ def make_plan(host: str, facts: dict) -> Plan:
         plan.blockers.append(
             f"{facts.get('user', 'the SSH user')} cannot run incus: add it to the incus-admin group "
             "(`sudo usermod -aG incus-admin USER`, then log in again) or allow passwordless `sudo -n`")
-    if not installed:
+    version = facts.get("incus_version", "")
+    old_incus = installed and is_old_incus(version)
+    wants_zabbly = zabbly and (not installed or old_incus or (installed and not version))
+    if zabbly and installed and version and not old_incus:
+        plan.notes.append(f"Incus {version} is new enough, the Zabbly repository is not needed")
+    if wants_zabbly and facts.get("codename") not in ZABBLY_SUITES:
+        plan.blockers.append(f"the Zabbly Incus repository has no packages for '{facts.get('codename') or facts.get('os')}' "
+                             f"(supported: {', '.join(sorted(ZABBLY_SUITES))})")
+        wants_zabbly = False
+    elif wants_zabbly and facts.get("apt") != "1":
+        plan.blockers.append("the Zabbly repository needs apt-get, which this host does not have")
+        wants_zabbly = False
+    elif wants_zabbly and not sudo:
+        plan.blockers.append(f"{facts.get('user', 'the SSH user')} has no passwordless sudo (`sudo -n true` fails), "
+                             "so devbox cannot add the Zabbly repository")
+        wants_zabbly = False
+    if wants_zabbly:
+        if facts.get("zabbly_repo") != "1":
+            plan.steps.append({"id": "zabbly-repo",
+                               "title": f"add the Zabbly Incus repository ({ZABBLY_URL}), key checked against "
+                                        f"{ZABBLY_KEY_FPR}",
+                               "commands": zabbly_commands(facts)})
+        else:
+            plan.steps.append({"id": "apt-update", "title": "refresh the package lists (Zabbly repository is configured)",
+                               "commands": ["sudo -n apt-get update"]})
+        install = ("sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y "
+                   "-o Dpkg::Options::=--force-confold incus")
+        plan.steps.append({"id": "upgrade-incus" if installed else "install-incus",
+                           "title": ("upgrade Incus" + (f" {version}" if version else "") if installed else "install Incus")
+                                    + " from the Zabbly repository",
+                           "commands": [install]})
+        if installed and facts.get("running_containers", "0") not in ("0", ""):
+            plan.notes.append(f"{facts['running_containers']} container(s) are running; the upgrade restarts the "
+                              "Incus daemon on the host")
+    elif not installed:
         if facts.get("apt") != "1":
             plan.blockers.append(f"incus is not installed and this host has no apt-get (OS: {facts.get('os')}); "
                                  "install Incus yourself, then run bootstrap again")
@@ -283,6 +366,15 @@ def make_plan(host: str, facts: dict) -> Plan:
                 "id": "install-incus", "title": "install Incus from the distribution's package archive",
                 "commands": ["sudo -n apt-get update",
                              "sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y incus"]})
+            plan.notes.append("the distribution's Incus is old (Ubuntu 24.04 ships 6.0.x); add --zabbly to install the "
+                              "current release from the Zabbly repository instead")
+    if installed and version and not old_incus:
+        plan.notes.append(f"Incus {version}" + (" (Zabbly repository)" if facts.get("zabbly_repo") == "1" else ""))
+    if old_incus and not zabbly:
+        plan.notes.append(
+            f"Incus {version} is older than {OLD_INCUS_BELOW[0]}.{OLD_INCUS_BELOW[1]}: Docker with a current runc cannot "
+            "start containers inside workspaces on it, so devbox registers runc 1.2.3 in each workspace as a "
+            f"workaround. `devbox host bootstrap {host} --zabbly --yes` upgrades Incus from the Zabbly repository")
     inc = "incus" if access == "direct" else "sudo -n incus"
     initialized = installed and facts.get("storage_pools", "0") != "0" and facts.get("bridge") == "1"
     if not initialized and not plan.blockers:
@@ -293,6 +385,15 @@ def make_plan(host: str, facts: dict) -> Plan:
     elif not installed and sudo:
         plan.notes.append("after the install, devbox will run incus through `sudo -n` unless the user joins incus-admin")
 
+    keys = facts.get("keys_maxkeys", "")
+    if installed and keys.isdigit() and int(keys) < KEYS_LOW_BELOW:
+        plan.manual.append(
+            f"kernel.keys.maxkeys is {keys}. All workspaces share this key quota (15 to 30 keys each, more with "
+            "Docker containers running), so around a dozen workspaces exhaust it and Docker then fails with "
+            f"'disk quota exceeded'. devbox does not change kernel settings (`--zabbly` brings a package that sets "
+            f"it to {KEYS_RECOMMENDED}); or raise it yourself: "
+            f"`echo 'kernel.keys.maxkeys = {KEYS_RECOMMENDED}' | sudo tee /etc/sysctl.d/99-devbox-incus.conf && "
+            "sudo sysctl --system`")
     ufw_active = facts.get("ufw_status", "").lstrip().startswith("Status: active")
     forward_drop = facts.get("forward_policy", "").endswith("DROP")
     if ufw_active:
@@ -325,7 +426,7 @@ def apply_plan(shell: HostShell, plan: Plan, say: Callable[[str], None] = lambda
     for step in plan.steps:
         say(step["title"])
         for command in step["commands"]:
-            proc = shell.run(command + " </dev/null", timeout=900, check=False)
+            proc = shell.run(f"( {command} ) </dev/null", timeout=900, check=False)
             if proc.returncode != 0:
                 detail = (proc.stderr or proc.stdout or "").strip()
                 raise DevboxError(f"step '{step['id']}' failed on {plan.host}: `{command}` exited "

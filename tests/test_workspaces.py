@@ -234,9 +234,10 @@ def test_workspaces_have_no_cost_no_hour_end_and_no_idle_shutdown(capsys, world)
     code, out, _ = run(capsys, "costs", "--json")
     assert json.loads(out)["total"] == 0 and json.loads(out)["servers"] == 0
     world.hetzner.calls.clear()
+    before = len(world.calls)
     code, out, _ = run(capsys, "idle-check", "--dry-run")
     assert code == 0 and "idle shutdown off" in out
-    assert "devbox-crm" in world.containers and not any(c[0] in ("stop", "delete") for c in world.calls)
+    assert "devbox-crm" in world.containers and not any(c[0] in ("stop", "delete") for c in world.calls[before:])
 
 
 def test_ssh_provider_refuses_machine_operations():
