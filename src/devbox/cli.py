@@ -126,7 +126,7 @@ class Context:
     def reconcile(self) -> list[dict]:
         # One provider listing: this controller's servers are reconciled; other
         # controllers' servers are only kept for reporting, never adopted.
-        if not self.hetzner_configured() and db.list_hosts(self.conn):
+        if self.hosts_only():
             return []  # only own hosts are in use: nothing to ask Hetzner about
         provider = self.provider
         everything = provider.list_all_servers()
@@ -140,11 +140,13 @@ class Context:
         self.fill_missing_prices()
         return orphans
 
-    def hetzner_configured(self) -> bool:
+    def hosts_only(self) -> bool:
+        """Own hosts are registered and there is no Hetzner token: nothing to ask Hetzner about."""
         try:
-            return bool(self.cfg.hcloud_token())
+            token = self.cfg.hcloud_token()
         except DevboxError:
-            return True  # an unreadable token file is reported by the first Hetzner call
+            return False  # an unreadable token file is reported by the first Hetzner call
+        return not token and bool(db.list_hosts(self.conn))
 
     def reconcile_host(self, host_name: str) -> list[str]:
         """Bring the registry's workspaces on one host in line with its containers.
@@ -1827,7 +1829,7 @@ def cmd_status(ctx: Context) -> int:
         lines.append("other controllers' devbox servers in this Hetzner project (not managed from here):")
         for s in foreign:
             lines.append(f"  {s['name']} (id {s['id']}, {s['status']}, controller {s['controller']}, project {s['project'] or '?'})")
-    elif not ctx.args.name and ctx.hetzner_configured():
+    elif not ctx.args.name and not ctx.hosts_only():
         lines.append("no devbox servers from other controllers in this Hetzner project")
 
     idle_enforcement = None
