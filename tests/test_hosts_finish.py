@@ -570,11 +570,11 @@ def test_the_startup_clock_starts_after_the_lock_is_held(capsys, world, monkeypa
 
     add_host(capsys, world)
     order = []
-    real_lock, real_init = cli.Context.lock, startup.Deadline.__init__
+    real_lock, real_init = cli.Context.project_lock, startup.Deadline.__init__
 
     @contextlib.contextmanager
-    def lock(self):
-        with real_lock(self):
+    def lock(self, name):
+        with real_lock(self, name):
             order.append("lock")
             yield
 
@@ -582,7 +582,7 @@ def test_the_startup_clock_starts_after_the_lock_is_held(capsys, world, monkeypa
         order.append("deadline")
         real_init(self, *a, **kw)
 
-    monkeypatch.setattr(cli.Context, "lock", lock)
+    monkeypatch.setattr(cli.Context, "project_lock", lock)
     monkeypatch.setattr(startup.Deadline, "__init__", init)
     assert run(capsys, "up", "crm", "--host", "mini")[0] == 0
     assert order[:2] == ["lock", "deadline"]

@@ -118,14 +118,34 @@ def test_exec_timeout_runs_in_scope_with_runtime_limit(monkeypatch):
     assert local_timeout > 2
 
 
-class ScopeServer:
-    """Fake `_ssh` for timed exec: the command's exit code and the scope's systemd state."""
+class FakeClock:
+    """Time that only moves when the code sleeps, so retry loops run instantly."""
 
-    def __init__(self, returncode, result=None, active=False, reachable=True):
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class ScopeServer:
+    """Fake `_ssh` for exec: the command's exit code and what the server says about its scope afterwards.
+
+    `down_for`: how many state reads fail (connection still blocked) before the server answers.
+    `rc`: the exit status the scope wrote to its result file (None: none was written).
+    """
+
+    def __init__(self, returncode, result=None, active=False, reachable=True, rc=None, down_for=0, running_for=0):
         self.returncode = returncode
         self.result = result
         self.active = active
         self.reachable = reachable
+        self.rc = rc
+        self.down_for = down_for
+        self.running_for = running_for
         self.calls = []
 
     def __call__(self, remote_cmd, *a, **kw):
@@ -133,11 +153,19 @@ class ScopeServer:
         if "systemd-run --scope" in remote_cmd:
             assert kw.get("raise_on_255") is False
             return subprocess.CompletedProcess([], self.returncode, "partial out", "")
+        from devbox import DevboxError
         if not self.reachable:
-            from devbox import DevboxError
             raise DevboxError("ssh to 192.0.2.1 failed")
-        if "show -p Result" in remote_cmd:
-            return subprocess.CompletedProcess([], 0, f"{self.result}\n" if self.result else "", "")
+        if "echo active=" in remote_cmd:
+            if self.down_for > 0:
+                self.down_for -= 1
+                raise DevboxError("ssh to 192.0.2.1 failed: Connection timed out during banner exchange")
+            active = self.active
+            if self.running_for > 0:
+                self.running_for -= 1
+                active = True
+            out = f"active={'yes' if active else 'no'}\nresult={self.result or ''}\nrc={'' if self.rc is None else self.rc}\n"
+            return subprocess.CompletedProcess([], 0, out, "")
         if "is-active" in remote_cmd:
             return subprocess.CompletedProcess([], 0 if self.active else 3, "", "")
         return subprocess.CompletedProcess([], 0, "", "")
@@ -164,16 +192,20 @@ def test_exec_real_ssh_failure_is_still_an_error(monkeypatch):
     from devbox import DevboxError
 
     server = ScopeServer(255, reachable=False)
-    with pytest.raises(DevboxError, match="ssh to 192.0.2.1 failed"):
-        remote_with(monkeypatch, server).exec("true", timeout=2)
+    clock = FakeClock()
+    with pytest.raises(DevboxError, match="ssh to 192.0.2.1 failed") as e:
+        remote_with(monkeypatch, server).exec("true", timeout=2, sleep=clock.sleep, clock=clock)
+    assert e.value.code == "exec_result_unknown" and e.value.exit_code == remote_mod.EXEC_RESULT_UNKNOWN
 
 
 def test_exec_connection_lost_while_still_running(monkeypatch):
     from devbox import DevboxError
 
     server = ScopeServer(255, result="success", active=True)
+    clock = FakeClock()
     with pytest.raises(DevboxError, match="still running"):
-        remote_with(monkeypatch, server).exec("sleep 60", timeout=30)
+        remote_with(monkeypatch, server).exec("sleep 60", timeout=30, sleep=clock.sleep, clock=clock)
+    assert clock.now >= 30  # it kept asking until the retry budget was used
 
 
 def test_exec_killed_by_something_else(monkeypatch):
@@ -182,6 +214,7 @@ def test_exec_killed_by_something_else(monkeypatch):
     server = ScopeServer(255, result="signal")
     with pytest.raises(DevboxError, match="killed on the server"):
         remote_with(monkeypatch, server).exec("sleep 60", timeout=30)
+    assert any("reset-failed" in c for c in server.calls)
 
 
 def test_exec_normal_exit_codes_pass_through(monkeypatch):
@@ -218,3 +251,73 @@ def test_detached_keep_alive_gets_marked(monkeypatch):
     r.start_unit("web", "npm run dev")
     assert "--description 'devbox-keepalive build'" in calls[0]
     assert "--description 'devbox web'" in calls[1]
+
+
+# --- result of a command after the connection dropped (#48) ---
+
+
+def test_exec_runs_in_a_scope_that_records_the_exit_status():
+    r = Remote("192.0.2.1", Path("/key"), Path("/kh"))
+    server = ScopeServer(0)
+    r._ssh = server
+    r.exec("echo hi")
+    cmd = server.calls[0]
+    assert "echo $rc > /run/devbox-exec-" in cmd and cmd.count(".rc") == 1
+
+
+def test_exec_dropped_connection_returns_the_real_exit_code_when_the_host_is_back(monkeypatch):
+    # The issue: ssh exits 255 while the command went on and finished (here with exit 3).
+    server = ScopeServer(255, result="success", rc=3, down_for=4)
+    clock = FakeClock()
+    result = remote_with(monkeypatch, server).exec("sleep 15; echo done", capture=True, sleep=clock.sleep, clock=clock)
+    assert result == ExecResult(3, "partial out", "", timed_out=False)
+    assert clock.now == 4 * remote_mod.EXEC_RETRY_PAUSE  # one pause per failed read, no more
+    assert any("reset-failed" in c and "rm -f /run/devbox-exec-" in c for c in server.calls)
+
+
+def test_exec_dropped_connection_success_is_exit_0(monkeypatch):
+    server = ScopeServer(255, result="success", rc=0, down_for=2)
+    clock = FakeClock()
+    assert remote_with(monkeypatch, server).exec("true", sleep=clock.sleep, clock=clock).returncode == 0
+
+
+def test_exec_waits_for_a_command_that_is_still_running_then_reports_its_code(monkeypatch):
+    server = ScopeServer(255, result="success", rc=0, running_for=3)
+    clock = FakeClock()
+    result = remote_with(monkeypatch, server).exec("sleep 20", timeout=300, sleep=clock.sleep, clock=clock)
+    assert result.returncode == 0 and not result.timed_out
+
+
+def test_exec_a_command_that_really_exits_255_is_reported_as_such(monkeypatch):
+    server = ScopeServer(255, result="success", rc=255)
+    clock = FakeClock()
+    assert remote_with(monkeypatch, server).exec("exit 255", sleep=clock.sleep, clock=clock).returncode == 255
+
+
+def test_exec_unobtainable_result_has_its_own_message_and_exit_code(monkeypatch):
+    from devbox import DevboxError
+
+    server = ScopeServer(255, down_for=10_000)
+    clock = FakeClock()
+    with pytest.raises(DevboxError) as e:
+        remote_with(monkeypatch, server).exec("sleep 5", timeout=20, sleep=clock.sleep, clock=clock)
+    assert e.value.exit_code == 125 and e.value.code == "exec_result_unknown"
+    assert "exit status is not known" in str(e.value) and "Connection timed out" in str(e.value)
+    assert clock.now <= 20 + remote_mod.EXEC_KILL_AFTER + 30 + remote_mod.EXEC_RETRY_PAUSE  # bounded
+
+
+def test_exec_retry_budget_without_a_timeout_is_bounded(monkeypatch):
+    from devbox import DevboxError
+
+    server = ScopeServer(255, down_for=10_000)
+    clock = FakeClock()
+    with pytest.raises(DevboxError, match="exit status is not known"):
+        remote_with(monkeypatch, server).exec("make", sleep=clock.sleep, clock=clock)
+    assert clock.now == remote_mod.EXEC_RESULT_RETRY_NO_LIMIT
+
+
+def test_exec_timeout_after_a_dropped_connection_is_still_a_timeout(monkeypatch):
+    server = ScopeServer(255, result="timeout", down_for=2)
+    clock = FakeClock()
+    result = remote_with(monkeypatch, server).exec("sleep 99", timeout=2, sleep=clock.sleep, clock=clock)
+    assert result.timed_out

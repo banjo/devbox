@@ -149,21 +149,26 @@ class Context:
             return False  # an unreadable token file is reported by the first Hetzner call
         return not token and bool(db.list_hosts(self.conn))
 
-    def reconcile_host(self, host_name: str) -> list[str]:
+    def reconcile_host(self, host_name: str, locked: bool = False) -> list[str]:
         """Bring the registry's workspaces on one host in line with its containers.
 
-        Returns notes. A host that cannot be reached leaves the registry as it is.
+        Returns notes. A host that cannot be reached leaves the registry as it is. `locked`: the caller does
+        not hold the state lock, so the registry part takes it (briefly; the host is asked before).
         """
         notes = []
-        servers = db.servers_on_host(self.conn, host_name)
-        if not servers:
+        if not db.servers_on_host(self.conn, host_name):
             return notes
         try:
             host = self.ssh.host(host_name)
             live = {c["name"]: c for c in self.incus(host).list_workspaces()}
         except DevboxError as e:
             return [f"host {host_name} could not be checked: {e}"]
-        for row_ in servers:
+        with self.lock() if locked else contextlib.nullcontext():
+            self._apply_host_state(host_name, live, notes)
+        return notes
+
+    def _apply_host_state(self, host_name: str, live: dict, notes: list[str]) -> None:
+        for row_ in db.servers_on_host(self.conn, host_name):
             container = live.get(row_["provider_id"])
             if container is None:
                 if row_["status"] == "running":
@@ -176,7 +181,6 @@ class Context:
             if ip and ip != row_["ip"]:
                 changes["ip"] = ip
             db.update_server(self.conn, row_["id"], **changes)
-        return notes
 
     def snapshot_price(self) -> float | None:
         if self._snapshot_price is None:
@@ -267,6 +271,11 @@ class Context:
 
     @contextlib.contextmanager
     def lock(self):
+        """The state lock: one holder at a time for registry writes and for commands that change servers.
+
+        Never nested in one process, and never held across a workspace startup: `up` of a workspace holds
+        only its project lock for that long and takes this lock for short registry sections.
+        """
         self.cfg.state_dir.mkdir(parents=True, exist_ok=True)
         with open(self.cfg.state_dir / "lock", "w") as f:
             try:
@@ -275,6 +284,47 @@ class Context:
                 print("waiting for another devbox command to finish...", file=sys.stderr)
                 fcntl.flock(f, fcntl.LOCK_EX)
             yield
+
+    @contextlib.contextmanager
+    def project_lock(self, name: str):
+        """Exclusive per project: `up`, `pause` and `down` of one project take turns; other projects don't wait.
+
+        Lock order: project lock(s) first, then the state lock.
+        """
+        with file_lock(self.cfg.state_dir / "locks" / f"project-{name}.lock",
+                       f"waiting for another devbox command on {name} to finish..."):
+            yield
+
+    @contextlib.contextmanager
+    def base_image_lock(self, host_name: str, deadline: "startup.Deadline", stage: str, say):
+        """One workspace at a time builds a host's base image; the others wait and then start from it."""
+        path = self.cfg.state_dir / "locks" / f"base-image-{host_name}.lock"
+        with file_lock(path, f"another workspace is building the base image on host {host_name}; waiting for it "
+                             "(this workspace then starts from the cached image)...", deadline=deadline,
+                       stage=stage, say=say):
+            yield
+
+
+@contextlib.contextmanager
+def file_lock(path: Path, waiting: str, deadline: "startup.Deadline | None" = None, stage: str = "create", say=None):
+    """flock `path`. With a deadline the wait stops when it runs out; `say` shows the waiting message."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            (say or (lambda m: print(m, file=sys.stderr)))(waiting)
+            if deadline is None:
+                fcntl.flock(f, fcntl.LOCK_EX)
+            else:
+                while True:
+                    deadline.check(stage)
+                    try:
+                        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        time.sleep(0.5)
+        yield
 
 
 def emit(args, data, text: str | None = None) -> None:
@@ -650,7 +700,9 @@ def cmd_up(ctx: Context) -> int:
         raise DevboxError("--cpus, --memory and --isolate only apply to workspaces on your own hosts (`up NAME --host HOST`)")
     limit_label, limit = startup_limit(ctx, project)
     state = {"server_id": None, "created": False, "snapshot": None}
-    with ctx.lock():
+    # Hetzner servers keep one lock for the whole startup: max_servers and --additional count the servers that
+    # exist, so two creations must not overlap.
+    with ctx.project_lock(name), ctx.lock():
         deadline = startup.Deadline(limit)  # starts once this command holds the lock
         progress = startup.Progress(deadline)
         ctx.provider.deadline = deadline
@@ -1194,6 +1246,11 @@ def take_down(ctx: Context, server, snapshot: bool, event: str) -> dict:
 
 
 def cmd_down(ctx: Context) -> int:
+    with ctx.project_lock(ctx.args.name):  # an `up` of the same project finishes first
+        return down_locked(ctx)
+
+
+def down_locked(ctx: Context) -> int:
     name = ctx.args.name
     snapshot = ctx.args.snapshot
     if ctx.args.at_hour_end:
@@ -1222,12 +1279,7 @@ def cmd_down(ctx: Context) -> int:
             if server["status"] != "running" or (workspace and server["power"] in POWERED_DOWN):
                 raise DevboxError(f"{'workspace' if workspace else 'server'} for {name} is not running; "
                                   f"cannot dump databases" + (f" (`devbox up {name}` starts it)" if workspace else ""))
-            dbs = db.list_databases(ctx.conn, name)
-            if not dbs:
-                raise DevboxError(f"{name} has no databases to dump; see `devbox db add`")
-            for database in dbs:
-                print(f"dumping {database['name']}...", file=sys.stderr)
-                dumps.append(dump_database(ctx, server, name, database))
+            dumps = dump_all_databases(ctx, server, name)
         if workspace:
             summary = take_down_workspace(ctx, server, snapshot, "pause" if snapshot else "down")
             summary["dumps"] = dumps
@@ -1267,16 +1319,36 @@ def refuse_if_hosting_workspaces(ctx: Context, server) -> None:
                 f"`devbox down PROJECT` each workspace, or `devbox host remove {row['name']} --force` first")
 
 
-def refuse_unsaved_databases(ctx: Context, server) -> None:
-    """`down` deletes database data: refuse while a registered database has no dump since the last use."""
-    if getattr(ctx.args, "no_dump", False) or server["status"] != "running":
-        return
+def dump_all_databases(ctx: Context, server, name: str) -> list[dict]:
+    """Dump every registered database of a running workspace or server (`down --dump`, `host remove --dump`)."""
+    dbs = db.list_databases(ctx.conn, name)
+    if not dbs:
+        raise DevboxError(f"{name} has no databases to dump; see `devbox db add`")
+    dumps = []
+    for database in dbs:
+        print(f"dumping {name}: {database['name']}...", file=sys.stderr)
+        dumps.append(dump_database(ctx, server, name, database))
+    return dumps
+
+
+def unsaved_databases(ctx: Context, server) -> list[str]:
+    """Registered databases of a running server or workspace with no dump since it was last used."""
+    if server["status"] != "running":
+        return []
     name = server["project"]
     used = db.last_use(ctx.conn, server).timestamp()
-    stale = [d["name"] for d in db.list_databases(ctx.conn, name)
-             if not any(Path(x["path"]).stat().st_mtime >= used for x in list_dumps(ctx, name, d["name"]))]
+    return [d["name"] for d in db.list_databases(ctx.conn, name)
+            if not any(Path(x["path"]).stat().st_mtime >= used for x in list_dumps(ctx, name, d["name"]))]
+
+
+def refuse_unsaved_databases(ctx: Context, server) -> None:
+    """`down` deletes database data: refuse while a registered database has no dump since the last use."""
+    if getattr(ctx.args, "no_dump", False):
+        return
+    name = server["project"]
+    stale = unsaved_databases(ctx, server)
     if stale:
-        dump = (f"dump now with `devbox db dump {name}`" if ctx.args.at_hour_end
+        dump = (f"dump now with `devbox db dump {name}`" if getattr(ctx.args, "at_hour_end", False)
                 else f"`devbox down {name} --dump` dumps first")
         raise DevboxError(
             f"{name}'s database{'s' if len(stale) > 1 else ''} {', '.join(stale)} "
@@ -2739,19 +2811,62 @@ def cmd_host_list(ctx: Context) -> int:
     return 0
 
 
+def guard_workspace_databases(ctx: Context, host: str, workspaces) -> list[dict]:
+    """The `down` safeguard for `host remove --force`: it deletes every workspace and its databases.
+
+    Refuses (before anything is deleted) while a registered database has no dump, unless --no-dump; with --dump
+    the databases are dumped first. Returns the dumps made.
+    """
+    if getattr(ctx.args, "no_dump", False):
+        return []
+    dumps: list[dict] = []
+    if getattr(ctx.args, "dump", False):
+        for w in workspaces:
+            if not db.list_databases(ctx.conn, w["project"]):
+                continue
+            if w["status"] != "running" or w["power"] in POWERED_DOWN:
+                raise DevboxError(f"workspace {w['provider_id']} is not running, so its databases cannot be dumped: "
+                                  f"`devbox up {w['project']}` starts it, or --no-dump deletes it anyway")
+        for w in workspaces:
+            if db.list_databases(ctx.conn, w["project"]):
+                dumps += dump_all_databases(ctx, w, w["project"])
+        return dumps
+    stale = {w["project"]: unsaved_databases(ctx, w) for w in workspaces}
+    stale = {p: names for p, names in stale.items() if names}
+    if stale:
+        what = "; ".join(f"{p}: {', '.join(names)}" for p, names in stale.items())
+        raise DevboxError(
+            f"host {host} has workspaces with databases that have no dump since the workspace was last used ({what}), "
+            f"and --force deletes their data: `devbox host remove {host} --force --dump` dumps first, "
+            f"`devbox pause PROJECT` keeps a workspace, or --no-dump deletes the data anyway")
+    return []
+
+
 def cmd_host_remove(ctx: Context) -> int:
+    name = ctx.args.name
+    with contextlib.ExitStack() as locks:
+        # No `up` or `down` of a workspace on this host runs while it is removed (project locks, in name order,
+        # before the state lock).
+        for project in sorted(w["project"] for w in db.servers_on_host(ctx.conn, name)):
+            locks.enter_context(ctx.project_lock(project))
+        return remove_host_locked(ctx)
+
+
+def remove_host_locked(ctx: Context) -> int:
     name = ctx.args.name
     with ctx.lock():
         if db.get_host(ctx.conn, name) is None:
             raise DevboxError(f"unknown host '{name}'")
         workspaces = db.servers_on_host(ctx.conn, name)
         removed = []
+        dumps: list[dict] = []
         if workspaces:
             projects = ", ".join(w["project"] for w in workspaces)
             if not ctx.args.force:
                 raise DevboxError(
                     f"host {name} still has workspaces ({projects}): `devbox down PROJECT` removes each, or "
                     f"--force deletes them all now (the machine itself is never touched)")
+            dumps = guard_workspace_databases(ctx, name, workspaces)
             try:
                 incus_ = ctx.incus(ctx.ssh.ensure_host(name))
             except DevboxError as e:
@@ -2779,8 +2894,10 @@ def cmd_host_remove(ctx: Context) -> int:
             print(f"warning: could not remove the cached base image from host {name}: {e}", file=sys.stderr)
         db.remove_host(ctx.conn, name)
         (ctx.cfg.state_dir / "known_hosts" / f"host-{name}").unlink(missing_ok=True)
-    emit(ctx.args, {"host": name, "deleted_workspaces": removed, "deleted_base_images": images},
-         f"removed host {name} from devbox" + (f"; deleted workspaces {', '.join(removed)}" if removed else "")
+    emit(ctx.args, {"host": name, "deleted_workspaces": removed, "deleted_base_images": images, "dumps": dumps},
+         "\n".join(f"dumped {d['database']} ({human_size(d['bytes'])}) to {d['path']}" for d in dumps)
+         + ("\n" if dumps else "")
+         + f"removed host {name} from devbox" + (f"; deleted workspaces {', '.join(removed)}" if removed else "")
          + (f"; deleted cached base image {', '.join(images)}" if images else "")
          + " (the machine was not touched)")
     return 0
@@ -2796,6 +2913,22 @@ def bootstrap_next(name: str, plan: "hosts.Plan", applied: bool, zabbly: bool) -
     return {"steps": steps}
 
 
+def base_image_rebuild_note(ctx: Context, host, plan: "hosts.Plan") -> str | None:
+    """After Incus was installed or upgraded: the cached base image no longer matches (the Incus version is part
+    of its key), so the next `up` on the host builds it again."""
+    if not any(step["id"] in ("upgrade-incus", "install-incus") for step in plan.steps):
+        return None
+    try:
+        images = ctx.incus(host).base_images()
+    except DevboxError:
+        return None
+    if not images:
+        return None
+    return (f"the cached base image on host {host.name} is for the old Incus version; the next `devbox up PROJECT "
+            f"--host {host.name}` builds it again, so that start is a cold one (about 1 to 3 minutes). After that "
+            "workspaces start from the new image in about 30 seconds")
+
+
 def cmd_host_bootstrap(ctx: Context) -> int:
     name = ctx.args.name
     zabbly = ctx.args.zabbly
@@ -2808,8 +2941,10 @@ def cmd_host_bootstrap(ctx: Context) -> int:
         facts = hosts.apply_plan(shell, plan, say=lambda m: print(f"{m}...", file=sys.stderr))
         after = hosts.make_plan(name, facts, zabbly=zabbly)
         nxt = bootstrap_next(name, after, True, zabbly)
-        emit(ctx.args, {"applied": True, "plan": plan.as_dict(), "after": after.as_dict(), "next": nxt},
-             "\n".join(["applied", *after.lines(), *guidance_lines(nxt)]))
+        rebuild = base_image_rebuild_note(ctx, host, plan)
+        emit(ctx.args, {"applied": True, "plan": plan.as_dict(), "after": after.as_dict(), "next": nxt,
+                        "base_image_note": rebuild},
+             "\n".join(["applied", *after.lines(), *([f"  note: {rebuild}"] if rebuild else []), *guidance_lines(nxt)]))
         return 1 if after.blockers or after.steps else 0
     nxt = bootstrap_next(name, plan, False, zabbly)
     data = {"applied": False, **plan.as_dict(), "next": nxt}
@@ -2843,8 +2978,10 @@ def cmd_up_workspace(ctx: Context, project, host_name: str | None) -> int:
         raise DevboxError(f"invalid --memory '{ctx.args.memory}': use a size like 4GiB or 512MiB")
     limit_label, limit = startup_limit(ctx, project)
     state = {"server_id": None, "created": False, "snapshot": None}
-    with ctx.lock():
-        # The startup clock starts once this command holds the lock, not while it waits for another `up`.
+    # Only this project is locked for the whole startup; the state lock is taken for short registry sections, so
+    # workspaces of different projects start in parallel.
+    with ctx.project_lock(project["name"]):
+        # The startup clock starts once this command holds the project lock, not while it waits for another `up`.
         deadline = startup.Deadline(limit)
         progress = startup.Progress(deadline)
         try:
@@ -2859,7 +2996,39 @@ def cmd_up_workspace(ctx: Context, project, host_name: str | None) -> int:
 
 def bring_up_workspace(ctx: Context, project, host_name: str | None, deadline: "startup.Deadline",
                        progress: "startup.Progress", state: dict) -> dict:
-    """`up` for a workspace: check the host, create or start the container, set it up, sync. Caller holds the lock."""
+    """`up` for a workspace: check the host, create or start the container, set it up, sync.
+
+    The caller holds the project lock. The state lock is taken only for registry sections; the base image
+    lock is held while this workspace builds the host's base image.
+    """
+    with contextlib.ExitStack() as stack:
+        return _bring_up_workspace(ctx, project, host_name, deadline, progress, state, stack)
+
+
+RUNC_WARNING = ("Docker needed the runc 1.2.3 workaround on this host's Incus; "
+                "`devbox host bootstrap {host} --zabbly` plans a newer Incus")
+
+
+def wait_for_base_image(ctx: Context, stack: contextlib.ExitStack, inc, host_name: str, cache_alias: str,
+                        deadline: "startup.Deadline", progress: "startup.Progress") -> None:
+    """Called when the host has no base image for this setup. Either another `up` is building it (wait for
+    it, then the caller finds it), or this one builds it: say so and keep the base image lock until done."""
+    stack.enter_context(ctx.base_image_lock(host_name, deadline, "create", progress.say))
+    if inc.has_base(cache_alias):
+        stack.close()  # built by the one we waited for: nobody needs the lock now
+        return
+    outdated = [i["alias"] for i in inc.base_images()]
+    if outdated:
+        progress.say(f"The cached base image on host {host_name} is outdated (the Incus version or devbox's setup "
+                     "changed since it was built); rebuilding it, so this start is a cold one, about 1 to 3 minutes. "
+                     "Later workspaces on this host start from the new image")
+    else:
+        progress.say(f"Host {host_name} has no cached base image yet; this workspace builds it, so this start is a "
+                     "cold one, about 1 to 3 minutes. Later workspaces on this host start from it in about 30 seconds")
+
+
+def _bring_up_workspace(ctx: Context, project, host_name: str | None, deadline: "startup.Deadline",
+                        progress: "startup.Progress", state: dict, stack: contextlib.ExitStack) -> dict:
     name = project["name"]
     cfg = ctx.cfg
     warnings: list[str] = []
@@ -2873,7 +3042,7 @@ def bring_up_workspace(ctx: Context, project, host_name: str | None, deadline: "
         host_name = server["host"]
     host = ctx.ssh.ensure_host(host_name)
     inc = ctx.incus(host)
-    warnings += ctx.reconcile_host(host_name)
+    warnings += ctx.reconcile_host(host_name, locked=True)
     server = db.active_server(ctx.conn, name)
     cname = incus.container_name(name)
     container = inc.get(cname)
@@ -2894,6 +3063,11 @@ def bring_up_workspace(ctx: Context, project, host_name: str | None, deadline: "
     if cfg.incus_image_cache:
         cache_alias = incus.base_alias(cfg.incus_image, inc.version())
 
+    needs_provisioning = server is None or server["status"] != "running"
+    if cache_alias and needs_provisioning and not inc.has_base(cache_alias):
+        progress.step("create", "Checking the cached base image...")
+        wait_for_base_image(ctx, stack, inc, host_name, cache_alias, deadline, progress)
+
     if server is None:
         progress.step("create", f"Creating workspace {cname} on host {host_name}: {cpus} cpu, {memory}")
         if container is None:
@@ -2901,6 +3075,8 @@ def bring_up_workspace(ctx: Context, project, host_name: str | None, deadline: "
             if base:
                 image_cache = "hit"
                 progress.say("Starting from the cached base image")
+                if inc.base_workaround(base):
+                    warnings.append(RUNC_WARNING.format(host=host_name))
             inc.create(cname, name, cfg.incus_image, cpus, memory, isolate=isolate, base=base)
         else:
             progress.say(f"Reusing container {cname} left by an earlier run")
@@ -2908,9 +3084,10 @@ def bring_up_workspace(ctx: Context, project, host_name: str | None, deadline: "
             if ctx.args.isolate is not None:
                 inc.set_isolation(cname, isolate)
         ctx.manifest(name).unlink(missing_ok=True)  # a new container has none of the synced files
-        server_id = db.insert_server(
-            ctx.conn, name, cname, "creating", power="running", server_type=label, location=host_name,
-            provider=SSH_PROVIDER, host=host_name)
+        with ctx.lock():
+            server_id = db.insert_server(
+                ctx.conn, name, cname, "creating", power="running", server_type=label, location=host_name,
+                provider=SSH_PROVIDER, host=host_name)
         state.update(server_id=server_id, created=True)
         server = db.get_server(ctx.conn, server_id)
         created = True
@@ -2950,11 +3127,11 @@ def bring_up_workspace(ctx: Context, project, host_name: str | None, deadline: "
         provisioned = inc.provision(cname, public_key, host_private, host_public, say=progress.say,
                                     bound=lambda: deadline.bound("cloud-init", 900), publish_as=publish_as,
                                     publish_ok=lambda: deadline.remaining() >= PUBLISH_MIN_SECONDS)
+        stack.close()  # the base image (if this one built it) is published: other `up`s can start from it
         if provisioned["published"]:
             image_cache = "published"
         if provisioned["workaround"]:
-            warnings.append(f"Docker needed the runc 1.2.3 workaround on this host's Incus; "
-                            f"`devbox host bootstrap {host_name} --zabbly` plans a newer Incus")
+            warnings.append(RUNC_WARNING.format(host=host_name))
         server = db.get_server(ctx.conn, server["id"])
     remote = ctx.remote(server)
     remote.wait_ssh(deadline, progress)
@@ -3250,6 +3427,9 @@ def build_parser(json_errors: bool = False) -> argparse.ArgumentParser:
     p = add_sub(host_sub, "remove", cmd_host_remove, "forget a host (the machine is never touched)")
     p.add_argument("name", help="host name")
     p.add_argument("--force", action="store_true", help="delete the workspaces on the host first")
+    p.add_argument("--dump", action="store_true", help="with --force: dump the registered databases of the workspaces first")
+    p.add_argument("--no-dump", action="store_true",
+                   help="with --force: delete even though a registered database has no recent dump (its data is lost)")
 
     p = add("status", cmd_status, "show servers, processes, capacity headroom, preview URLs and cost so far")
     project_arg(p, optional=True)

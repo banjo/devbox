@@ -78,11 +78,16 @@ The first `up` on a host installs everything from the network. With `incus_image
 (default) devbox then publishes that container as a local Incus image `devbox-base-<hash>`, taken after the
 shared setup and before anything specific to the workspace: ssh host keys, authorized keys and the
 machine id are removed first. Later workspaces on the host are launched from this image; setup then
-only has to verify what is there. `up` reports `image_cache` (`published`, `hit` or `off`).
+only has to verify what is there. `up` reports `image_cache` (`published`, `hit` or `off`). Only one `up` per host builds the image at a time.
 
 The hash covers the source image, `cloud-init.yaml`, devbox's setup and Docker-check scripts and the
 host's Incus version. When any of them change, the next `up` builds and publishes a new image and
 deletes the old one; a changed Incus version matters because a cached image may carry the runc workaround.
+That `up` is a cold start (1 to 3 minutes) and says so before it begins, with the reason (no image yet, or
+the Incus version or devbox's setup changed); `host bootstrap --zabbly --yes` mentions it too when it replaced
+the Incus of a host that has a cached image. If the runc workaround was needed to build the image, the image
+carries the property `user.devbox.runc-workaround=true`, so every `up` from it prints the same warning as
+the one that built it.
 The image is published uncompressed: on a 16-core mini PC (dir storage) publishing a 1.4 GB workspace took
 about 26 s instead of 56 s with gzip, and launching from it 3 s instead of 11 s, at the cost of disk (about
 1.4 GB instead of 0.5 GB per host). The first `up` on a host therefore takes about 30 s longer than without
@@ -123,9 +128,15 @@ no workspace in the registry uses; they are only deleted with `cleanup --yes`.
 
 ## Several workspaces at once
 
-`up` commands take turns: they share one state lock, so starting three workspaces together runs the second
-and third after the first has finished (the startup limit only counts from the moment a command gets the
-lock). Each workspace uses 15 to 30 kernel keys from a quota that all containers on the host share
+`up` of different projects runs in parallel: each `up` holds only a lock for its own project for the long
+startup, and takes the short registry lock (the one `down` and the other commands use) only while it
+writes to the registry. Three `up PROJECT --host H` started together take about as long as one cold start
+plus a little: while the host has no cached base image, one of them builds it and the others wait for that
+(they say so), then start from the cached image. Two `up`s of the same project, or an `up` and a `down` of
+it, take turns (`waiting for another devbox command on PROJECT to finish...`); the startup limit counts from
+the moment the command has its project lock, and a wait for the base image counts. A Hetzner `up` still holds
+the registry lock for its whole startup (`max_servers` counts existing servers), so a workspace `up` waits
+for it at its first registry write. Each workspace uses 15 to 30 kernel keys from a quota that all containers on the host share
 (`kernel.keys.maxkeys`, default 200); about a dozen workspaces exhaust it and Docker fails with
 `disk quota exceeded`. `devbox host bootstrap` reports a low value ([Own hosts](hosts.md#bootstrap)).
 

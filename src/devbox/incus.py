@@ -24,7 +24,8 @@ NAME_PREFIX = "devbox-"
 CONTAINER_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
 IMAGE_REMOTE = "images:"
 BASE_PREFIX = "devbox-base-"  # alias of the cached, provisioned base image
-BASE_CACHE_FORMAT = "1"  # bump when the way base images are made changes
+BASE_CACHE_FORMAT = "2"  # bump when the way base images are made changes
+WORKAROUND_PROP = "user.devbox.runc-workaround"  # on a base image: its Docker needed the runc 1.2.3 workaround
 PORT_ISOLATION = "security.port_isolation"
 NIC = "eth0"
 WORKAROUND_MARKER = "devbox: runc workaround registered"
@@ -359,13 +360,17 @@ class Incus:
             for a in img.get("aliases") or []:
                 if a.get("name", "").startswith(BASE_PREFIX):
                     found.append({"alias": a["name"], "fingerprint": img.get("fingerprint", ""),
-                                  "size": img.get("size")})
+                                  "size": img.get("size"), "workaround": props.get(WORKAROUND_PROP) == "true"})
         return found
 
     def has_base(self, alias: str) -> bool:
         return any(i["alias"] == alias for i in self.base_images())
 
-    def publish_base(self, name: str, alias: str, say=lambda m: None) -> None:
+    def base_workaround(self, alias: str) -> bool:
+        """Was the runc workaround applied in the cached base image `alias`?"""
+        return any(i["alias"] == alias and i["workaround"] for i in self.base_images())
+
+    def publish_base(self, name: str, alias: str, say=lambda m: None, workaround: bool = False) -> None:
         """Publish the (provisioned, not yet personalised) container as the host's base image.
 
         The container is cleaned of host keys and machine id, stopped for the publish and started again.
@@ -378,7 +383,8 @@ class Incus:
             # Uncompressed: publishing takes half the time and launching from the image a third (measured on a
             # 1.4 GB workspace on dir storage: 26 s vs 56 s to publish, 3 s vs 11 s to launch).
             self.run(["publish", name, "--alias", alias, "--reuse", "--compression", "none", f"{BASE_PROP}=true",
-                      f"{CONTROLLER}={self.controller_id}"], timeout=900)
+                      f"{CONTROLLER}={self.controller_id}", *([f"{WORKAROUND_PROP}=true"] if workaround else [])],
+                     timeout=900)
         finally:
             self.run(["start", name], timeout=180)
         for old in self.base_images():
@@ -439,7 +445,7 @@ class Incus:
             say("Skipping the base image: too little startup time left (the next `up` on this host publishes it)")
         elif publish_as:
             try:
-                self.publish_base(name, publish_as, say)
+                self.publish_base(name, publish_as, say, workaround=workaround)
                 published = True
             except DevboxError as e:
                 say(f"Could not publish the base image (workspaces still work, later ones just take longer): {e}")
