@@ -12,7 +12,7 @@ def ts(s: str) -> datetime:
 def server(id=1, project="app", created="2026-10-01T10:00:00", deleted=None, hourly=0.01, monthly=5.0,
            type="cx23", location="fsn1"):
     return {
-        "id": id, "project": project, "hetzner_id": 100 + id, "server_type": type, "location": location,
+        "id": id, "project": project, "provider_id": 100 + id, "server_type": type, "location": location,
         "created_at": created + "+00:00", "deleted_at": deleted + "+00:00" if deleted else None,
         "price_hourly": hourly, "price_monthly": monthly,
     }

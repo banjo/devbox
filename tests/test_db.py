@@ -47,7 +47,7 @@ def test_one_active_server_per_project(conn):
         db.insert_server(conn, "crm", 2, "creating")
     db.mark_deleted(conn, sid)
     db.insert_server(conn, "crm", 2, "creating")
-    assert db.active_server(conn, "crm")["hetzner_id"] == 2
+    assert db.active_server(conn, "crm")["provider_id"] == 2
 
 
 def test_remove_project_with_server_fails(conn):

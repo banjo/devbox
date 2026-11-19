@@ -18,7 +18,7 @@ def conn():
 
 
 def server_row(**kw):
-    return {"id": 1, "project": "crm", "hetzner_id": 7, "server_type": "cx23", "location": "fsn1",
+    return {"id": 1, "project": "crm", "provider_id": 7, "server_type": "cx23", "location": "fsn1",
             "created_at": "2026-10-01T00:00:00+00:00", "deleted_at": "2026-10-01T02:30:00+00:00",
             "price_hourly": 0.01, "price_monthly": 5.0, **kw}
 
@@ -43,7 +43,7 @@ def test_without_an_ipv4_price_costs_are_as_before():
 
 def test_summary_reports_the_ipv4_share_and_still_adds_up():
     items = [costs.server_item(server_row(ipv4_price_hourly=0.001, ipv4_price_monthly=0.6)),
-             costs.server_item(server_row(id=2, hetzner_id=8, project="api"))]
+             costs.server_item(server_row(id=2, provider_id=8, project="api"))]
     s = costs.summarize(items, now=datetime(2026, 10, 2, tzinfo=timezone.utc))
     assert s["ipv4_total"] == pytest.approx(0.003)
     assert {g["key"]: g["ipv4_cost"] for g in s["groups"]} == pytest.approx({"api": 0.0, "crm": 0.003})
