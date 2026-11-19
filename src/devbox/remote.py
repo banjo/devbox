@@ -16,6 +16,12 @@ APP_DIR = "/srv/app"
 UNIT_PREFIX = "devbox-"
 EXEC_UNIT_PREFIX = "devbox-exec-"
 EXEC_KILL_AFTER = 10
+# Where an exec scope records its exit status (on the server), for when the connection drops before it is seen.
+EXEC_RESULT_DIR = "/run"
+EXEC_RESULT_RETRY_MAX = 600  # seconds to keep asking for the result of a timed command
+EXEC_RESULT_RETRY_NO_LIMIT = 300  # ... of a command without a timeout
+EXEC_RETRY_PAUSE = 5
+EXEC_RESULT_UNKNOWN = 125  # exit code when the command's result could not be fetched
 KEEP_ALIVE_DESCRIPTION = "devbox-keepalive"
 # Exit codes of a command killed by a signal: ssh reports 255, a shell 128+N.
 SIGNAL_EXITS = (255, 128 + 15, 128 + 9, -15, -9)
@@ -295,7 +301,8 @@ class Remote:
                      "down, `devbox status` checks and `devbox down` clears the registry entry)")
         return text
 
-    def exec(self, script: str, timeout: float | None = None, capture: bool = False) -> ExecResult:
+    def exec(self, script: str, timeout: float | None = None, capture: bool = False,
+             sleep=time.sleep, clock=time.monotonic) -> ExecResult:
         """Run a foreground command in the app folder.
 
         The command always runs in its own systemd scope (`devbox-exec-*`), so
@@ -303,15 +310,23 @@ class Remote:
         gets RuntimeMaxSec, so the server itself stops it (SIGTERM to every
         process in the scope, SIGKILL after 10s) even if the SSH connection is
         lost. Whether the deadline was hit is read back from the scope's result.
+
+        The scope also writes the command's exit status to a file on the server. When the connection drops
+        (ssh exits 255) the result is fetched from there, retrying until the connection is back or the retry
+        budget ends, so a command that finished reports its real exit code.
         """
         secs = max(1, math.ceil(timeout)) if timeout is not None else None
         unit = f"{EXEC_UNIT_PREFIX}{secrets.token_hex(4)}"
+        rc_file = f"{EXEC_RESULT_DIR}/{unit}.rc"
         # No --collect: a scope stopped by RuntimeMaxSec stays loaded as failed
         # with Result=timeout until reset-failed, so it can be checked below.
         limits = f"-p RuntimeMaxSec={secs}s -p TimeoutStopSec={EXEC_KILL_AFTER}s " if secs else ""
+        inner = f"echo started > {rc_file}; bash -lc {shlex.quote(script)}; rc=$?; echo $rc > {rc_file}; exit $rc"
         remote = (
+            # Status files left behind by a connection that was down at cleanup time: a day old, never needed again.
+            f"find {EXEC_RESULT_DIR} -maxdepth 1 -name 'devbox-exec-*.rc' -mmin +1440 -delete 2>/dev/null; "
             f"cd {APP_DIR} && systemd-run --scope --quiet --unit {unit} {limits}"
-            f"--setenv=HOME=/root bash -lc {shlex.quote(script)}"
+            f"--setenv=HOME=/root bash -c {shlex.quote(inner)}"
         )
         try:
             proc = self._ssh(
@@ -328,38 +343,84 @@ class Remote:
                 f"no response {secs}s after the deadline; remote command {state} (scope {unit})"
             )
 
+        returncode = proc.returncode
+        timed_out = False
         # Exit 255 is either an SSH failure or the remote command being killed
         # by a signal (which is what a deadline does). Ask the server which.
-        result = self.scope_result(unit) if proc.returncode in SIGNAL_EXITS else None
-        timed_out = result == "timeout"
-        if proc.returncode == 255 and not timed_out:
-            detail = (proc.stderr or "").strip() if capture else ""
-            if result is None:
-                raise DevboxError(self.ssh_failure(detail))
-            if not self.scope_gone(unit):
-                after = "will be stopped at the deadline" if secs else f"keeps running until it ends (stop it with `systemctl stop {unit}.scope` on the server)"
-                raise DevboxError(
-                    f"lost the connection; the command is still running on the server and {after} (scope {unit})"
-                )
-            self._ssh(f"systemctl reset-failed {unit}.scope 2>/dev/null; true", check=False, timeout=30)
-            raise DevboxError(f"the command was killed on the server (systemd result: {result})")
-        if timed_out and not self.scope_gone(unit):
-            self.stop_scope(unit)
-        self._ssh(f"systemctl reset-failed {unit}.scope 2>/dev/null; true", check=False, timeout=30)
-        return ExecResult(proc.returncode, proc.stdout, proc.stderr, timed_out=timed_out)
+        if returncode in SIGNAL_EXITS:
+            budget = min(EXEC_RESULT_RETRY_MAX, secs + EXEC_KILL_AFTER + 30) if secs else EXEC_RESULT_RETRY_NO_LIMIT
+            state = self.exec_outcome(unit, rc_file, budget, secs, sleep, clock)
+            timed_out = state["result"] == "timeout"
+            if state["rc"] is not None:
+                returncode = state["rc"]
+            elif returncode == 255 and not timed_out:
+                self.clear_scope(unit, rc_file)
+                if not state["started"]:
+                    # No scope, no status file: the connection never got as far as running the command.
+                    raise DevboxError(self.ssh_failure("the command did not start on the server"))
+                raise DevboxError(f"the command was killed on the server (systemd result: {state['result']})")
+            elif timed_out:
+                try:
+                    if not self.scope_gone(unit):
+                        self.stop_scope(unit)
+                except DevboxError:
+                    pass  # systemd has already stopped it at the deadline; this only makes sure
+        self.clear_scope(unit, rc_file)
+        return ExecResult(returncode, proc.stdout, proc.stderr, timed_out=timed_out)
 
-    def scope_result(self, unit: str) -> str | None:
-        """systemd's Result for an exec scope ('timeout', 'signal', ...), or None if unknown."""
+    def clear_scope(self, unit: str, rc_file: str) -> None:
+        """Best effort: the command already has its result, so a connection that is down again must not turn a
+        finished command into a failure (the status file lives in /run and goes away on reboot)."""
         try:
-            proc = self._ssh(
-                f"systemctl show -p Result --value {unit}.scope", check=False, timeout=30
-            )
+            self._ssh(f"systemctl reset-failed {unit}.scope 2>/dev/null; rm -f {rc_file}; true", check=False,
+                      timeout=30)
         except DevboxError:
-            return None
+            pass
+
+    def exec_outcome(self, unit: str, rc_file: str, budget: float, secs: int | None, sleep, clock) -> dict:
+        """What the server says about an exec scope after the connection ended: {"result", "rc"}.
+
+        Retries while the server cannot be reached and while the command is still running, until `budget`
+        seconds are used. Raises (code `exec_result_unknown`) when no answer comes in time.
+        """
+        until = clock() + budget
+        last_error = ""
+        while True:
+            state = None
+            try:
+                state = self.scope_state(unit, rc_file)
+            except DevboxError as e:
+                last_error = str(e)
+            if state is not None and not state["active"]:
+                return state
+            if clock() >= until:
+                if state is not None:
+                    after = ("will be stopped at the deadline" if secs else
+                             f"keeps running until it ends (stop it with `systemctl stop {unit}.scope` on the server)")
+                    raise DevboxError(
+                        f"lost the connection; the command is still running on the server and {after} (scope {unit})")
+                raise DevboxError(
+                    f"lost the connection and could not fetch the result of the command from the server for "
+                    f"{int(budget)}s ({last_error or 'no answer'}); it may have finished or may still be running, "
+                    f"its exit status is not known (scope {unit}; on the server `cat {rc_file}` shows it once it "
+                    "has ended)", code="exec_result_unknown", exit_code=EXEC_RESULT_UNKNOWN)
+            sleep(max(0.0, min(EXEC_RETRY_PAUSE, until - clock())))
+
+    def scope_state(self, unit: str, rc_file: str) -> dict | None:
+        """One read of an exec scope: {"active", "result", "rc" (int | None), "started"}; None if unreadable.
+        Raises DevboxError when the server cannot be reached."""
+        proc = self._ssh(
+            f"a=no; systemctl is-active --quiet {unit}.scope && a=yes; echo active=$a; "
+            f"echo result=$(systemctl show -p Result --value {unit}.scope 2>/dev/null); "
+            f"if [ -e {rc_file} ]; then echo started=yes; echo rc=$(cat {rc_file}); fi", check=False, timeout=30)
         if proc.returncode != 0:
             return None
-        value = (proc.stdout or "").strip()
-        return value or None
+        values = dict(line.split("=", 1) for line in (proc.stdout or "").splitlines() if "=" in line)
+        if "active" not in values:
+            return None
+        rc = values.get("rc", "").strip()
+        return {"active": values["active"].strip() == "yes", "result": values.get("result", "").strip() or None,
+                "rc": int(rc) if rc.lstrip("-").isdigit() else None, "started": values.get("started") == "yes"}
 
     def stop_scope(self, unit: str) -> bool:
         self._ssh(f"systemctl kill --signal=SIGKILL {unit}.scope 2>/dev/null; true", check=False, timeout=30)

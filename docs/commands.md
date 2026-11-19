@@ -26,7 +26,10 @@ devbox host list                          hosts and their workspaces
 devbox host bootstrap NAME [--zabbly] [--yes]
                                           show (then apply) what a host needs: Incus (its version is reported;
                                           --zabbly plans a current Incus from the Zabbly repository), firewall rules
-devbox host remove NAME [--force]         forget a host (--force deletes its workspaces first; never the machine)
+devbox host remove NAME [--force [--dump|--no-dump]]
+                                          forget a host (--force deletes its workspaces first, never the machine;
+                                          like `down`, it refuses workspaces whose database has no dump unless
+                                          --dump dumps it first or --no-dump deletes it)
     up/resume options: --startup-timeout 5m, --cleanup-on-failure, --fresh, --over-budget,
                        --additional (create a server even if max_servers are running; once)
 devbox sync NAME [--watch]                copy local code to the server (keep syncing on save with --watch)

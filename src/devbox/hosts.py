@@ -271,7 +271,12 @@ class Plan:
 
     def lines(self) -> list[str]:
         if self.nothing_to_do:
-            out = [f"{self.host}: Incus is installed and initialised, nothing to do"]
+            if self.manual:
+                out = [f"{self.host}: Incus is installed and initialised; devbox has nothing left to change, "
+                       f"{len(self.manual)} item{'s' if len(self.manual) != 1 else ''} below need{'' if len(self.manual) != 1 else 's'} "
+                       "you (devbox does not change those)"]
+            else:
+                out = [f"{self.host}: Incus is installed and initialised, nothing to do"]
         else:
             out = [f"plan for host {self.host}:"]
             for i, step in enumerate(self.steps, 1):

@@ -12,7 +12,7 @@ Hetzner servers keep working exactly as before. Choose per project with `--host`
 devbox host add NAME --ssh USER@HOST [--key PATH]   register a host and pin its SSH host key
 devbox host bootstrap NAME [--zabbly] [--yes]       show (then apply) what the host needs
 devbox host list                                    hosts and the workspaces on them
-devbox host remove NAME [--force]                   forget a host; the machine is never touched
+devbox host remove NAME [--force [--dump | --no-dump]]  forget a host; the machine is never touched
 devbox up PROJECT --host NAME [--cpus N --memory SIZE] [--isolate]
 ```
 
@@ -42,7 +42,9 @@ agent decide.
 
 `devbox host bootstrap NAME` inspects the host read-only and prints a plan. Nothing changes until
 `--yes`, the same pattern as `autostop enable`. It is idempotent: when everything is in place it says
-`nothing to do`. The plan always names the Incus version it found.
+`nothing to do`; when only things devbox does not change itself are left (the `manual:` lines below), it says
+that devbox has nothing left to change and that N items need you, instead. The plan always names the
+Incus version it found.
 
 What it checks and may do:
 
@@ -86,7 +88,10 @@ What it checks and may do:
 
 `host remove` forgets the host. It refuses while workspaces exist; `--force` deletes the workspaces
 devbox created, and devbox's cached base image ([Workspaces](workspaces.md#base-image-cache)). It never
-touches the machine itself. If the machine can no longer be reached, `--force` still forgets the host and
+touches the machine itself. The database safeguard of `down` applies: if a workspace has a registered
+database ([Databases](databases.md)) with no dump since the workspace was last used, `--force` refuses
+before deleting anything. `--force --dump` dumps those databases first (the workspaces must be running),
+`--force --no-dump` deletes the data anyway. If the machine can no longer be reached, `--force` still forgets the host and
 its workspaces in the registry (with a warning; any containers stay on the machine).
 
 ## A Hetzner server as a host
