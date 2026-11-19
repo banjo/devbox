@@ -1203,6 +1203,7 @@ def cmd_down(ctx: Context) -> int:
             with ctx.lock():
                 server = db.active_server(ctx.conn, db.require_project(ctx.conn, name)["name"])
                 if server is not None:
+                    refuse_if_hosting_workspaces(ctx, server)
                     refuse_unsaved_databases(ctx, server)
         return request_stop_at_hour_end(ctx, name, "pause" if snapshot else "down")
     with ctx.lock():
@@ -1213,6 +1214,7 @@ def cmd_down(ctx: Context) -> int:
             emit(ctx.args, {"project": name, "deleted": None}, f"{name} has no server")
             return 0
         dumps = []
+        refuse_if_hosting_workspaces(ctx, server)
         if not snapshot and not getattr(ctx.args, "dump", False):
             refuse_unsaved_databases(ctx, server)
         workspace = ctx.is_workspace(server)
@@ -1248,6 +1250,21 @@ def cmd_down(ctx: Context) -> int:
     lines += guidance_lines(guidance)
     emit(ctx.args, {"project": name, "deleted": server["provider_id"], **summary, "next": guidance}, "\n".join(lines))
     return 0
+
+
+def refuse_if_hosting_workspaces(ctx: Context, server) -> None:
+    """A Hetzner server that is also registered as an own host carries workspaces: deleting or snapshotting the
+    machine would destroy (or freeze) them behind the registry's back."""
+    if ctx.is_workspace(server) or not server["ip"]:
+        return
+    for row in db.list_hosts(ctx.conn):
+        target = row["ssh"].rpartition("@")[2].strip("[]")
+        workspaces = [w["project"] for w in db.servers_on_host(ctx.conn, row["name"])]
+        if target == server["ip"] and workspaces:
+            raise DevboxError(
+                f"{server['project']}'s server {server['ip']} is also the registered host '{row['name']}', which still "
+                f"has workspaces ({', '.join(workspaces)}); deleting or pausing the machine would destroy them. "
+                f"`devbox down PROJECT` each workspace, or `devbox host remove {row['name']} --force` first")
 
 
 def refuse_unsaved_databases(ctx: Context, server) -> None:

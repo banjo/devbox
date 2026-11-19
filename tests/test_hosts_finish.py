@@ -614,3 +614,22 @@ def test_a_key_quota_failure_in_docker_names_the_cause(tmp_path):
     fake.exec_fail.clear()
     with pytest.raises(DevboxError, match="kernel key quota is used up"):
         inc.provision("devbox-a", "k", "p", "q")
+
+
+def test_a_server_that_is_also_a_registered_host_is_not_deleted_while_it_has_workspaces(capsys, world, monkeypatch):
+    monkeypatch.setattr(cli, "resolve_ssh_allow", lambda entries: ["192.0.2.1/32"])
+    monkeypatch.setattr(cli.Remote, "wait_cloud_init", lambda self, deadline, progress, secrets=(): [])
+    monkeypatch.setattr(cli.Remote, "prepare_snapshot", lambda self, timeout=60: None)
+    assert run(capsys, "project", "add", "crm", "--path", str(world.tmp / "crm"))[0] == 0
+    assert run(capsys, "project", "add", "blog", "--path", str(world.tmp / "blog"))[0] == 0
+    code, out, err = run(capsys, "up", "blog", "--type", "cx23", "--location", "fsn1", "--json")
+    assert code == 0, out + err
+    server = db.active_server(db.connect(config.load().db_path), "blog")
+    assert run(capsys, "host", "add", "box", "--ssh", f"root@{server['ip']}", "--yes")[0] == 0
+    assert run(capsys, "up", "crm", "--host", "box")[0] == 0
+    for argv in (("down", "blog", "--no-dump"), ("pause", "blog"), ("down", "blog", "--at-hour-end")):
+        code, _, err = run(capsys, *argv)
+        assert code == 1 and "also the registered host 'box'" in err and "crm" in err, argv
+    assert db.active_server(db.connect(config.load().db_path), "blog") is not None
+    assert run(capsys, "down", "crm")[0] == 0
+    assert run(capsys, "down", "blog", "--no-dump")[0] == 0

@@ -141,7 +141,7 @@ def test_provisioning_reuses_cloud_init_and_checks_the_network(tmp_path):
     inc.provision("devbox-a", "ssh-ed25519 PUB", "PRIVATE\n", "ssh-ed25519 HOST")
     inside = "\n".join(s for s in fake.scripts if s.startswith("[devbox-a]"))
     for needle in ("getent hosts", "/etc/profile.d/devbox.sh", "openssh-server", "get.docker.com", "mise.run",
-                   "cloudflared", "authorized_keys", "ssh_host_" + "ed25519_key", "systemctl restart ssh",
+                   "cloudflared", "authorized_keys", "ssh_host_" + "ed25519_key", "systemctl restart ssh", "reset-failed ssh.service",
                    "hello-world"):
         assert needle in inside
     keys = [i for _, i in fake.inputs]
@@ -155,6 +155,10 @@ def test_provisioning_stops_with_a_firewall_hint_without_internet(tmp_path):
     with pytest.raises(DevboxError, match="host bootstrap mini"):
         inc.provision("devbox-a", "k", "p", "q")
     assert not any("get.docker.com" in s for s in fake.scripts)
+
+
+def test_network_check_needs_a_real_connection_not_just_dns():
+    assert "getent hosts" in incus.NETWORK_CHECK and "/dev/tcp/github.com/443" in incus.NETWORK_CHECK
 
 
 # jump host

@@ -108,8 +108,11 @@ SSHD_SETUP = (
     "{ apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server; } || exit 1; "
     "systemctl enable ssh >/dev/null 2>&1; true"
 )
+# DNS alone proves little: on a host with Docker (FORWARD policy DROP) the bridge still answers DNS while every
+# forwarded connection is dropped. Also open a TCP connection to github.com (IPv4 only), which setup needs.
 NETWORK_CHECK = (
-    "for i in 1 2 3 4 5 6; do getent hosts archive.ubuntu.com >/dev/null && exit 0; sleep 5; done; exit 1"
+    "for i in 1 2 3 4; do getent hosts archive.ubuntu.com >/dev/null && "
+    "timeout 8 bash -c 'exec 3<>/dev/tcp/github.com/443' 2>/dev/null && exit 0; sleep 4; done; exit 1"
 )
 
 
@@ -403,8 +406,9 @@ class Incus:
         say("Checking container network...")
         if self.exec(name, NETWORK_CHECK, check=False, timeout=60).returncode != 0:
             raise DevboxError(
-                f"container {name} cannot resolve names (no internet from the container); if the host runs "
-                f"Docker or UFW, `devbox host bootstrap {self.shell.host.name}` fixes the firewall")
+                f"container {name} has no internet (DNS or a TCP connection to github.com failed); if the host runs "
+                f"Docker or UFW, `devbox host bootstrap {self.shell.host.name}` shows the firewall rules it needs "
+                "(a `manual:` line when UFW is not active)")
         files, commands = cloud_init_steps()
         say("Installing base files...")
         for f in files:
@@ -447,5 +451,8 @@ class Incus:
                         "umask 077; cat > /etc/ssh/ssh_host_ed25519_key", input=host_private.rstrip("\n") + "\n")
         self.exec(name, "chmod 600 /etc/ssh/ssh_host_ed25519_key; cat > /etc/ssh/ssh_host_ed25519_key.pub "
                         "&& chmod 644 /etc/ssh/ssh_host_ed25519_key.pub", input=host_public.strip() + " devbox-host\n")
-        self.exec(name, "systemctl restart ssh && systemctl is-active --quiet ssh")
+        # sshd could not start without host keys after the container's boot (cached image) and may have hit
+        # systemd's start limit; reset that before restarting.
+        self.exec(name, "systemctl reset-failed ssh.service ssh.socket 2>/dev/null; "
+                        "systemctl restart ssh && systemctl is-active --quiet ssh")
         return {"workaround": workaround, "published": published}

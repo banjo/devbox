@@ -388,7 +388,7 @@ def make_plan(host: str, facts: dict, zabbly: bool = False) -> Plan:
     keys = facts.get("keys_maxkeys", "")
     if installed and keys.isdigit() and int(keys) < KEYS_LOW_BELOW:
         plan.manual.append(
-            f"kernel.keys.maxkeys is {keys}. All workspaces share this key quota (about 15 keys each, more with "
+            f"kernel.keys.maxkeys is {keys}. All workspaces share this key quota (15 to 30 keys each, more with "
             "Docker containers running), so around a dozen workspaces exhaust it and Docker then fails with "
             f"'disk quota exceeded'. devbox does not change kernel settings; raise it yourself: "
             f"`echo 'kernel.keys.maxkeys = {KEYS_RECOMMENDED}' | sudo tee /etc/sysctl.d/99-devbox-incus.conf && "
